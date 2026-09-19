@@ -166,6 +166,55 @@ void launcher_directory_contract()
 
 void lifecycle_contract()
 {
+    for (const auto& [tool_name, kind] : std::vector<std::pair<std::string, std::string>>{
+            {"ExitPlanMode", "permission"}, {"AskUserQuestion", "interactive_question"}})
+    {
+        for (const std::string event_name : {"PreToolUse", "PostToolUse", "PostToolUseFailure"}) {
+            addon::Attention_classification_request request;
+            request.base.event.name = event_name;
+            request.base.event.body = claude::object(R"({"session_id":"session","tool_use_id":"native-tool-request"})");
+            request.base.event.body.set("hook_event_name", Json(event_name));
+            request.base.event.body.set("tool_name", Json(tool_name));
+            const auto result = claude::classify_attention(request);
+            require(result.attention_kind && result.attention_kind->kind == kind &&
+                result.attention_kind->observation_index == 0,
+                "plan approval and interactive question retain distinct kinds on request and resolution");
+            require(result.base.observations.size() == 1, "native tool event has one observation");
+            const auto& observation = result.base.observations.front();
+            require(observation.provider_event_name == event_name &&
+                observation.attention_request_id == "native-tool-request",
+                "attention classification preserves native event and paired tool identity");
+            require(observation.attention_transition == (event_name == "PreToolUse"
+                    ? addon::Attention_transition::REQUESTED : addon::Attention_transition::RESOLVED),
+                "native pre and post events request and resolve the same attention");
+        }
+    }
+    {
+        addon::Attention_classification_request request;
+        request.base.event.name = "Stop";
+        request.base.event.body = claude::object(R"({"hook_event_name":"Stop","session_id":"session","last_assistant_message":"Which directory?"})");
+        auto result = claude::classify_attention(request);
+        require(result.attention_kind && result.attention_kind->kind == "conversational_hint",
+            "ordinary complete assistant question gives inferred hint");
+        const auto id = result.base.observations.front().attention_request_id;
+        require(!id.empty() && result.base.observations.front().provider_event_name == "Stop",
+            "hint has its own identity without rewriting native Stop");
+        require(claude::classify_attention(request).base.observations.front().attention_request_id == id,
+            "replayed event has stable hint identity");
+        require(claude::classify_event(request.base).observations.front().attention_transition == addon::Attention_transition::NONE,
+            "ordinary helper ingress does not acquire companion behavior");
+        request.base.event.body.set("agent_id", Json("child"));
+        require(!claude::classify_attention(request).attention_kind, "child message cannot raise root hint");
+        request.base.event.name = "UserPromptSubmit";
+        request.base.event.body = claude::object(R"({"hook_event_name":"UserPromptSubmit","session_id":"session"})");
+        request.pending_conversational_request_id = id;
+        result = claude::classify_attention(request);
+        require(result.base.observations.front().attention_transition == addon::Attention_transition::RESOLVED &&
+            result.base.observations.front().attention_request_id == id,
+            "actual submission resolves only the host supplied conversational identity");
+        request.pending_conversational_request_id.reset();
+        require(!claude::classify_attention(request).attention_kind, "submission without pending hint invents no resolution");
+    }
     addon::Classify_event_request request;
     request.event.name = "SessionStart";
     request.event.body = claude::object(R"({"hook_event_name":"SessionStart","session_id":"a375d05e-f6cf-4812-80f5-91b33d24c053","source":"resume"})");

@@ -81,14 +81,19 @@ std::optional<addon::Json_value> read_event(bool watch_parent)
     if (!name || !name->is_string() || name->as_string().empty()) {
         return std::nullopt;
     }
-    // Hooks may contain full prompts and tool results. Lifecycle admission
-    // needs only native correlation fields; arbitrary vendor payload stays in
-    // this process and never consumes the bounded provider-event lane.
+    // Keep native correlation and only a bounded complete root reply for the
+    // local conversational heuristic; prompts and tool results stay here.
     auto sanitized = addon::Json_value::object();
     for (const auto key : {"hook_event_name", "session_id", "source", "reason", "agent_id", "agent_type",
             "prompt_id", "tool_name", "tool_use_id", "error"})
     {
         if (const auto* value = event->find(key)) sanitized.set(key, *value);
+    }
+    if (name->as_string() == "Stop" && !event->find("agent_id")) {
+        const auto* reply = event->find("last_assistant_message");
+        if (reply && reply->is_string() && reply->as_string().size() <= 2048) {
+            sanitized.set("last_assistant_message", *reply);
+        }
     }
     std::string prompt;
     for (const auto key : {"prompt", "user_prompt", "message"}) {

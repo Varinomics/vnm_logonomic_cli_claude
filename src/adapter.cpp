@@ -97,7 +97,8 @@ void invoke(addon::Invocation_context& context, const fs::path& package_root)
         else
         if (capability == "structured-session" || capability == "delegated-session") claude::handle_sessions(context, package_root);
         else
-        if (capability == "helper-ingress" || capability == "lifecycle-events") claude::handle_lifecycle(context);
+        if (capability == "helper-ingress" || capability == "lifecycle-events" ||
+            capability == addon::k_attention_kind_capability_id) claude::handle_lifecycle(context);
         else claude::handle_preparation(context, package_root);
     }
     catch (const std::exception&) {
@@ -120,6 +121,7 @@ int main()
         {"accounts", 2}, {"launch-preparation", 3}, {"interactive-resume", 2},
         {"structured-session", 3}, {"delegated-session", 3}, {"auth-status", 2}, {"quota", 2},
         {"usage-scan", 2}, {"usage-scan", 3}, {"legacy-state-import", 1}, {"lifecycle-events", 1}, {"helper-ingress", 2},
+        {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"coordination-delivery", 1},
     };
     addon::Adapter_runtime runtime(std::move(options));
