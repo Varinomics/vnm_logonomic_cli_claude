@@ -97,6 +97,13 @@ add_custom_command(
 add_custom_target(claude_package ALL DEPENDS "${CLAUDE_PACKAGE_DIRECTORY}/package.files.json")
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(claude_session_declaration_tests tests/claude_session_declaration_tests.cpp)
+    claude_target(claude_session_declaration_tests)
+    add_dependencies(claude_session_declaration_tests claude_package)
+    add_test(NAME claude_session_declaration_tests
+        COMMAND claude_session_declaration_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    set_tests_properties(claude_session_declaration_tests PROPERTIES
+        TIMEOUT 30 LABELS "packaged-adapter;session-declarations")
     add_executable(claude_contract_tests tests/claude_contract_tests.cpp)
     target_link_libraries(claude_contract_tests PRIVATE claude_provider)
     claude_target(claude_contract_tests)
