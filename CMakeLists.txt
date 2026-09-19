@@ -124,6 +124,15 @@ if(BUILD_TESTING)
     set_tests_properties(claude_contract_tests claude_package_validation claude_package_conformance
         claude_hook_contract_tests claude_helper_tests PROPERTIES TIMEOUT 120)
 endif()
+if(BUILD_TESTING)
+    add_executable(claude_usage_cache_tests tests/claude_usage_cache_tests.cpp)
+    target_link_libraries(claude_usage_cache_tests PRIVATE claude_provider)
+    claude_target(claude_usage_cache_tests)
+    add_dependencies(claude_usage_cache_tests claude_package)
+    add_test(NAME claude_usage_cache_tests
+        COMMAND claude_usage_cache_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    set_tests_properties(claude_usage_cache_tests PROPERTIES TIMEOUT 180 LABELS "usage;cache;packaged-adapter")
+endif()
 logonomic_cli_addon_install_package("${CLAUDE_PACKAGE_DIRECTORY}" logonomic.cli.claude)
 
 option(LOGONOMIC_CLI_ADDON_RECIPE_TESTS

@@ -69,6 +69,7 @@ struct Snapshot
     std::string profile;
     std::vector<Usage_session> sessions;
     std::uint64_t touched_ms = 0;
+    std::optional<addon::Usage_cache_reference> cache_candidate;
 };
 
 std::mutex s_snapshot_mutex;
@@ -486,8 +487,9 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     File_cache cache;
     std::string receipt;
     bool cache_loaded = false;
-    if (cache_input.storage_file && fs::is_regular_file(*cache_input.storage_file)) {
-        receipt = read_cache(*cache_input.storage_file, false, cache, context);
+    const auto& input_file = cache_input.selected_file ? cache_input.selected_file : cache_input.storage_file;
+    if (input_file && fs::is_regular_file(*input_file)) {
+        receipt = read_cache(*input_file, false, cache, context);
         cache_loaded = true;
         if (cache_input.native_seed && receipt != cache_input.seed_sha256_hex) {
             File_cache incoming;
@@ -593,13 +595,47 @@ void handle_usage(addon::Invocation_context& context)
         return;
     }
     addon::Contract_failure failure;
-    const auto input = addon::decode_usage_scan_request(context.request().payload, &failure, 2);
+    const auto version = context.request().capability.version;
+    const auto input = addon::decode_usage_scan_request(context.request().payload, &failure, version);
     if (!input) {
         context.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
     }
     const auto profile = profile_for_context(input->context);
-    const auto profile_key = account_key(profile);
+    auto profile_key = account_key(profile);
+    if (version == 3) {
+        auto identity = *input;
+        identity.snapshot_id.reset();
+        identity.cursor.reset();
+        profile_key = addon::to_hex(addon::Sha256::digest(
+            addon::serialize_json_canonical(addon::encode_usage_scan_request(identity, 3))));
+        const auto& selection = *input->cache_selection;
+        const auto& root = input->context.profile_storage->root;
+        if (!addon::validate_usage_cache_root(selection.candidate_root, root, &failure)) {
+            throw std::runtime_error(failure.reason_code);
+        }
+        const auto outside_mutable = [&](const std::string& selected) {
+            const auto mutable_path = addon::path_from_utf8(root) / "claude-message-cache-v1.jsonl";
+            for (auto path = addon::path_from_utf8(selected); path.has_relative_path(); path = path.parent_path()) {
+                std::error_code error;
+                if (fs::equivalent(path, mutable_path, error)) {
+                    return false;
+                }
+            }
+            const auto relative = addon::path_from_utf8(selected).lexically_relative(addon::path_from_utf8(root));
+            auto name = addon::path_to_utf8(*relative.begin());
+#ifdef _WIN32
+            name = addon::ascii_lowercase(name);
+#endif
+            return name != "claude-message-cache-v1.jsonl" &&
+                !(name.starts_with("claude-cache-") && name.ends_with(".tmp"));
+        };
+        if (!outside_mutable(selection.candidate_root) ||
+            (selection.accepted && !outside_mutable(selection.accepted->root)))
+        {
+            throw std::runtime_error("usage_cache_namespace_conflict");
+        }
+    }
     std::string snapshot_id;
     std::size_t begin = 0;
     if (!input->snapshot_id) {
@@ -608,6 +644,26 @@ void handle_usage(addon::Invocation_context& context)
         if (!input->context.profile_storage) throw std::runtime_error("profile_storage_unavailable");
         Usage_cache_input cache;
         cache.storage_file = addon::path_from_utf8(input->context.profile_storage->root) / "claude-message-cache-v1.jsonl";
+        if (version == 3) {
+            const auto& selection = *input->cache_selection;
+            const auto& root = input->context.profile_storage->root;
+            if (!addon::validate_usage_cache_allocation(selection.candidate_root, root, &failure)) {
+                throw std::runtime_error(failure.reason_code);
+            }
+            cache.storage_file = addon::path_from_utf8(selection.candidate_root) / "messages.jsonl";
+            if (selection.accepted) {
+                const auto manifest = addon::validate_usage_cache_candidate(
+                    *selection.accepted, root, input->context.account_context,
+                    [&context] { return context.cancel_requested(); }, &failure);
+                if (!manifest) throw std::runtime_error(failure.reason_code);
+                if (manifest->format != "claude-message-cache@1" || manifest->files.size() != 1 ||
+                    manifest->files.front().path != "messages.jsonl")
+                {
+                    throw std::runtime_error("usage_cache_format_unsupported");
+                }
+                cache.selected_file = addon::path_from_utf8(selection.accepted->root) / "messages.jsonl";
+            }
+        }
         if (input->native_file_cache) {
             if (!input->context.account_context || input->native_file_cache->source_account_key !=
                     input->context.account_context->adapter_account_key)
@@ -624,6 +680,15 @@ void handle_usage(addon::Invocation_context& context)
         if (input->context.account_context) snapshot.scope.source_account_key = input->context.account_context->adapter_account_key;
         snapshot.touched_ms = now_ms();
         snapshot_id = addon::random_nonce_hex();
+        if (version == 3) {
+            // Surviving transcripts do not prove that all contributing messages remain.
+            for (auto& session : snapshot.sessions) session.record.aggregate_evidence = "partial";
+            snapshot.cache_candidate = addon::seal_usage_cache_candidate(
+                input->cache_selection->candidate_root, input->context.profile_storage->root,
+                input->context.account_context, snapshot_id, "claude-message-cache@1",
+                [&context] { return context.cancel_requested(); }, &failure);
+            if (!snapshot.cache_candidate) throw std::runtime_error(failure.reason_code);
+        }
         std::lock_guard lock(s_snapshot_mutex);
         std::erase_if(s_snapshots, [](const auto& entry) { return now_ms() - entry.second.touched_ms > 600000; });
         if (s_snapshots.size() >= 8) throw std::runtime_error("usage_snapshot_capacity");
@@ -649,13 +714,14 @@ void handle_usage(addon::Invocation_context& context)
         snapshot.touched_ms = now_ms();
         page.snapshot_id = snapshot_id;
         page.scope = snapshot.scope;
+        page.cache_candidate = snapshot.cache_candidate;
         const auto end = std::min(begin + addon::k_max_usage_page_records, snapshot.sessions.size());
         for (auto index = begin; index < end; ++index) page.records.push_back(snapshot.sessions[index].record);
         page.complete = end == snapshot.sessions.size();
         if (!page.complete) page.next_cursor = std::to_string(end);
         else s_snapshots.erase(found);
     }
-    context.succeed(addon::encode_usage_scan_result(page, 2));
+    context.succeed(addon::encode_usage_scan_result(page, version));
 }
 
 } // namespace claude

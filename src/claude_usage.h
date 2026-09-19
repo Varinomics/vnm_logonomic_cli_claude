@@ -28,6 +28,7 @@ struct Usage_cache_input
     std::string seed_sha256_hex;
     bool cache_required = false;
     std::optional<std::filesystem::path> storage_file;
+    std::optional<std::filesystem::path> selected_file;
 };
 
 std::vector<Usage_session> scan_usage(
