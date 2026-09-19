@@ -650,7 +650,7 @@ void handle_usage(addon::Invocation_context& context)
             if (!addon::validate_usage_cache_allocation(selection.candidate_root, root, &failure)) {
                 throw std::runtime_error(failure.reason_code);
             }
-            cache.storage_file = addon::path_from_utf8(selection.candidate_root) / "messages.jsonl";
+            cache.storage_file = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root)) / "messages.jsonl";
             if (selection.accepted) {
                 const auto manifest = addon::validate_usage_cache_candidate(
                     *selection.accepted, root, input->context.account_context,
@@ -661,7 +661,7 @@ void handle_usage(addon::Invocation_context& context)
                 {
                     throw std::runtime_error("usage_cache_format_unsupported");
                 }
-                cache.selected_file = addon::path_from_utf8(selection.accepted->root) / "messages.jsonl";
+                cache.selected_file = addon::usage_cache_io_path(addon::path_from_utf8(selection.accepted->root)) / "messages.jsonl";
             }
         }
         if (input->native_file_cache) {
