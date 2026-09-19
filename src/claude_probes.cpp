@@ -1,0 +1,170 @@
+#include "claude_probes.h"
+#include "claude_accounts.h"
+#include "claude_launcher.h"
+#include "claude_support.h"
+
+#include <cmath>
+#include <optional>
+#include <regex>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+
+namespace claude {
+namespace {
+
+namespace addon = logonomic::cli_addon;
+using Json = addon::Json_value;
+
+std::string usage_result(const Json& event)
+{
+    if (text(event, "type") != "result") return {};
+    if (flag(event, "is_error") || text(event, "subtype") == "error") {
+        throw std::runtime_error("quota_failed");
+    }
+    return text(event, "result");
+}
+
+std::string usage_text(std::string_view bytes)
+{
+    addon::Json_parse_error error;
+    const auto value = addon::parse_json(bytes, addon::Json_parse_limits{}, &error);
+    if (value && value->is_object()) return usage_result(*value);
+    if (value && value->is_array()) {
+        for (const auto& event : value->as_array()) {
+            const auto result = usage_result(event);
+            if (!result.empty()) return result;
+        }
+    }
+    std::istringstream lines{std::string(bytes)};
+    for (std::string line; std::getline(lines, line);) {
+        const auto event = addon::parse_json(line, addon::Json_parse_limits{}, &error);
+        if (!event || !event->is_object()) continue;
+        const auto result = usage_result(*event);
+        if (!result.empty()) return result;
+    }
+    throw std::runtime_error("quota_output_unavailable");
+}
+
+addon::Quota_window quota_window(const std::string& content, const std::string& name, std::uint64_t minutes)
+{
+    const std::regex pattern("Current " + name + R"([^:]*:\s*(\d+(?:\.\d+)?)% used[\s\S]*?resets\s*([^\r\n]+))",
+        std::regex::icase);
+    std::smatch match;
+    if (!std::regex_search(content, match, pattern)) throw std::runtime_error("quota_window_missing");
+    const double used = std::stod(match[1].str());
+    if (!std::isfinite(used)) throw std::runtime_error("quota_window_invalid");
+    auto reset = match[2].str();
+    while (!reset.empty() && (reset.back() == ')' || reset.back() == '.' || reset.back() == ',' ||
+        reset.back() == ' ' || reset.back() == '\t')) reset.pop_back();
+    const auto begin = reset.find_first_not_of(" \t");
+    if (begin == std::string::npos) throw std::runtime_error("quota_window_invalid");
+    reset.erase(0, begin);
+    addon::Quota_window window;
+    window.used_percent = used;
+    window.window_minutes = minutes;
+    window.label = "Current " + name;
+    window.reset_text = std::move(reset);
+    return window;
+}
+
+addon::Observation_scope scope(const std::optional<addon::Account_context>& account)
+{
+    addon::Observation_scope result;
+    if (account) result.source_account_key = account->adapter_account_key;
+    result.observed_at_ms = now_ms();
+    result.fresh_for_ms   = 60000;
+    return result;
+}
+
+} // namespace
+
+addon::Auth_status inspect_auth(const addon::Structured_inspection& inspection)
+{
+    if (inspection.timed_out) return addon::Auth_status::FAILED;
+    addon::Json_parse_error error;
+    const auto value = addon::parse_json(inspection.stdout_bytes, addon::Json_parse_limits{}, &error);
+    const auto* logged_in = value && value->is_object() ? value->find("loggedIn") : nullptr;
+    if (!logged_in || !logged_in->is_boolean()) return addon::Auth_status::UNKNOWN;
+    if (logged_in->as_boolean() && inspection.exit_code == 0) return addon::Auth_status::AUTHENTICATED;
+    if (!logged_in->as_boolean() && inspection.exit_code == 1) return addon::Auth_status::NOT_LOGGED_IN;
+    return addon::Auth_status::UNKNOWN;
+}
+
+addon::Quota_observation inspect_quota(const addon::Structured_inspection& inspection)
+{
+    addon::Quota_observation result;
+    result.state = addon::Quota_status::FAILED;
+    if (inspection.timed_out || inspection.exit_code != 0) return result;
+    try {
+        const auto content = usage_text(inspection.stdout_bytes);
+        result.primary   = quota_window(content, "session", 300);
+        result.secondary = quota_window(content, "week", 10080);
+        result.state = addon::Quota_status::READY;
+    }
+    catch (const std::exception&) {
+        result.primary.reset();
+        result.secondary.reset();
+    }
+    return result;
+}
+
+void handle_probes(addon::Invocation_context& context, const std::filesystem::path& package_root)
+{
+    const bool authentication = context.request().capability.capability_id == "auth-status";
+    addon::Contract_failure failure;
+    if (context.request().operation == "prepare") {
+        const auto input = addon::decode_probe_prepare_request(context.request().payload, &failure, 2);
+        if (!input) {
+            context.fail(addon::Result_status::FAILED, failure.reason_code);
+            return;
+        }
+        addon::Structured_prepare_result result;
+        result.process = cli_process(input->context, false);
+        apply_account(input->context, result.process);
+        auto& args = result.process.argv;
+        if (authentication) {
+            args.insert(args.end(), {"auth", "status", "--json"});
+        }
+        else {
+            args.insert(args.end(), {"-p", "/usage", "--output-format", "json", "--verbose",
+                "--no-session-persistence", "--safe-mode", "--strict-mcp-config", "--mcp-config",
+                path_string(package_root / "assets/empty_mcp.json"), "--tools", "", "--allowedTools", "",
+                "--model", "sonnet"});
+            result.process.assets.push_back("assets/empty_mcp.json");
+        }
+        result.inspection.protocol_state = "await_exit";
+        result.profile_storage = input->context.profile_storage;
+        result.account_context = input->context.account_context;
+        context.succeed(addon::encode_structured_prepare_result(result, 2));
+        return;
+    }
+    if (context.request().operation != "inspect") {
+        context.reject_unknown_operation();
+        return;
+    }
+    const auto input = addon::decode_probe_inspect_request(context.request().payload, &failure, 2);
+    if (!input) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        return;
+    }
+    if (authentication) {
+        addon::Auth_inspect_result result;
+        result.complete = input->inspection.final;
+        if (result.complete) result.observation = addon::Auth_observation{scope(input->account_context), inspect_auth(input->inspection)};
+        else result.protocol_state = input->inspection.protocol_state;
+        context.succeed(addon::encode_auth_inspect_result(result));
+    }
+    else {
+        addon::Quota_inspect_result result;
+        result.complete = input->inspection.final;
+        if (result.complete) {
+            result.observation = inspect_quota(input->inspection);
+            result.observation->scope = scope(input->account_context);
+        }
+        else result.protocol_state = input->inspection.protocol_state;
+        context.succeed(addon::encode_quota_inspect_result(result, 2));
+    }
+}
+
+} // namespace claude

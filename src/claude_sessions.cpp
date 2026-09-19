@@ -1,0 +1,525 @@
+#include "claude_sessions.h"
+#include "claude_launcher.h"
+#include "claude_accounts.h"
+#include "claude_support.h"
+
+#include <logonomic_cli_addon/ids.h>
+
+#include <algorithm>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace claude {
+namespace {
+
+namespace addon = logonomic::cli_addon;
+using Json = addon::Json_value;
+
+std::vector<std::string> string_array(const Json& value)
+{
+    if (!value.is_array()) {
+        throw std::runtime_error("invalid_protocol_state");
+    }
+    std::vector<std::string> result;
+    for (const auto& entry : value.as_array()) {
+        if (!entry.is_string() || entry.as_string().empty()) {
+            throw std::runtime_error("invalid_protocol_state");
+        }
+        result.push_back(entry.as_string());
+    }
+    return result;
+}
+
+bool same_strings(std::vector<std::string> left, std::vector<std::string> right)
+{
+    std::sort(left.begin(), left.end());
+    std::sort(right.begin(), right.end());
+    return left == right;
+}
+
+bool same_directory(std::string left, std::string right)
+{
+    left  = path_string(addon::path_from_utf8(left).lexically_normal());
+    right = path_string(addon::path_from_utf8(right).lexically_normal());
+#ifdef _WIN32
+    for (char& ch : left) {
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+    }
+    for (char& ch : right) {
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+    }
+#endif
+    return !left.empty() && left == right;
+}
+
+bool valid_review_init(const Json& event, const Json& state)
+{
+    const auto* tools   = event.find("tools");
+    const auto* servers = event.find("mcp_servers");
+    const auto* plugins = event.find("plugins");
+    const auto* expected_tools   = state.find("expected_tools");
+    const auto* expected_servers = state.find("expected_mcp_servers");
+    if (text(event, "permissionMode") != "plan" || !tools || !servers || !servers->is_array() ||
+        !plugins || !plugins->is_array() || !plugins->as_array().empty() ||
+        !expected_tools || !expected_servers ||
+        !same_strings(string_array(*tools), string_array(*expected_tools)) ||
+        !same_directory(text(event, "cwd"), text(state, "working_directory")))
+    {
+        return false;
+    }
+    std::vector<std::string> names;
+    for (const auto& server : servers->as_array()) {
+        if (!server.is_object() || server.as_object().size() != 2 ||
+            text(server, "name").empty() || text(server, "status") != "connected")
+        {
+            return false;
+        }
+        names.push_back(text(server, "name"));
+    }
+    return same_strings(std::move(names), string_array(*expected_servers));
+}
+
+addon::Structured_inspect_result failed(std::string reason)
+{
+    addon::Structured_inspect_result result;
+    result.complete = true;
+    result.failure_reason = std::move(reason);
+    return result;
+}
+
+std::string join(const std::vector<std::string>& items)
+{
+    std::string result;
+    for (const auto& item : items) {
+        if (!result.empty()) result += ',';
+        result += item;
+    }
+    return result;
+}
+
+std::string control_request(Json& state, const std::string& phase, const std::string& server = {})
+{
+    const auto id = addon::random_nonce_hex();
+    state.set("mcp_phase", Json(phase));
+    state.set("mcp_request_id", Json(id));
+    Json request = Json::object();
+    request.set("subtype", Json(phase == "initialize" ? "initialize" :
+        phase == "reconnect" ? "mcp_reconnect" : "mcp_status"));
+    if (!server.empty()) {
+        request.set("serverName", Json(server));
+    }
+    Json frame = Json::object();
+    frame.set("type", Json("control_request"));
+    frame.set("request_id", Json(id));
+    frame.set("request", std::move(request));
+    return addon::serialize_json(frame) + '\n';
+}
+
+bool required_catalog_ready(const Json& response, const Json& state)
+{
+    const auto* servers = response.find("mcpServers");
+    const auto* required = state.find("required_mcp_servers");
+    if (!servers || !servers->is_array() || !required || !required->is_array()) {
+        return false;
+    }
+    std::set<std::string> seen;
+    for (const auto& server : servers->as_array()) {
+        const auto name = text(server, "name");
+        if (name.empty() || !seen.insert(name).second) {
+            return false;
+        }
+    }
+    for (const auto& expected : required->as_array()) {
+        const auto name = text(expected, "name");
+        const auto server = std::find_if(servers->as_array().begin(), servers->as_array().end(),
+            [&name](const Json& entry) { return text(entry, "name") == name; });
+        if (server == servers->as_array().end() || text(*server, "status") != "connected") {
+            return false;
+        }
+        const auto* tools = server->find("tools");
+        const auto* actions = expected.find("actions");
+        if (!tools || !tools->is_array() || !actions) {
+            return false;
+        }
+        std::set<std::string> names;
+        for (const auto& tool : tools->as_array()) {
+            const auto action = text(tool, "name");
+            if (action.empty() || !names.insert(action).second) {
+                return false;
+            }
+        }
+        for (const auto& action : string_array(*actions)) {
+            if (!names.contains(action)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::optional<std::string> advance_readiness(
+    const Json& event, Json& state, addon::Structured_inspect_result& result)
+{
+    const auto* response = event.find("response");
+    if (!response || !response->is_object() || text(*response, "request_id").empty() ||
+        text(*response, "request_id") != text(state, "mcp_request_id"))
+    {
+        return "mcp_control_response_mismatch";
+    }
+    const auto* payload = response->find("response");
+    const auto phase = text(state, "mcp_phase");
+    // Native reconnect success omits its undefined response payload.
+    if (text(*response, "subtype") != "success" || (payload && !payload->is_object()) ||
+        (!payload && phase != "reconnect"))
+    {
+        return "mcp_control_unavailable";
+    }
+    if (phase == "status") {
+        if (!required_catalog_ready(*payload, state)) {
+            return "required_mcp_unavailable";
+        }
+        // Classify the entire buffered native stream before releasing input;
+        // an administrative frame may be split after this status response.
+        state.set("mcp_phase", Json("verified"));
+        state.set("mcp_request_id", Json(""));
+        return std::nullopt;
+    }
+    auto* remaining = state.find("mcp_remaining");
+    if (!remaining || !remaining->is_array() || (phase != "initialize" && phase != "reconnect")) {
+        return "invalid_protocol_state";
+    }
+    if (phase == "reconnect") {
+        if (remaining->as_array().empty()) {
+            return "invalid_protocol_state";
+        }
+        remaining->as_array().erase(remaining->as_array().begin());
+    }
+    result.stdin_bytes = remaining->as_array().empty() ? control_request(state, "status") :
+        control_request(state, "reconnect", remaining->as_array().front().as_string());
+    return std::nullopt;
+}
+
+addon::Structured_prepare_result prepare(
+    const addon::Session_launch_context& context,
+    addon::Structured_purpose purpose,
+    const std::string& prompt,
+    const std::string& mcp_path,
+    const std::vector<std::string>& delegated_tools,
+    const std::vector<std::string>& server_names,
+    const Json& required_servers)
+{
+    if (prompt.empty()) {
+        throw std::runtime_error("unsupported_launcher");
+    }
+    const bool review = purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
+    const auto command = recognize_launcher(context.launcher.script_body);
+    if (!command || (!review && !direct_implementation_arguments(context))) {
+        throw std::runtime_error("unsupported_launcher");
+    }
+    addon::Structured_prepare_result result;
+    result.process = cli_process(context, !review);
+    apply_account(context, result.process);
+    std::vector<std::string> tools = review ? std::vector<std::string>{"Read", "Glob", "Grep"}
+        : std::vector<std::string>{"Read", "Glob", "Grep", "Edit", "Write"};
+    tools.insert(tools.end(), delegated_tools.begin(), delegated_tools.end());
+    auto& args = result.process.argv;
+    args.insert(args.end(), {"-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"});
+    if (review) {
+        args.insert(args.end(), {"--safe-mode", "--strict-mcp-config", "--mcp-config", mcp_path,
+            "--tools", join(tools), "--allowedTools", join(tools), "--permission-mode", "plan",
+            "--setting-sources", "project", "--model", "sonnet"});
+    }
+    else {
+        args.insert(args.end(), {"--permission-mode", "dontAsk", "--allowedTools", join(tools)});
+        if (!server_names.empty()) {
+            args.insert(args.end(), {"--mcp-config", mcp_path});
+        }
+    }
+    result.process.stdin_behavior = addon::Stdin_behavior::PAYLOAD;
+    result.process.stdin_payload  = prompt;
+    result.profile_storage = context.profile_storage;
+    result.account_context = context.account_context;
+    result.inspection.incremental = true;
+    Json state = Json::object();
+    state.set("initialized", Json(false));
+    state.set("pending_base64", Json(""));
+    state.set("result_base64", Json(""));
+    state.set("root_session_id", Json(""));
+    state.set("working_directory", Json(context.working_directory));
+    state.set("expected_tools", strings(tools));
+    state.set("expected_mcp_servers", strings(server_names));
+    if (!server_names.empty()) {
+        args.insert(args.end(), {"--input-format", "stream-json"});
+        state.set("required_mcp_servers", required_servers);
+        state.set("mcp_remaining", strings(server_names));
+        state.set("prompt_base64", Json(addon::encode_base64(prompt)));
+        result.process.stdin_payload = control_request(state, "initialize");
+        result.inspection.keep_stdin_open = true;
+    }
+    result.inspection.protocol_state = addon::serialize_json(state);
+    return result;
+}
+
+} // namespace
+
+addon::Structured_inspect_result inspect_session(
+    addon::Structured_purpose purpose, const addon::Structured_inspection& inspection)
+{
+    try {
+        Json state = object(inspection.protocol_state);
+        const auto* initialized_value = state.find("initialized");
+        const auto pending_value = addon::decode_base64(text(state, "pending_base64"));
+        const auto result_value  = addon::decode_base64(text(state, "result_base64"));
+        if (!initialized_value || !initialized_value->is_boolean() || !pending_value || !result_value) {
+            return failed("invalid_protocol_state");
+        }
+        bool initialized = initialized_value->as_boolean();
+        std::string root_session = text(state, "root_session_id");
+        std::string pending = *pending_value + inspection.stdout_bytes;
+        bool pending_before_input = flag(state, "pending_before_input");
+        std::string answer = *result_value;
+        const bool review = purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
+        const auto initial_phase = text(state, "mcp_phase");
+        if (!initial_phase.empty() && initial_phase != "released" && inspection.final) {
+            return failed(inspection.timed_out ? "process_timed_out" : "mcp_readiness_incomplete");
+        }
+        if ((initialized && root_session.empty()) || (!answer.empty() && !initialized)) {
+            return failed("invalid_protocol_state");
+        }
+        addon::Structured_inspect_result result;
+        auto record = [&result](addon::Presentation_event_kind kind) {
+            result.presentation_state = addon::Presentation_state::AVAILABLE;
+            if (!result.presentation.empty() && result.presentation.back().kind == kind) {
+                ++result.presentation.back().count;
+            }
+            else {
+                result.presentation.push_back({kind, 1});
+            }
+        };
+        std::size_t consumed = 0;
+        for (std::size_t end; (end = pending.find('\n', consumed)) != std::string::npos;) {
+            const auto line = pending.substr(consumed, end - consumed);
+            consumed = end + 1;
+            if (line.find_first_not_of(" \r\t") == std::string::npos) continue;
+            const auto event = object(line);
+            const auto type = text(event, "type");
+            const auto subtype = text(event, "subtype");
+            if (type.empty() || (review && !answer.empty())) return failed("invalid_structured_output");
+            // A reply cannot acknowledge input that this inspection has not
+            // returned to the host yet. Retain only established startup hooks.
+            const bool startup_hook = !review && !initialized && type == "system" &&
+                (subtype == "hook_started" || subtype == "hook_progress" || subtype == "hook_response");
+            if ((result.stdin_bytes || pending_before_input) && !startup_hook) {
+                return failed("unexpected_preprompt_output");
+            }
+            pending_before_input = false;
+            const auto phase = text(state, "mcp_phase");
+            if (!phase.empty() && phase != "released" && !startup_hook) {
+                if (type != "control_response") {
+                    return failed("unexpected_preprompt_output");
+                }
+                if (const auto failure = advance_readiness(event, state, result)) {
+                    return failed(*failure);
+                }
+                continue;
+            }
+            if (!phase.empty() && type == "control_response") {
+                return failed("mcp_control_response_mismatch");
+            }
+            if (type == "system" && subtype == "init") {
+                const auto id = text(event, "session_id");
+                if (id.empty() || (!root_session.empty() && id != root_session)) {
+                    return failed("session_provenance_mismatch");
+                }
+                if (review) {
+                    if (initialized || !valid_review_init(event, state)) return failed("review_surface_mismatch");
+                    record(addon::Presentation_event_kind::REVIEW_INITIALIZED);
+                }
+                else {
+                    if (!initialized) record(addon::Presentation_event_kind::REASONING);
+                }
+                root_session = id;
+                initialized = true;
+                continue;
+            }
+            if (!review && !initialized) {
+                const auto id = text(event, "session_id");
+                if (type != "system" || (subtype != "hook_started" && subtype != "hook_progress" && subtype != "hook_response") ||
+                    id.empty() || (!root_session.empty() && id != root_session))
+                {
+                    return failed("session_provenance_mismatch");
+                }
+                root_session = id;
+                record(addon::Presentation_event_kind::REASONING);
+                continue;
+            }
+            if (type == "result") {
+                if (!initialized) return failed("result_before_initialization");
+                const auto id = text(event, "session_id");
+                const auto* parent = event.find("parent_tool_use_id");
+                const auto* origin = event.find("origin");
+                if (id.empty() ||
+                    (parent && !parent->is_null() && (!parent->is_string() || parent->as_string().empty())) ||
+                    (origin && !origin->is_null() && (!origin->is_object() || text(*origin, "kind").empty())))
+                {
+                    return failed("invalid_result_provenance");
+                }
+                if (id != root_session || (parent && !parent->is_null())) {
+                    continue;
+                }
+                const auto* is_error = event.find("is_error");
+                const auto value = text(event, "result");
+                if (!answer.empty() || value.empty() || value.size() > 1024 * 1024 ||
+                    !is_error || !is_error->is_boolean() || is_error->as_boolean() || subtype != "success")
+                {
+                    return failed("invalid_final_result");
+                }
+                answer = value;
+                record(addon::Presentation_event_kind::RESULT_AUTHENTICATED);
+                continue;
+            }
+            if (type == "system") {
+                if (review && (subtype != "thinking_tokens" || !initialized)) return failed("unexpected_system_event");
+                record(addon::Presentation_event_kind::REASONING);
+            }
+            else
+            if (type == "assistant") record(addon::Presentation_event_kind::ANALYSIS_UPDATE);
+            else
+            if (type == "user") record(addon::Presentation_event_kind::TOOL_RESPONSE);
+            else
+            if (type == "rate_limit_event") record(addon::Presentation_event_kind::RATE_LIMIT_STATUS);
+            else
+            if (review) return failed("unsupported_structured_event");
+        }
+        pending.erase(0, consumed);
+        if (result.stdin_bytes && pending.find_first_not_of(" \t\r\n") != std::string::npos) {
+            pending_before_input = true;
+        }
+        if (review && text(state, "mcp_phase") == "verified" &&
+            pending.find_first_not_of(" \t\r\n") != std::string::npos)
+        {
+            return failed("unexpected_preprompt_output");
+        }
+        if (text(state, "mcp_phase") == "verified" && pending.find_first_not_of(" \t\r\n") == std::string::npos) {
+            const auto prompt = addon::decode_base64(text(state, "prompt_base64"));
+            if (!prompt || prompt->empty()) {
+                return failed("invalid_protocol_state");
+            }
+            Json message = Json::object();
+            message.set("role", Json("user"));
+            message.set("content", Json(*prompt));
+            Json frame = Json::object();
+            frame.set("type", Json("user"));
+            frame.set("session_id", Json(""));
+            frame.set("parent_tool_use_id", Json());
+            frame.set("message", std::move(message));
+            result.stdin_bytes = addon::serialize_json(frame) + '\n';
+            result.close_stdin = true;
+            state.set("mcp_phase", Json("released"));
+            state.set("prompt_base64", Json(""));
+        }
+        if (review && !answer.empty() && pending.find_first_not_of(" \t\r\n") != std::string::npos) {
+            return failed("output_after_result");
+        }
+        if (inspection.final) {
+            if (inspection.timed_out) return failed("process_timed_out");
+            if (inspection.exit_code != 0) return failed("process_failed");
+            if (!initialized || answer.empty() || pending.find_first_not_of(" \t\r\n") != std::string::npos) {
+                return failed("unauthenticated_final_result");
+            }
+        }
+        result.complete = inspection.final || (review && !answer.empty() && text(state, "mcp_phase").empty());
+        if (result.complete) {
+            result.result_bytes = std::move(answer);
+        }
+        else {
+            state.set("initialized", Json(initialized));
+            state.set("pending_base64", Json(addon::encode_base64(pending)));
+            state.set("pending_before_input", Json(pending_before_input));
+            state.set("result_base64", Json(addon::encode_base64(answer)));
+            state.set("root_session_id", Json(root_session));
+            result.protocol_state = addon::serialize_json(state);
+            if (!addon::exchange_protocol_state_valid(result.protocol_state)) return failed("protocol_state_limit");
+        }
+        return result;
+    }
+    catch (const std::exception&) {
+        return failed("invalid_structured_output");
+    }
+}
+
+void handle_sessions(addon::Invocation_context& invocation, const std::filesystem::path& package_root)
+{
+    const auto& request = invocation.request();
+    addon::Contract_failure failure;
+    if (request.operation == "inspect" && request.capability.capability_id == "structured-session") {
+        const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure, 3);
+        if (!inspection) {
+            invocation.fail(addon::Result_status::FAILED, failure.reason_code);
+            return;
+        }
+        invocation.succeed(addon::encode_structured_inspect_result(inspect_session(inspection->purpose, inspection->inspection), 3));
+        return;
+    }
+    if (request.operation != "prepare") {
+        invocation.reject_unknown_operation();
+        return;
+    }
+    if (request.capability.capability_id == "structured-session") {
+        const auto input = addon::decode_structured_prepare_request(request.payload, &failure, 3);
+        if (!input) {
+            invocation.fail(addon::Result_status::FAILED, failure.reason_code);
+            return;
+        }
+        auto result = prepare(input->context, input->purpose, input->prompt,
+            path_string(package_root / "assets/empty_mcp.json"), {}, {}, Json::array());
+        result.process.assets.push_back("assets/empty_mcp.json");
+        invocation.succeed(addon::encode_structured_prepare_result(result, 3));
+        return;
+    }
+    const auto input = addon::decode_delegated_prepare_request(request.payload, &failure, 3);
+    if (!input) {
+        invocation.fail(addon::Result_status::FAILED, failure.reason_code);
+        return;
+    }
+    Json servers = Json::object();
+    std::vector<std::string> tools;
+    std::vector<std::string> names;
+    Json required_servers = Json::array();
+    addon::Delegated_prepare_result result;
+    for (const auto& server : input->control.servers) {
+        const std::string name = "logonomic-task-" + input->control.task_id + '-' + server.server_id;
+        names.push_back(name);
+        Json required = Json::object();
+        required.set("name", Json(name));
+        required.set("actions", strings(server.actions));
+        required_servers.push_back(std::move(required));
+        for (const auto& action : server.actions) tools.push_back("mcp__" + name + "__" + action);
+        Json environment = Json::object();
+        for (const auto& [key, value] : server.environment) environment.set(key, Json(value));
+        Json config = Json::object();
+        config.set("type", Json("stdio"));
+        config.set("command", Json(server.program));
+        config.set("args", Json::array());
+        config.set("env", std::move(environment));
+        servers.set(name, std::move(config));
+        result.acknowledgment.server_ids.push_back(server.server_id);
+    }
+    Json config = Json::object();
+    config.set("mcpServers", std::move(servers));
+    const std::string relative = "mcp/" + input->control.task_id + ".json";
+    result.private_artifacts.push_back({relative, addon::serialize_json(config)});
+    auto prepared = prepare(input->context, input->purpose, input->prompt,
+        path_string(addon::path_from_utf8(input->control.private_artifact_root) / relative), tools, names, required_servers);
+    result.process         = std::move(prepared.process);
+    result.inspection      = std::move(prepared.inspection);
+    result.profile_storage = input->context.profile_storage;
+    result.account_context = input->context.account_context;
+    invocation.succeed(addon::encode_delegated_prepare_result(result, 3));
+}
+
+} // namespace claude

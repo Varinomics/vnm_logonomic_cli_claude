@@ -1,0 +1,9 @@
+{
+  "provider": "Claude Code",
+  "native_integration_source": "Varinomics/logonomic/src/logonomic_claude_cli_provider.cpp",
+  "native_usage_source": "Varinomics/logonomic/src/logonomic_launcher_service.cpp",
+  "native_integration_snapshot": "fc1f5acd",
+  "forward_policy": "Actual hook and structured event semantics are validated; no upstream version ceiling.",
+  "icons_source": "https://github.com/lobehub/lobe-icons",
+  "icons_license": "notices/lobe_icons_mit.txt"
+}

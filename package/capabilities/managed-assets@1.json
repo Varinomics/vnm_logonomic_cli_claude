@@ -1,0 +1,12 @@
+{
+  "capability_id": "managed-assets",
+  "version": 1,
+  "payload": {
+    "assets": [
+      "assets/claude-hooks/.claude-plugin/plugin.json",
+      "assets/claude-hooks/hooks/hooks.json",
+      "assets/claude-hooks/scripts/logonomic-hook-relay.cjs",
+      "assets/empty_mcp.json"
+    ]
+  }
+}

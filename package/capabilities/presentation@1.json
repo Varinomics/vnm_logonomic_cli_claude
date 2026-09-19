@@ -1,0 +1,11 @@
+{
+  "capability_id": "presentation",
+  "version": 1,
+  "payload": {
+    "display_name": "Claude",
+    "icon": {
+      "light": "assets/claude.svg",
+      "dark": "assets/claude.svg"
+    }
+  }
+}

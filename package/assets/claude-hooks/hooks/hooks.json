@@ -1,0 +1,165 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 18,
+            "statusMessage": "Recording Logonomic session start"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 13,
+            "statusMessage": "Recording Logonomic subagent start"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 13,
+            "statusMessage": "Recording Logonomic subagent stop"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 18
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 13
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 13
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 13
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 13
+          }
+        ],
+        "matcher": "^(AskUserQuestion|ExitPlanMode)$"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 13
+          }
+        ],
+        "matcher": "^(AskUserQuestion|ExitPlanMode)$"
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 13
+          }
+        ],
+        "matcher": "^(AskUserQuestion|ExitPlanMode)$"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/logonomic-hook-relay.cjs"
+            ],
+            "timeout": 5,
+            "statusMessage": "Recording Logonomic session end"
+          }
+        ]
+      }
+    ]
+  }
+}

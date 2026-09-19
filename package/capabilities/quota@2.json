@@ -1,0 +1,13 @@
+{
+  "capability_id": "quota",
+  "version": 2,
+  "payload": {
+    "environment_names": [
+      "CLAUDE_CONFIG_DIR",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
+}

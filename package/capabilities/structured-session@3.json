@@ -1,0 +1,17 @@
+{
+  "capability_id": "structured-session",
+  "version": 3,
+  "payload": {
+    "purposes": [
+      "read-only-review",
+      "implementation"
+    ],
+    "environment_names": [
+      "CLAUDE_CONFIG_DIR",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
+}
