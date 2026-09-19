@@ -120,6 +120,38 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
     return result;
 }
 
+addon::Attention_classification_result classify_attention(const addon::Attention_classification_request& request)
+{
+    addon::Attention_classification_result result{classify_event(request.base), std::nullopt};
+    if (result.base.observations.empty()) return result;
+    auto& observation = result.base.observations.front();
+    const auto& name = request.base.event.name;
+    if (name == "Stop") {
+        const auto* message = request.base.event.body.find("last_assistant_message");
+        if (message && message->is_string() && addon::looks_like_reply_request(message->as_string())) {
+            observation.attention_transition = addon::Attention_transition::REQUESTED;
+            observation.attention_evidence = addon::Evidence::INFERRED;
+            observation.attention_request_id = "conversation-" + std::to_string(request.base.ledger.current_epoch) + "-" +
+                (request.base.ledger.current_transition ? request.base.ledger.current_transition->nonce : std::string{}) + "-" +
+                addon::provider_event_evidence_digest_hex(request.base.event);
+            result.attention_kind = addon::Attention_kind{0, "conversational_hint"};
+        }
+    }
+    else if (name == "UserPromptSubmit" && request.pending_conversational_request_id) {
+        observation.attention_transition = addon::Attention_transition::RESOLVED;
+        observation.attention_evidence = addon::Evidence::INFERRED;
+        observation.attention_request_id = *request.pending_conversational_request_id;
+        result.attention_kind = addon::Attention_kind{0, "conversational_hint"};
+    }
+    else if (observation.attention_transition != addon::Attention_transition::NONE) {
+        const bool permission = name == "PermissionRequest" ||
+            text(request.base.event.body, "tool_name") == "ExitPlanMode";
+        result.attention_kind = addon::Attention_kind{0,
+            permission ? "permission" : "interactive_question"};
+    }
+    return result;
+}
+
 void handle_lifecycle(addon::Invocation_context& context)
 {
     if (context.request().operation != addon::k_classify_event_operation) {
@@ -127,6 +159,16 @@ void handle_lifecycle(addon::Invocation_context& context)
         return;
     }
     addon::Contract_failure failure;
+    if (context.request().capability.capability_id == addon::k_attention_kind_capability_id) {
+        const auto request = addon::decode_attention_classification_request(context.request().payload, &failure);
+        if (!request) {
+            context.fail(addon::Result_status::FAILED, failure.reason_code);
+        }
+        else {
+            context.succeed(addon::encode_attention_classification_result(classify_attention(*request)));
+        }
+        return;
+    }
     const auto request = addon::decode_classify_event_request(context.request().payload, &failure);
     if (!request) {
         context.fail(addon::Result_status::FAILED, failure.reason_code);

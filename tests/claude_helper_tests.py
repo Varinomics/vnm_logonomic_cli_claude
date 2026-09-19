@@ -55,6 +55,18 @@ def main():
         for mode in ("empty", "refused"):
             result, records, _ = run(prompt, CLAUDE_TEST_CONTEXT=mode)
             assert result.returncode == 0 and result.stdout == ""
+        stop = {"hook_event_name": "Stop", "session_id": "native-session",
+                "last_assistant_message": "Which directory?"}
+        for payload, retained in ((stop, True), ({**stop, "agent_id": "child"}, False),
+                                  ({**stop, "last_assistant_message": "x" * 2049}, False)):
+            result, records, _ = run(payload)
+            assert result.returncode == 0, result.stderr
+            delivered = next(item for item in records if item["operation"] == "provider-event")
+            event = delivered["request"]["event"]
+            assert event["name"] == "Stop"
+            assert ("last_assistant_message" in event["body"]) == retained
+            if retained:
+                assert event["body"]["last_assistant_message"] == stop["last_assistant_message"]
         result, records, _ = run({**prompt, "agent_id": "child-agent"})
         assert result.stdout == "" and all(item["operation"] != "request-title-instruction" for item in records)
         start = {"hook_event_name": "SessionStart", "session_id": "new-session", "source": "startup"}
