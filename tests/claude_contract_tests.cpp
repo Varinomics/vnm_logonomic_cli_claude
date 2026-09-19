@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -643,21 +644,55 @@ void empty_usage_cache_contract()
         std::ofstream seed(*cache.native_seed, std::ios::binary);
         seed.close();
         require(bool(seed), "empty native seed fixture written");
+        const auto require_missing_evidence = [&] {
+            bool refused = false;
+            try { (void)claude::scan_usage(root, context, cache); }
+            catch (const std::runtime_error& error) {
+                refused = std::string_view(error.what()) == "usage_required_cache_unavailable";
+            }
+            require(refused, "required history needs actual retained message evidence");
+        };
+        require_missing_evidence();
+        require(!fs::exists(*cache.storage_file), "refused empty seed must not publish an owned cache");
+
+        // Fresh empty history remains legal when the host requires no retained evidence.
+        cache.cache_required = false;
         require(claude::scan_usage(root, context, cache).empty(),
-            "explicit empty native seed satisfies required cache evidence");
+            "optional empty native seed supports fresh empty history");
+        require(fs::is_regular_file(*cache.storage_file), "optional scan persisted its empty cache");
+        std::ifstream before(*cache.storage_file, std::ios::binary);
+        require(bool(before), "existing cache opens before refusal");
+        const std::string accepted_before((std::istreambuf_iterator<char>(before)), std::istreambuf_iterator<char>());
+        before.close();
         fs::remove(*cache.native_seed);
         cache.native_seed.reset();
+        cache.cache_required = true;
+        require_missing_evidence();
+        std::ifstream after(*cache.storage_file, std::ios::binary);
+        require(bool(after), "existing cache opens after refusal");
+        const std::string accepted_after((std::istreambuf_iterator<char>(after)), std::istreambuf_iterator<char>());
+        after.close();
+        require(accepted_before == accepted_after, "refusal preserves the existing cache bytes");
+        cache.cache_required = false;
         require(claude::scan_usage(root, context, cache).empty(),
-            "header-only adopted package cache satisfies required cache evidence on reload");
+            "optional header-only cache remains valid on reload");
         fs::remove(*cache.storage_file);
-        bool missing_cache = false;
-        try {
-            (void)claude::scan_usage(root, context, cache);
-        }
-        catch (const std::runtime_error& error) {
-            missing_cache = std::string_view(error.what()) == "usage_required_cache_unavailable";
-        }
-        require(missing_cache, "required cache without package evidence or native seed fails");
+        cache.cache_required = true;
+        require_missing_evidence();
+
+        // A nonempty wrapper with no records is still not historical evidence.
+        cache.native_seed = root / "native-seed.jsonl";
+        auto wrapper = addon::Json_value::object();
+        wrapper.set("path", addon::Json_value(claude::path_string(root / "missing.jsonl")));
+        wrapper.set("records", addon::Json_value::array());
+        const auto wrapped = addon::serialize_json(wrapper) + "\n";
+        cache.seed_sha256_hex = addon::to_hex(addon::Sha256::digest(wrapped));
+        std::ofstream wrapper_file(*cache.native_seed, std::ios::binary);
+        wrapper_file << wrapped;
+        wrapper_file.close();
+        require(bool(wrapper_file), "zero-record native wrapper fixture written");
+        require_missing_evidence();
+        require(!fs::exists(*cache.storage_file), "zero-record refusal must not publish a cache");
     }
     catch (...) {
         fs::remove_all(root);
@@ -782,6 +817,39 @@ void retained_message_contract()
     }
 }
 
+void quota_reset_label_contract()
+{
+    using namespace logonomic::cli_addon;
+    const std::vector<std::pair<std::string,std::string>> cases{
+        {"7pm (Europe/Berlin)", "7pm (Europe/Berlin)"},
+        {"7pm (Europe/Berlin))., ", "7pm (Europe/Berlin)"},
+        {"7pm (Europe/Berlin).)", "7pm (Europe/Berlin)"},
+        {"Sep 18 (Europe/Berlin)\t", "Sep 18 (Europe/Berlin)"},
+        {"7pm., \t", "7pm"},
+        {"7pm)", "7pm"},
+        {"7pm.)", "7pm"},
+        {"7pm.) ,)\t", "7pm"},
+        {" ", ""},
+    };
+    for (const auto& [input, expected] : cases) {
+        Json_value event=Json_value::object();
+        event.set("type", Json_value("result"));
+        event.set("is_error", Json_value(false));
+        event.set("result", Json_value("Current session: 12% used, resets " + input +
+            "\nCurrent week: 34% used, resets " + input));
+        Structured_inspection inspection;
+        inspection.final=true; inspection.exit_code=0;
+        inspection.stdout_bytes=serialize_json(event);
+        const auto observation=claude::inspect_quota(inspection);
+        const bool good=expected.empty() ? (!observation.primary && !observation.secondary) :
+            (observation.primary && observation.secondary &&
+             observation.primary->reset_text.value_or("")==expected &&
+             observation.secondary->reset_text.value_or("")==expected);
+        std::cout << (good?"PASS":"FAIL") << " reset_label=[" << input << "] expected=[" << expected << "]\n";
+        require(good, "ARC-005 quota reset label must preserve balanced parentheses in both windows");
+    }
+}
+
 } // namespace
 
 int main()
@@ -793,6 +861,7 @@ int main()
         structured_contract();
         delegated_readiness_contract();
         probe_contract();
+        quota_reset_label_contract();
         usage_contract();
         empty_usage_cache_contract();
         retained_message_contract();

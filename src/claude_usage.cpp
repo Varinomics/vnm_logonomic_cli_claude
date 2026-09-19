@@ -499,7 +499,14 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
         receipt = read_cache(*cache_input.native_seed, true, cache, context, cache_input.seed_sha256_hex);
         cache_loaded = true;
     }
-    if (cache_input.cache_required && !cache_loaded) throw std::runtime_error("usage_required_cache_unavailable");
+    // Required evidence describes history already retained by the host. A
+    // validated empty seed (or a header-only local cache) proves only framing
+    // and a receipt, not the message evidence needed to reconstruct that history.
+    const bool retained_messages = std::any_of(cache.begin(), cache.end(),
+        [](const auto& entry) { return !entry.second.empty(); });
+    if (cache_input.cache_required && (!cache_loaded || !retained_messages)) {
+        throw std::runtime_error("usage_required_cache_unavailable");
+    }
     std::vector<fs::path> files;
     if (projects_present) for (const auto& entry : fs::recursive_directory_iterator(projects)) {
         if (context.cancel_requested()) throw std::runtime_error("cancelled");

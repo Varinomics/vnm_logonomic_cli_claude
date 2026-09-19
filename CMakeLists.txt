@@ -62,6 +62,11 @@ file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities/*"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/provenance/*"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/notices/*")
+# Directory membership is an input too: removing a resource, or adding one
+# with an older timestamp, must rebuild the indexed package. file(GENERATE)
+# changes this file only when membership changes, preserving no-op builds.
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
+    CONTENT "${package_files}\n")
 add_custom_command(
     OUTPUT "${CLAUDE_PACKAGE_DIRECTORY}/package.files.json"
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CLAUDE_PACKAGE_DIRECTORY}"
@@ -87,7 +92,7 @@ add_custom_command(
         --third-party "assets/claude.svg" "notices/lobe_icons_mit.txt"
             "provenance/lobe_icons.json"
     DEPENDS claude_adapter claude_helper claude_launch_bridge logonomic_cli_addon_index
-        "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" ${package_files}
+        "${CMAKE_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
     VERBATIM)
 add_custom_target(claude_package ALL DEPENDS "${CLAUDE_PACKAGE_DIRECTORY}/package.files.json")
 include(CTest)
@@ -120,3 +125,29 @@ if(BUILD_TESTING)
         claude_hook_contract_tests claude_helper_tests PROPERTIES TIMEOUT 120)
 endif()
 logonomic_cli_addon_install_package("${CLAUDE_PACKAGE_DIRECTORY}" logonomic.cli.claude)
+
+option(LOGONOMIC_CLI_ADDON_RECIPE_TESTS
+    "Register isolated package rebuild regressions (requires Python 3)" OFF)
+if(BUILD_TESTING AND LOGONOMIC_CLI_ADDON_RECIPE_TESTS)
+    # Exercise this repository's actual producer, never a substitute packaging
+    # implementation. The isolated nested configure uses this same SDK source;
+    # it does not change the owned master dependency or edit an installed package.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    get_target_property(_membership_sdk_source logonomic_cli_addon_sdk::sdk SOURCE_DIR)
+    add_test(NAME claude_package_membership
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/package_membership_tests.py"
+            "--source=${CMAKE_CURRENT_SOURCE_DIR}" "--sdk=${_membership_sdk_source}"
+            "--cmake=${CMAKE_COMMAND}" "--target=claude_package" "--package-id=logonomic.cli.claude"
+            "--generator=${CMAKE_GENERATOR}" "--config=$<CONFIG>" "--build-type=${CMAKE_BUILD_TYPE}"
+            "--generator-platform=${CMAKE_GENERATOR_PLATFORM}" "--toolset=${CMAKE_GENERATOR_TOOLSET}"
+            "--toolchain=${CMAKE_TOOLCHAIN_FILE}" "--compiler=${CMAKE_CXX_COMPILER}"
+            "--make-program=${CMAKE_MAKE_PROGRAM}" "--prefix-path=${CMAKE_PREFIX_PATH}"
+            "--validator=$<TARGET_FILE:logonomic_cli_addon_validate>" "--platform=${CLAUDE_PLATFORM}")
+    set_tests_properties(claude_package_membership PROPERTIES
+        TIMEOUT 1800 RESOURCE_LOCK cli_addon_recipe_rebuild LABELS "cli-addon;delivery;recipe;owning-path")
+endif()
+# Contract and recipe tests must not be confused with real native qualification.
+get_directory_property(_provider_tests TESTS)
+if(_provider_tests)
+    set_property(TEST ${_provider_tests} APPEND PROPERTY LABELS "cli-addon;provider-contract")
+endif()

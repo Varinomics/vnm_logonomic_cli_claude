@@ -404,7 +404,7 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
         if (directory.empty()) {
             continue;
         }
-        for (const auto suffix : windows ? std::vector<std::string>{".exe", ".cmd", ".ps1", ".bat"}
+        for (const auto& suffix : windows ? std::vector<std::string>{".exe", ".cmd", ".ps1", ".bat"}
                                          : std::vector<std::string>{""})
         {
             const auto candidate = addon::path_from_utf8(directory) / ("claude" + suffix);

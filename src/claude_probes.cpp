@@ -3,6 +3,7 @@
 #include "claude_launcher.h"
 #include "claude_support.h"
 
+#include <algorithm>
 #include <cmath>
 #include <optional>
 #include <regex>
@@ -55,8 +56,20 @@ addon::Quota_window quota_window(const std::string& content, const std::string& 
     const double used = std::stod(match[1].str());
     if (!std::isfinite(used)) throw std::runtime_error("quota_window_invalid");
     auto reset = match[2].str();
-    while (!reset.empty() && (reset.back() == ')' || reset.back() == '.' || reset.back() == ',' ||
-        reset.back() == ' ' || reset.back() == '\t')) reset.pop_back();
+    const auto trim_end = [&] {
+        while (!reset.empty() && (reset.back() == ' ' || reset.back() == '\t')) reset.pop_back();
+    };
+    trim_end();
+    while (!reset.empty()) {
+        const bool punctuation = reset.back() == '.' || reset.back() == ',';
+        const bool unmatched_close = reset.back() == ')' &&
+            std::count(reset.begin(), reset.end(), ')') > std::count(reset.begin(), reset.end(), '(');
+        if (!punctuation && !unmatched_close) {
+            break;
+        }
+        reset.pop_back();
+        trim_end();
+    }
     const auto begin = reset.find_first_not_of(" \t");
     if (begin == std::string::npos) throw std::runtime_error("quota_window_invalid");
     reset.erase(0, begin);
