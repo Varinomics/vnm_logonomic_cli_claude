@@ -8,6 +8,7 @@
 #include "claude_usage_summary.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/package_source.h>
 
@@ -130,6 +131,7 @@ int main()
         {"usage-saved-daily-tokens", 1},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"coordination-delivery", 1},
+        {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler([package_root](addon::Invocation_context& context) { invoke(context, package_root); });

@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -525,6 +526,259 @@ void launcher_directory_contract()
         for (char& ch : native) if (ch == '/') ch = '\\';
         require(!claude::canonical_resume_directory(native), "resume requires native oracle forward-separator spelling");
 #endif
+    }
+    catch (...) {
+        fs::remove_all(root);
+        throw;
+    }
+    fs::remove_all(root);
+}
+
+// The actual launch-preparation producer for one launch, with the package at
+// `root` and Node on the launch PATH.
+Context prepare_launch(
+    const fs::path&                                     root,
+    const std::string&                                  platform,
+    const std::string&                                  runner,
+    const std::vector<std::string>&                     launcher_argv,
+    const std::optional<addon::Initial_prompt_request>& initial_prompt,
+    const std::string&                                  instruction)
+{
+    addon::Prepare_request request;
+    request.launcher          = {"claude", runner, ""};
+    request.working_directory = claude::path_string(root);
+    request.title_instruction = instruction;
+    addon::Launch_environment environment;
+    environment.platform_id           = platform;
+    environment.effective_environment = Json::object();
+    environment.effective_environment.set("PATH", Json(claude::path_string(root / "tools")));
+    request.launch_environment = environment;
+    request.launcher_argv      = launcher_argv;
+    request.initial_prompt     = initial_prompt;
+    Context invocation;
+    invocation.m_request.capability.capability_id = "launch-preparation";
+    invocation.m_request.operation = "prepare";
+    invocation.m_request.payload = addon::encode_prepare_request(request, 3);
+    claude::handle_preparation(invocation, root);
+    return invocation;
+}
+
+// The replacement argv of a prepared launch that the host admits as delivering
+// `initial_prompt`.
+std::vector<std::string> acknowledged_argv(const Context& invocation, const addon::Initial_prompt_request& initial_prompt)
+{
+    require(invocation.m_finished && invocation.m_status == addon::Result_status::SUCCESS,
+        "a launcher that can carry the prompt is prepared");
+    addon::Contract_failure failure;
+    const auto patch = addon::decode_launch_patch(invocation.m_payload, &failure, 3);
+    require(patch && addon::validate_launch_patch(*patch, {}, {}, &failure) &&
+        addon::validate_initial_prompt_acknowledgment(initial_prompt, *patch, &failure),
+        "the host admits the acknowledged launch");
+    require(patch->disposition->prepared && patch->disposition->lifecycle_events,
+        "the acknowledged launch is prepared and keeps its hooks");
+    require(patch->initial_prompt->text_sha256_hex == addon::to_hex(addon::Sha256::digest(initial_prompt.text)),
+        "the echo is SHA-256 over the exact prompt bytes");
+    return *patch->argv;
+}
+
+// The host's continuation pointer to a brief.
+std::string pointer(const std::string& brief)
+{
+    return "Logonomic continuation: read the brief at " + brief +
+        " before anything else and follow it; do not modify the project until the user confirms.";
+}
+
+void require_refusal(const Context& invocation, const char* message)
+{
+    require(invocation.m_finished && invocation.m_status == addon::Result_status::UNAVAILABLE &&
+        invocation.m_reason == "initial_prompt_unavailable" && invocation.m_payload.is_null(), message);
+}
+
+void initial_prompt_contract()
+{
+    const auto root = fs::temp_directory_path() / ("claude-prompt-" + addon::random_nonce_hex());
+    fs::create_directories(root / "tools");
+    try {
+        // Both spellings of Node let either platform's rules run on any build host.
+        std::ofstream(root / "tools/node").close();
+        std::ofstream(root / "tools/node.exe").close();
+        const std::string instruction = "Set the session title.";
+        const auto plugin    = claude::path_string(root / "assets/claude-hooks");
+        const auto directory = claude::path_string(root / "briefs/7f3c9a2e5b1d4f60");
+        const auto brief     = claude::path_string(root / "briefs/7f3c9a2e5b1d4f60/brief.md");
+        const addon::Initial_prompt_request prompt{pointer(brief), brief};
+        const auto prepare = [
+                &root,
+                &instruction
+            ](
+                const std::string&                                  platform,
+                const std::string&                                  runner,
+                const std::vector<std::string>&                     launcher_argv,
+                const std::optional<addon::Initial_prompt_request>& initial_prompt)
+            {
+                return prepare_launch(root, platform, runner, launcher_argv, initial_prompt, instruction);
+            };
+
+        const std::vector<std::string> expected{"claude", "--add-dir", directory, "--append-system-prompt",
+            instruction, "--model", "sonnet", "--plugin-dir", plugin, prompt.text};
+        for (const auto* platform : {"linux-x86_64", "windows-x86_64"}) {
+            require(acknowledged_argv(prepare(platform, "direct", {"claude", "--model", "sonnet"}, prompt), prompt) ==
+                expected, "the prompt is the one positional argument, last, behind a grant of only the brief's directory");
+        }
+        std::vector<std::string> spliced{"cmd.exe", "/c"};
+        spliced.insert(spliced.end(), expected.begin(), expected.end());
+        require(acknowledged_argv(prepare("windows-x86_64", "cmd", {"cmd.exe", "/c", "claude --model sonnet"}, prompt),
+            prompt) == spliced, "cmd carries the same arguments as separate words");
+        std::string quoted = "claude";
+        for (auto argument = expected.begin() + 1; argument != expected.end(); ++argument) {
+            quoted += " '" + *argument + "'";
+        }
+        const auto powershell = acknowledged_argv(prepare("windows-x86_64", "powershell",
+            {"powershell.exe", "-NoLogo", "-Command", "claude --model sonnet"}, prompt), prompt);
+        require(powershell.size() == 4 && powershell[3] == quoted, "PowerShell renders the same arguments quoted");
+        const auto bash = acknowledged_argv(prepare("linux-x86_64", "bash",
+            {"/usr/bin/bash", "-c", "claude --model sonnet"}, prompt), prompt);
+        require(bash.size() == 3 && bash[2] == quoted, "a POSIX shell renders the same arguments quoted");
+
+        const auto plain = prepare("linux-x86_64", "direct", {"claude", "--model", "sonnet"}, std::nullopt);
+        addon::Contract_failure failure;
+        const auto unprompted = addon::decode_launch_patch(plain.m_payload, &failure, 3);
+        require(unprompted && !unprompted->initial_prompt && *unprompted->argv == std::vector<std::string>{
+                "claude", "--append-system-prompt", instruction, "--model", "sonnet", "--plugin-dir", plugin},
+            "a launch without an initial prompt gains neither a grant nor a prompt");
+
+        for (const auto& launcher : std::vector<std::vector<std::string>>{
+                {"npx", "@anthropic-ai/claude-code"}, {"claude", "--add-dir", directory}, {"claude", "-p"},
+                {"claude", "--resume", "a375d05e-f6cf-4812-80f5-91b33d24c053"}, {"claude", "-c"},
+                {"claude", "existing prompt"}})
+        {
+            require_refusal(prepare("linux-x86_64", "direct", launcher, prompt),
+                "a package runner, an unknown option, print mode, a session selector or a prompt of its own refuses");
+        }
+        require_refusal(prepare("linux-x86_64", "bash", {"bash", "-c", "claude; echo done"}, prompt),
+            "shell control syntax refuses");
+        require_refusal(prepare("windows-x86_64", "bash", {"bash", "-lc", "claude"}, prompt),
+            "a Windows POSIX shell rewrites path-like arguments and refuses");
+        for (const auto* marker : {"%PATH%", "!PATH!", "\"quoted\""}) {
+            const addon::Initial_prompt_request marked{pointer(brief) + " " + marker, brief};
+            require_refusal(prepare("windows-x86_64", "cmd", {"cmd.exe", "/c", "claude"}, marked),
+                "cmd.exe would rewrite a prompt with a variable reference or a quote");
+            require(acknowledged_argv(prepare("linux-x86_64", "direct", {"claude"}, marked), marked).back() ==
+                marked.text, "a POSIX launch carries every prompt byte");
+        }
+        require_refusal(prepare("windows-x86_64", "direct", {"claude", "--model", "sonnet&echo"}, prompt),
+            "an unquoted Windows argument with a cmd operator refuses");
+        require_refusal(prepare("windows-x86_64", "cmd", {"cmd.exe", "/c", "\"C:\\Program Files\\Claude\\claude.exe\""},
+            prompt), "cmd.exe strips the quotes of a program with a space and refuses");
+        require_refusal(prepare("windows-x86_64", "direct", {"C:\\Program Files\\nodejs\\claude.cmd"}, prompt),
+            "cmd.exe also strips the quotes of a batch file with a space that the host starts directly");
+        require(acknowledged_argv(prepare("windows-x86_64", "direct", {"C:\\Program Files\\Claude\\claude.exe"}, prompt),
+            prompt).front() == "C:\\Program Files\\Claude\\claude.exe", "a native image with a space needs no cmd.exe");
+        const std::string long_instruction(3900, 'i');
+        const std::string long_prompt(3900, 's');
+        require_refusal(prepare_launch(root, "windows-x86_64", "cmd",
+                {"cmd.exe", "/c", "claude --system-prompt " + long_prompt}, prompt, long_instruction),
+            "a command line over cmd.exe's limit refuses");
+        require(acknowledged_argv(prepare_launch(root, "linux-x86_64", "direct",
+                {"claude", "--system-prompt", long_prompt}, prompt, long_instruction), prompt).back() == prompt.text,
+            "the same arguments fit a direct POSIX launch");
+        require_refusal(prepare_launch(root, "linux-x86_64", "bash", {"bash", "-c", "claude"}, prompt, long_instruction),
+            "a rendering over the argument bound refuses");
+        require_refusal(prepare("windows-x86_64", "powershell", {"powershell.exe", "-NoLogo", "-Command", "claude"},
+                addon::Initial_prompt_request{pointer(brief) + " O\xE2\x80\x99" "Brien", brief}),
+            "PowerShell would end the quoted prompt at a typographic quote");
+        require_refusal(prepare("windows-x86_64", "powershell",
+                {"powershell.exe", "-NoLogo", "-Command", "claude --settings 'C:\\settings dir\\'"}, prompt),
+            "Windows PowerShell would escape the closing quote after a trailing backslash");
+        const auto top = claude::path_string(root.root_path() / "brief.md");
+        require_refusal(prepare("linux-x86_64", "direct", {"claude"}, addon::Initial_prompt_request{pointer(top), top}),
+            "a brief in a root directory would grant the root");
+        const auto dotted = claude::path_string(root / "briefs/7f3c9a2e5b1d4f60/../brief.md");
+        require_refusal(prepare("linux-x86_64", "direct", {"claude"},
+            addon::Initial_prompt_request{pointer(dotted), dotted}), "a dotted path could name a wider directory");
+        require_refusal(prepare("linux-x86_64", "direct", {"claude"},
+            addon::Initial_prompt_request{"-" + prompt.text, brief}), "Claude would read a leading '-' as an option");
+        require_refusal(prepare("linux-x86_64", "direct", {"claude"}, addon::Initial_prompt_request{"update", brief}),
+            "Claude could read a single word as a subcommand");
+
+        // Claude's own reading of each prepared launch: the prompt is its one
+        // operand, the title instruction reaches --append-system-prompt, the
+        // hook plugin and the brief's directory are the values of their
+        // options, and every value the launcher gave stays that option's.
+        for (const auto& launcher : std::vector<std::vector<std::string>>{
+                {"claude", "--system-prompt", "--append-system-prompt"},
+                {"claude", "--system-prompt", "--plugin-dir"},
+                {"claude", "--name", "--verbose", "--append-system-prompt", "Keep answers short."},
+                {"claude", "--prompt-suggestions", "off", "--model", "sonnet"},
+                {"claude", "--prompt-suggestions=No"}})
+        {
+            for (const auto* platform : {"linux-x86_64", "windows-x86_64"}) {
+                const auto reading = claude_reading(acknowledged_argv(prepare(platform, "direct", launcher, prompt), prompt));
+                const auto appended = reading.values("--append-system-prompt");
+                require(reading.operands == std::vector<std::string>{prompt.text} &&
+                    appended.size() == 1 && appended.front().find(instruction) != std::string::npos &&
+                    reading.values("--plugin-dir") == std::vector<std::string>{plugin} &&
+                    reading.values("--add-dir") == std::vector<std::string>{directory},
+                    "Claude reads the prompt as its one operand and each added value as its option's");
+                const auto source = claude_reading(launcher);
+                for (const auto& [option, values] : source.options) {
+                    if (option != "--append-system-prompt" && option != "--plugin-dir") {
+                        require(reading.values(option) == source.values(option), "every launcher value stays its option's");
+                    }
+                }
+            }
+        }
+        {
+            // Without Node there are no hooks, and no plugin to add.
+            const auto bare = root / "without-node";
+            fs::create_directories(bare);
+            const auto launch = prepare_launch(bare, "linux-x86_64", "direct",
+                {"claude", "--system-prompt", "--append-system-prompt"}, prompt, instruction);
+            const auto patch = addon::decode_launch_patch(launch.m_payload, &failure, 3);
+            require(launch.m_status == addon::Result_status::SUCCESS && patch &&
+                addon::validate_initial_prompt_acknowledgment(prompt, *patch, &failure) &&
+                !patch->disposition->lifecycle_events, "a launch without Node carries the prompt without hooks");
+            const auto reading = claude_reading(*patch->argv);
+            require(reading.operands == std::vector<std::string>{prompt.text} &&
+                reading.values("--system-prompt") == std::vector<std::string>{"--append-system-prompt"} &&
+                reading.values("--append-system-prompt") == std::vector<std::string>{instruction},
+                "without hooks the title instruction is still an option value, not a second prompt");
+        }
+
+        // Claude submits its positional prompt as typed input: a prompt that
+        // its input handling would change or not send is refused.
+        for (const auto& text : std::vector<std::string>{
+                "/review " + prompt.text, " " + prompt.text, prompt.text + " ", "exit ", "  ",
+                prompt.text + " Then ultraplan the change.", prompt.text + " See [Pasted text #1 +4 lines].",
+                "[Image #1] " + prompt.text, prompt.text + " [...Truncated text #2 +10 lines...]",
+                prompt.text + "\xC2\xA0"})
+        {
+            require_refusal(prepare("linux-x86_64", "direct", {"claude"}, addon::Initial_prompt_request{text, brief}),
+                "a prompt Claude would run as a command, trim, drop or rewrite refuses");
+        }
+        const addon::Initial_prompt_request bracketed{prompt.text + " Keep the plan [draft #1] as written.", brief};
+        require(acknowledged_argv(prepare("linux-x86_64", "direct", {"claude"}, bracketed), bracketed).back() ==
+            bracketed.text, "brackets that are no paste reference are carried");
+
+        // A main-thread agent's own initial prompt comes first in the first
+        // turn, and inline settings can select one or add a blocking hook.
+        for (const auto& launcher : std::vector<std::vector<std::string>>{
+                {"claude", "--agent", "reviewer"}, {"claude", "--agent=reviewer"},
+                {"claude", "--settings", "{\"agent\":\"reviewer\"}"},
+                {"claude", "--settings= {\"model\":\"sonnet\"} "},
+                {"claude", "--settings", "\xC2\xA0{\"agent\":\"reviewer\"}\xE3\x80\x80"},
+                {"claude", "--settings=\xEF\xBB\xBF\v{\"agent\":\"reviewer\"}\xE2\x80\xA8"}})
+        {
+            require_refusal(prepare("linux-x86_64", "direct", launcher, prompt),
+                "a launcher that selects an agent or passes settings inline refuses");
+        }
+        for (const auto& launcher : std::vector<std::vector<std::string>>{
+                {"claude", "--name", "--agent"}, {"claude", "--settings", "settings.json"},
+                {"claude", "--settings=C:/Users/zoe/.claude/review-settings.json"}})
+        {
+            require(acknowledged_argv(prepare("linux-x86_64", "direct", launcher, prompt), prompt).back() == prompt.text,
+                "a settings file, and an option value that reads like --agent, are the user's configuration");
+        }
     }
     catch (...) {
         fs::remove_all(root);
@@ -1517,6 +1771,7 @@ int main(int argc, char** argv)
         launcher_discovery_candidate_limit();
         launcher_discovery_scan_limit();
         launcher_directory_contract();
+        initial_prompt_contract();
         lifecycle_contract();
         declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
         structured_contract();

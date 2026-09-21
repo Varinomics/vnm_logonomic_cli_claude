@@ -73,12 +73,37 @@ and root-result provenance still apply. Task-server children remain
 within the host-owned process lifetime.
 Non-delegated sessions retain their one-shot input behavior.
 
+Interactive launch preparation also accepts the host's
+`interactive-initial-prompt@1` member. The prepared invocation starts a new
+interactive session whose first user message is the host's text, passed as
+Claude's positional prompt; it lets Claude read the directory of the host's
+referenced file through `--add-dir` and nothing wider, and the result echoes
+the text's SHA-256. Only Claude itself with known interactive options is
+prepared this way, never a package runner. Preparation fails `unavailable`
+with `initial_prompt_unavailable`, instead of launching without the prompt,
+wherever a layer between the host and Claude could change the text: a POSIX
+shell on Windows; cmd.exe variable expansion, quotes, operators outside quotes,
+a quoted program or its line limit; Windows PowerShell's native argument
+passing; or an invocation over the launch-preparation@3 argument bounds. It
+also fails where Claude itself would not submit the text as it is: Claude
+submits its positional prompt as typed input, so a text that is one word,
+starts with `-` or `/`, has whitespace or a non-ASCII character at either end,
+names `ultraplan` or holds a paste reference such as `[Pasted text #1]` is
+refused, and so is a launcher that selects a main-thread agent with `--agent`,
+whose own initial prompt Claude puts first, or passes `--settings` inline JSON,
+which can do the same or add a hook. The user's own Claude configuration (a
+default agent, hooks, managed settings, plugins, or a settings file a launcher
+names) is outside the acknowledgment and acts on the first message as on any
+typed one.
+
 Contract tests cover launcher and resume restrictions, root/child structured
 stream handling, delegated control correlation and catalog admission, ordered
 task/EOF delivery, lifecycle correlation, auth and quota interpretation, transcript
-deduplication, partial coverage, and hook response admission. Qualification of
-the coordinated host file-cache handoff and package persistence is required
-before cutover.
+deduplication, partial coverage, hook response admission, and initial-prompt
+preparation and refusal. A delivery test runs every prepared initial-prompt
+launcher shape against a stand-in CLI that records the arguments it receives.
+Qualification of the coordinated host file-cache handoff and package
+persistence is required before cutover.
 
 The Claude icon derives from Lobe Icons. Its unchanged MIT notice is in
 `package/notices/lobe_icons_mit.txt`; `package/provenance/lobe_icons.json`
