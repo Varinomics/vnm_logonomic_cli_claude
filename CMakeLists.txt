@@ -164,6 +164,12 @@ if(BUILD_TESTING)
     add_test(NAME claude_usage_cache_tests
         COMMAND claude_usage_cache_tests "${CLAUDE_PACKAGE_DIRECTORY}")
     set_tests_properties(claude_usage_cache_tests PROPERTIES TIMEOUT 180 LABELS "usage;cache;packaged-adapter")
+    add_executable(claude_usage_host_tests tests/claude_usage_host_tests.cpp)
+    target_link_libraries(claude_usage_host_tests PRIVATE claude_provider)
+    claude_target(claude_usage_host_tests)
+    add_dependencies(claude_usage_host_tests claude_package)
+    add_test(NAME claude_usage_host_tests COMMAND claude_usage_host_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    set_tests_properties(claude_usage_host_tests PROPERTIES TIMEOUT 180 LABELS "usage;cache;packaged-adapter")
 endif()
 
 option(LOGONOMIC_CLI_ADDON_RECIPE_TESTS
