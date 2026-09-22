@@ -10,7 +10,9 @@
 
 #include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/launch_preparation.h>
+#include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/probe_contracts.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
 #include <cstdint>
@@ -120,6 +122,20 @@ void launcher_directory_contract()
         const auto process = claude::cli_process(launch, false);
         require(!process.argv.empty() && addon::path_from_utf8(process.argv.front()) == program,
             "wrapped Claude relative PATH resolves against requested directory");
+#ifdef _WIN32
+        // Windows environment names are case-insensitive, and the host passes
+        // the launcher environment in its own spelling: `Path` for the system
+        // search path.
+        auto windows_spelling = launch;
+        auto& effective = windows_spelling.launch_environment->effective_environment;
+        effective.erase("PATH");
+        effective.set("Path", Json("tools"));
+        const auto resolved = claude::cli_process(windows_spelling, false);
+        require(!resolved.argv.empty() && addon::path_from_utf8(resolved.argv.front()) == program,
+            "the Windows Path spelling resolves the wrapped Claude program");
+        require(claude::node_available(*windows_spelling.launch_environment, directory),
+            "the Windows Path spelling finds Node for hooks and resume");
+#endif
         require(claude::canonical_resume_directory(directory), "clean absolute resume directory admitted");
         addon::Resume_prepare_request resume;
         resume.context = launch;
@@ -603,6 +619,77 @@ void probe_contract()
         overage.secondary->used_percent == 121, "native quota overage remains observable without clamping");
 }
 
+#ifdef _WIN32
+void probe_profile_contract()
+{
+    // Windows environment names are case-insensitive, and the host passes the
+    // launcher environment in its own spelling. Claude Code honours
+    // Claude_Config_Dir, so the quota probe and the account must select it too.
+    const auto root = fs::temp_directory_path() / ("claude-profile-" + addon::random_nonce_hex());
+    const auto configured = root / "work-profile";
+    const auto home = root / "home";
+    fs::create_directories(root / "tools");
+    fs::create_directories(configured);
+    fs::create_directories(home / ".claude");
+    std::ofstream(root / "tools/claude.exe").close();
+    try {
+        addon::Probe_prepare_request request;
+        request.context.working_directory = claude::path_string(root);
+        request.context.launcher.script_body = "claude";
+        request.context.launcher.runner_key = "bash";
+        request.context.launcher_argv = {"bash", "-c", "claude"};
+        request.context.launch_environment = addon::Launch_environment{};
+        request.context.launch_environment->platform_id = "windows-x86_64";
+        auto& environment = request.context.launch_environment->effective_environment;
+        environment.set("Path", Json(claude::path_string(root / "tools")));
+        environment.set("UserProfile", Json(claude::path_string(home)));
+        environment.set("Claude_Config_Dir", Json(claude::path_string(configured)));
+        addon::Contract_failure failure;
+        const auto probe_profile = [&]() {
+            Context invocation;
+            invocation.m_request.capability.capability_id = "quota";
+            invocation.m_request.operation = "prepare";
+            invocation.m_request.payload = addon::encode_probe_prepare_request(request, 2);
+            claude::handle_probes(invocation, root);
+            const auto prepared = addon::decode_structured_prepare_result(invocation.m_payload, &failure, 2);
+            require(prepared.has_value(), "quota preparation yields a process proposal");
+            for (const auto& [name, value] : prepared->process.environment) {
+                if (name == "CLAUDE_CONFIG_DIR") return claude::account_key(addon::path_from_utf8(value));
+            }
+            throw std::runtime_error("quota probe names no Claude profile");
+        };
+        const auto resolved_account = [&]() {
+            addon::Accounts_launcher_request accounts;
+            accounts.launcher = request.context.launcher;
+            accounts.launch_environment = *request.context.launch_environment;
+            accounts.normalization_directory = claude::path_string(root);
+            Context invocation;
+            invocation.m_request.capability.capability_id = "accounts";
+            invocation.m_request.operation = "resolve";
+            invocation.m_request.payload = addon::encode_accounts_launcher_request(accounts);
+            claude::handle_accounts(invocation);
+            const auto resolution = addon::decode_account_resolution_result(invocation.m_payload, &failure);
+            require(resolution && resolution->adapter_account_key, "account resolution names an account");
+            return *resolution->adapter_account_key;
+        };
+        require(probe_profile() == claude::account_key(configured),
+            "the quota probe runs against the profile named by Claude_Config_Dir");
+        require(resolved_account() == claude::account_key(configured),
+            "the account is the profile named by Claude_Config_Dir");
+        environment.erase("Claude_Config_Dir");
+        require(probe_profile() == claude::account_key(home / ".claude"),
+            "without a profile override the quota probe uses UserProfile's .claude");
+        require(resolved_account() == claude::account_key(home / ".claude"),
+            "without a profile override the account is UserProfile's .claude");
+    }
+    catch (...) {
+        fs::remove_all(root);
+        throw;
+    }
+    fs::remove_all(root);
+}
+#endif
+
 void usage_contract()
 {
     const auto root = fs::temp_directory_path() / ("claude-usage-" + addon::random_nonce_hex());
@@ -899,6 +986,45 @@ void quota_reset_label_contract()
     }
 }
 
+void account_name_contract()
+{
+    // Oracle: accounts@1 names an account with a filesystem profile after the
+    // profile's folder through the SDK's account_display_name.
+#ifdef _WIN32
+    const std::string platform = "windows-x86_64";
+    const std::string home     = "C:/Users/Jane Doe";
+    const std::string home_env = "USERPROFILE";
+#else
+    const std::string platform = "linux-x86_64";
+    const std::string home     = "/home/jane";
+    const std::string home_env = "HOME";
+#endif
+    const auto discovered_name = [&](const std::string& config_dir) {
+        addon::Accounts_launcher_request request;
+        request.launcher.script_body = "claude";
+        request.launcher.runner_key  = addon::k_runner_direct;
+        request.launch_environment.platform_id = platform;
+        request.launch_environment.effective_environment = Json::object();
+        request.launch_environment.effective_environment.set(home_env, Json(home));
+        request.launch_environment.effective_environment.set("CLAUDE_CONFIG_DIR", Json(config_dir));
+        request.default_home_fallback   = home;
+        request.normalization_directory = home;
+        Context discovery;
+        discovery.m_request.capability.capability_id = "accounts";
+        discovery.m_request.operation = addon::k_accounts_discover_operation;
+        discovery.m_request.payload   = addon::encode_accounts_launcher_request(request);
+        claude::handle_accounts(discovery);
+        addon::Contract_failure failure;
+        const auto accounts = addon::decode_accounts_result(discovery.m_payload, &failure);
+        return accounts && accounts->size() == 1 ? accounts->front().display_name : std::string{};
+    };
+    require(discovered_name(home + "/.claude-work/") == ".claude-work",
+        "a trailing separator does not hide the profile folder's name");
+    const std::string long_home = home + "/.claude-account-for-the-varinomics-nightly-release-builds";
+    require(discovered_name(long_home) == addon::account_display_name(long_home),
+        "an over-long folder name is fitted by the SDK's account display-name rule");
+}
+
 } // namespace
 
 int main()
@@ -910,7 +1036,11 @@ int main()
         structured_contract();
         delegated_readiness_contract();
         probe_contract();
+#ifdef _WIN32
+        probe_profile_contract();
+#endif
         quota_reset_label_contract();
+        account_name_contract();
         usage_contract();
         empty_usage_cache_contract();
         retained_message_contract();
