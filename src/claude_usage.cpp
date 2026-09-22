@@ -42,6 +42,13 @@ constexpr std::uint64_t k_max_exact = 9007199254740991;
 // transcripts that changed.
 constexpr std::size_t k_max_record_bytes = 512 * 1024 * 1024;
 constexpr std::size_t k_read_bytes = 1024 * 1024;
+// The cache writes a transcript's messages in lines of about this many
+// serialized bytes, far below the record bound, so it stays readable however
+// many messages one transcript accumulates.
+constexpr std::size_t k_cache_line_bytes = 1024 * 1024;
+// claude-message-cache-v1 kept each transcript on one line; v2 continues a
+// transcript on consecutive lines. Both are read.
+constexpr std::string_view k_cache_format = "claude-message-cache-v2";
 
 Json usage_object(std::string_view bytes)
 {
@@ -431,6 +438,7 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
     addon::Sha256 digest;
     std::string receipt;
     bool header_seen = native;
+    std::string previous_source;
     std::string_view line;
     bool terminated = false;
     while (stream.next(line, terminated)) {
@@ -440,7 +448,8 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
         digest.update("\n");
         const auto wrapper = usage_object(line);
         if (!header_seen) {
-            if (text(wrapper, "format") != "claude-message-cache-v1") throw std::runtime_error("usage_cache_invalid");
+            const auto format = text(wrapper, "format");
+            if (format != k_cache_format && format != "claude-message-cache-v1") throw std::runtime_error("usage_cache_invalid");
             receipt = text(wrapper, "seed_sha256_hex");
             header_seen = true;
             continue;
@@ -449,9 +458,15 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
         if (!addon::path_from_utf8(raw_source).is_absolute()) throw std::runtime_error("usage_cache_invalid");
         const auto source = cache_path(addon::path_from_utf8(raw_source));
         const auto* records = wrapper.find("records");
-        if (!records || !records->is_array() || cache.contains(source)) throw std::runtime_error("usage_cache_invalid");
+        // Only the first of a transcript's consecutive lines carries its fingerprint.
+        const bool continued = !native && source == previous_source;
+        const auto fingerprint = native ? std::nullopt : cached_fingerprint(wrapper);
+        if (!records || !records->is_array() || (continued ? fingerprint.has_value() : cache.contains(source))) {
+            throw std::runtime_error("usage_cache_invalid");
+        }
+        previous_source = source;
         auto& destination = cache[source];
-        if (!native) destination.fingerprint = cached_fingerprint(wrapper);
+        if (!continued) destination.fingerprint = fingerprint;
         for (const auto& record : records->as_array()) {
             destination.messages.push_back(cached_message(record, native));
         }
@@ -506,21 +521,32 @@ void write_cache(const fs::path& path, const File_cache& cache, addon::Invocatio
         std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
         if (!stream) throw std::runtime_error("usage_cache_write_failed");
         Json header = Json::object();
-        header.set("format", Json("claude-message-cache-v1"));
+        header.set("format", Json(k_cache_format));
         header.set("seed_sha256_hex", Json(seed_receipt));
         stream << addon::serialize_json(header) << '\n';
         for (const auto& [source, file] : cache) {
             if (context.cancel_requested()) throw std::runtime_error("cancelled");
-            Json wrapper = Json::object();
-            wrapper.set("path", Json(source));
-            if (file.fingerprint) {
-                wrapper.set("size",     Json(file.fingerprint->size));
-                wrapper.set("modified", Json(file.fingerprint->modified));
+            auto next = file.messages.begin();
+            bool first = true;
+            do {
+                Json wrapper = Json::object();
+                wrapper.set("path", Json(source));
+                if (first && file.fingerprint) {
+                    wrapper.set("size",     Json(file.fingerprint->size));
+                    wrapper.set("modified", Json(file.fingerprint->modified));
+                }
+                Json entries = Json::array();
+                std::size_t bytes = 0;
+                for (; next != file.messages.end() && bytes < k_cache_line_bytes; ++next) {
+                    auto entry = cache_record(*next);
+                    bytes += addon::serialize_json(entry).size();
+                    entries.push_back(std::move(entry));
+                }
+                wrapper.set("records", std::move(entries));
+                stream << addon::serialize_json(wrapper) << '\n';
+                first = false;
             }
-            Json entries = Json::array();
-            for (const auto& record : file.messages) entries.push_back(cache_record(record));
-            wrapper.set("records", std::move(entries));
-            stream << addon::serialize_json(wrapper) << '\n';
+            while (next != file.messages.end());
         }
         stream.close();
         if (!stream) throw std::runtime_error("usage_cache_write_failed");
@@ -778,7 +804,8 @@ void handle_usage(addon::Invocation_context& context)
                     *selection.accepted, root, input->context.account_context,
                     [&context] { return context.cancel_requested(); }, &failure);
                 if (!manifest) throw std::runtime_error(failure.reason_code);
-                if (manifest->format != "claude-message-cache@1" || manifest->files.size() != 1 ||
+                if ((manifest->format != "claude-message-cache@1" && manifest->format != "claude-message-cache@2") ||
+                    manifest->files.size() != 1 ||
                     manifest->files.front().path != "messages.jsonl")
                 {
                     throw std::runtime_error("usage_cache_format_unsupported");
@@ -807,7 +834,7 @@ void handle_usage(addon::Invocation_context& context)
             for (auto& session : snapshot.sessions) session.record.aggregate_evidence = "partial";
             snapshot.cache_candidate = addon::seal_usage_cache_candidate(
                 input->cache_selection->candidate_root, input->context.profile_storage->root,
-                input->context.account_context, snapshot_id, "claude-message-cache@1",
+                input->context.account_context, snapshot_id, "claude-message-cache@2",
                 [&context] { return context.cancel_requested(); }, &failure);
             if (!snapshot.cache_candidate) throw std::runtime_error(failure.reason_code);
         }

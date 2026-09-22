@@ -40,7 +40,10 @@ The first scan consumes a host-bound native file-cache seed when supplied and
 commits a package-owned per-file cache before returning results. The cache
 records each transcript's size and modification time; an incremental scan
 parses only transcripts whose values changed, while repair and reset parse all
-of them. A transcript that changes while it is read keeps its previous evidence
+of them. Equal size and modification time are taken to mean unchanged content,
+the check the pre-cutover scanner used: transcripts are append-only, and repair
+rereads every transcript. A transcript's cached messages are written across
+lines of about 1 MiB each, so no cache line nears the record bound. A transcript that changes while it is read keeps its previous evidence
 until a later scan reads it at rest. Only a single record is bounded in size;
 the size and number of transcripts and messages are not. Deleted files remain
 represented by their retained per-message evidence. Historical coverage
