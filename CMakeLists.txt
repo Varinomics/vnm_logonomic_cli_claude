@@ -69,6 +69,11 @@ add_executable(claude_helper src/claude_helper.cpp)
 claude_target(claude_helper)
 add_executable(claude_launch_bridge src/claude_launch_bridge.cpp)
 claude_target(claude_launch_bridge)
+if(MINGW)
+    # The bridge's Windows entry point is wmain, which MinGW links only with
+    # -municode.
+    target_link_options(claude_launch_bridge PRIVATE -municode)
+endif()
 
 logonomic_cli_addon_package_platform(CLAUDE_PLATFORM)
 set(CLAUDE_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
