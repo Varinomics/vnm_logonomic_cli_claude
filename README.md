@@ -37,8 +37,13 @@ finalized assistant messages under that profile's `projects` directory, deduplic
 exact message IDs, retain partial token-category coverage, and attribute tokens
 to repositories from recorded working directories. No monetary cost is inferred.
 The first scan consumes a host-bound native file-cache seed when supplied and
-commits a package-owned per-file cache before returning results. Deleted files
-remain represented by their retained per-message evidence. Historical coverage
+commits a package-owned per-file cache before returning results. The cache
+records each transcript's size and modification time; an incremental scan
+parses only transcripts whose values changed, while repair and reset parse all
+of them. A transcript that changes while it is read keeps its previous evidence
+until a later scan reads it at rest. Only a single record is bounded in size,
+not a transcript or the history. Deleted files remain represented by their
+retained per-message evidence. Historical coverage
 remains explicitly incomplete because transcripts do not prove a complete
 lifetime history.
 

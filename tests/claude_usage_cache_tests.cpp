@@ -8,6 +8,7 @@
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/usage_scan.h>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,7 @@
 #include <utility>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -53,6 +55,65 @@ public:
 
 private:
     addon::Invoke_request m_request;
+};
+
+class Scan_context final : public addon::Invocation_context
+{
+public:
+    const addon::Invoke_request& request() const override { return m_request; }
+    bool cancel_requested() const override { return false; }
+    bool wait_for_cancel(int) override { return false; }
+    void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
+    void succeed(addon::Json_value) override {}
+    void fail(addon::Result_status, std::string, std::string) override {}
+    bool finished() const override { return false; }
+
+private:
+    addon::Invoke_request m_request;
+};
+
+std::string assistant_record(std::string_view session, std::string_view id, unsigned tokens)
+{
+    return "{\"type\":\"assistant\",\"sessionId\":\"" + std::string(session) +
+        "\",\"timestamp\":\"2026-09-12T12:00:00Z\",\"message\":{\"id\":\"" + std::string(id) +
+        "\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":" + std::to_string(tokens) + "}}}\n";
+}
+
+// A live session appends to its transcript while a scan reads it. This
+// context appends one completed record at each cancellation poll, a bounded
+// number of times.
+class Live_writer_context final : public addon::Invocation_context
+{
+public:
+    explicit Live_writer_context(fs::path transcript)
+    :
+        m_transcript(std::move(transcript))
+    {}
+
+    const addon::Invoke_request& request() const override { return m_request; }
+    bool cancel_requested() const override
+    {
+        if (m_appended < 20) {
+            std::ofstream append(m_transcript, std::ios::binary | std::ios::app);
+            append << assistant_record("live", "live-appended-" + std::to_string(m_appended), 7);
+            append.close();
+            check(append.good(), "live transcript append written");
+            ++m_appended;
+        }
+        return false;
+    }
+    bool wait_for_cancel(int) override { return false; }
+    void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
+    void succeed(addon::Json_value) override {}
+    void fail(addon::Result_status, std::string, std::string) override {}
+    bool finished() const override { return false; }
+
+    unsigned appended() const { return m_appended; }
+
+private:
+    addon::Invoke_request m_request;
+    fs::path              m_transcript;
+    mutable unsigned      m_appended = 0;
 };
 
 class Workspace
@@ -349,21 +410,156 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
     write(addon::usage_cache_io_path(addon::path_from_utf8(first.cache_candidate->root) / "unlisted"), "unexpected");
     check(outcome_for(request, 3).status != addon::Host_status::SUCCESS,
         "corrupt selected inventory fails without fallback");
+
+    // An incremental scan reuses the accepted evidence of a transcript whose
+    // size and modification time are unchanged, and rereads only the others.
+    request.context = first_request.context;
+    const auto steady  = profile / "projects/incremental/steady.jsonl";
+    const auto growing = profile / "projects/incremental/growing.jsonl";
+    const auto message = assistant_record;
+    const auto session_total = [](const addon::Usage_scan_page& page, std::string_view session) {
+        std::uint64_t sum = 0;
+        for (const auto& record : page.records) {
+            if (record.session_key == session) {
+                sum += record.total_tokens;
+            }
+        }
+        return sum;
+    };
+    write(steady, message("steady", "steady-1", 100) + message("steady", "steady-2", 200) +
+        message("steady", "steady-3", 300));
+    const auto third = message("growing", "growing-3", 30);
+    const auto split = third.size() / 2;
+    write(growing, message("growing", "growing-1", 10) + message("growing", "growing-2", 20) +
+        third.substr(0, split));
+    select("incremental-base", std::nullopt);
+    const auto base = all_pages(request, 3);
+    check(session_total(base, "steady") == 600 && session_total(base, "growing") == 30,
+        "a record still being written is not counted");
+    validate(*base.cache_candidate);
+
+    // Unreadable bytes behind an unchanged size and modification time prove
+    // that the incremental scan did not parse the file again.
+    const auto steady_size     = fs::file_size(steady);
+    const auto steady_modified = fs::last_write_time(steady);
+    write(steady, std::string(steady_size - 1, 'x') + "\n");
+    fs::last_write_time(steady, steady_modified);
+    check(fs::file_size(steady) == steady_size && fs::last_write_time(steady) == steady_modified,
+        "rewritten fixture keeps its size and modification time");
+    {
+        std::ofstream append(growing, std::ios::binary | std::ios::app);
+        append << third.substr(split) << message("growing", "growing-1", 10) << message("growing", "growing-4", 40);
+        append.close();
+        check(append.good(), "appended transcript fixture written");
+    }
+    select("incremental-next", base.cache_candidate);
+    const auto next = all_pages(request, 3);
+    check(session_total(next, "steady") == 600, "an unchanged transcript is not parsed again");
+    check(session_total(next, "growing") == 100,
+        "an appended transcript adds exactly its new records, once each");
+    validate(*next.cache_candidate);
+
+    select("incremental-repair", next.cache_candidate);
+    request.mode = "repair";
+    check(outcome_for(request, 3).status != addon::Host_status::SUCCESS,
+        "repair rereads every transcript instead of trusting its recorded fingerprint");
     check(host.shutdown(1000, nullptr), "packaged adapter exits without contacting a model");
+}
+
+void large_history_contract(const fs::path& fixture)
+{
+    // Only a single record is bounded, so a history of any size scans. The
+    // fixture's history exceeds 512 MiB, the largest record the scanner parses.
+    const auto profile = fixture / "large-profile";
+    const auto filler = "{\"type\":\"user\",\"sessionId\":\"large-session\",\"timestamp\":\"2026-09-12T12:00:00Z\","
+        "\"message\":{\"role\":\"user\",\"content\":\"" + std::string(1024 * 1024, 'x') + "\"}}\n";
+    std::uint64_t history_bytes = 0;
+    std::uint64_t expected      = 0;
+    for (unsigned file = 0; file < 5; ++file) {
+        const auto path = profile / "projects/large" / ("session-" + std::to_string(file) + ".jsonl");
+        fs::create_directories(path.parent_path());
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        for (unsigned line = 0; line < 105; ++line) {
+            output << filler;
+        }
+        const auto tokens = 1000 + file;
+        output << "{\"type\":\"assistant\",\"sessionId\":\"large-session\",\"timestamp\":\"2026-09-12T12:00:00Z\","
+            "\"message\":{\"id\":\"large-" << file << "\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":"
+            << tokens << "}}}\n";
+        output.close();
+        check(output.good(), "large transcript fixture written");
+        history_bytes += fs::file_size(path);
+        expected      += tokens;
+    }
+    check(history_bytes > 512ull * 1024 * 1024, "fixture exceeds the former whole-history budget");
+    Scan_context context;
+    const auto started  = std::chrono::steady_clock::now();
+    const auto sessions = claude::scan_usage(profile, context);
+    const auto elapsed  = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    std::cout << "scanned " << history_bytes << " history bytes in " << elapsed.count() << " ms\n";
+    check(sessions.size() == 1 && sessions[0].record.total_tokens == expected && sessions[0].message_count == 5,
+        "a history larger than the former budget scans completely");
+    fs::remove_all(profile);
+}
+
+void live_transcript_contract(const fs::path& fixture)
+{
+    const auto profile = fixture / "live-profile";
+    const auto live    = profile / "projects/active/live.jsonl";
+    const auto steady  = profile / "projects/active/steady.jsonl";
+    write(live,   assistant_record("live", "live-1", 10) + assistant_record("live", "live-2", 20));
+    write(steady, assistant_record("steady", "steady-1", 100) + assistant_record("steady", "steady-2", 200));
+    claude::Usage_cache_input cache;
+    cache.storage_file = fixture / "owned-cache.jsonl";
+    cache.incremental  = true;
+    const auto session_total = [](const std::vector<claude::Usage_session>& sessions, std::string_view session) {
+        std::uint64_t sum = 0;
+        for (const auto& entry : sessions) {
+            if (entry.record.session_key == session) {
+                sum += entry.record.total_tokens;
+            }
+        }
+        return sum;
+    };
+
+    // A transcript that grows while it is read keeps its previous evidence,
+    // here none, instead of failing the scan of every other transcript.
+    Live_writer_context writing(live);
+    const auto racing = claude::scan_usage(profile, writing, cache);
+    check(writing.appended() > 0, "the live writer appended during the scan");
+    check(session_total(racing, "steady") == 300 && session_total(racing, "live") == 0,
+        "a scan racing a live writer completes with the other transcripts");
+
+    Scan_context quiet;
+    const auto settled = claude::scan_usage(profile, quiet, cache);
+    check(session_total(settled, "steady") == 300 &&
+        session_total(settled, "live") == 30 + 7ull * writing.appended(),
+        "the next scan reads the settled transcript completely");
 }
 
 } // namespace
 
 int main(int argc, char** argv)
 {
-    try {
-        check(argc == 2, "expected built package directory");
-        Workspace workspace;
-        adapter_cache_contract(addon::path_from_utf8(argv[1]), workspace.m_path);
-        return 0;
-    }
-    catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
+    if (argc != 2) {
+        std::cerr << "expected built package directory\n";
         return 1;
     }
+    int failures = 0;
+    const auto run = [&failures](const char* name, const auto& contract) {
+        try {
+            Workspace workspace;
+            contract(workspace.m_path);
+        }
+        catch (const std::exception& error) {
+            std::cerr << name << ": " << error.what() << '\n';
+            ++failures;
+        }
+    };
+    const auto package = addon::path_from_utf8(argv[1]);
+    run("adapter cache", [&package](const fs::path& fixture) { adapter_cache_contract(package, fixture); });
+    run("large history", large_history_contract);
+    run("live transcript", live_transcript_contract);
+    return failures == 0 ? 0 : 1;
 }

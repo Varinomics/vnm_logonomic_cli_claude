@@ -35,18 +35,97 @@ namespace fs = std::filesystem;
 using Json = addon::Json_value;
 
 constexpr std::uint64_t k_max_exact = 9007199254740991;
-constexpr std::uint64_t k_max_history_bytes = 512 * 1024 * 1024;
+// A transcript or cache line is held and parsed whole, so each record is
+// bounded. Files and the history as a whole are not: they are read one line at
+// a time, and an incremental scan reads only the transcripts that changed.
+constexpr std::size_t k_max_record_bytes = 512 * 1024 * 1024;
 constexpr std::size_t k_max_messages = 1000000;
+constexpr std::size_t k_read_bytes = 1024 * 1024;
 
 Json usage_object(std::string_view bytes)
 {
     addon::Json_parse_limits limits;
-    limits.max_bytes = k_max_history_bytes;
-    limits.max_string_bytes = k_max_history_bytes;
+    limits.max_bytes = k_max_record_bytes;
+    limits.max_string_bytes = k_max_record_bytes;
     addon::Json_parse_error failure;
     auto value = addon::parse_json(bytes, limits, &failure);
     if (!value || !value->is_object()) throw std::runtime_error("usage_json_invalid");
     return std::move(*value);
+}
+
+// Yields the lines of a file while buffering at most one record. The final
+// line is reported unterminated when no newline ends the file, because a
+// transcript's last record may still be being written.
+class Line_reader
+{
+public:
+    explicit Line_reader(const fs::path& path)
+    :
+        m_stream(path, std::ios::binary)
+    {}
+
+    bool is_open() const { return m_stream.is_open(); }
+    bool failed()  const { return m_stream.bad(); }
+
+    // False at the end of the input. The view is valid until the next call.
+    bool next(std::string_view& line, bool& terminated)
+    {
+        for (;;) {
+            const auto newline = m_buffer.find('\n', m_searched);
+            if (newline != std::string::npos) {
+                if (newline - m_begin > k_max_record_bytes) throw std::runtime_error("usage_record_capacity");
+                line       = std::string_view(m_buffer).substr(m_begin, newline - m_begin);
+                m_begin    = newline + 1;
+                m_searched = m_begin;
+                terminated = true;
+                return true;
+            }
+            if (m_buffer.size() - m_begin > k_max_record_bytes) throw std::runtime_error("usage_record_capacity");
+            if (m_end_of_input) {
+                if (m_begin == m_buffer.size()) return false;
+                line       = std::string_view(m_buffer).substr(m_begin);
+                m_begin    = m_buffer.size();
+                m_searched = m_begin;
+                terminated = false;
+                return true;
+            }
+            m_buffer.erase(0, m_begin);
+            m_begin = 0;
+            const auto kept = m_buffer.size();
+            m_buffer.resize(kept + k_read_bytes);
+            m_stream.read(m_buffer.data() + kept, static_cast<std::streamsize>(k_read_bytes));
+            const auto received = static_cast<std::size_t>(m_stream.gcount());
+            m_buffer.resize(kept + received);
+            m_searched     = kept;
+            m_end_of_input = received < k_read_bytes;
+        }
+    }
+
+private:
+    std::ifstream m_stream;
+    std::string   m_buffer;
+    std::size_t   m_begin        = 0;
+    std::size_t   m_searched     = 0;
+    bool          m_end_of_input = false;
+};
+
+// The size and modification time of a transcript when it was parsed. Ticks of
+// fs::file_time_type compare only on the platform that recorded them, which
+// is the only one that reads this profile's cache.
+struct file_fingerprint_t
+{
+    std::int64_t size     = 0;
+    std::int64_t modified = 0;
+
+    bool operator==(const file_fingerprint_t&) const = default;
+};
+
+file_fingerprint_t fingerprint(const fs::path& path)
+{
+    return {
+        static_cast<std::int64_t>(fs::file_size(path)),
+        static_cast<std::int64_t>(fs::last_write_time(path).time_since_epoch().count()),
+    };
 }
 
 struct Message
@@ -163,21 +242,22 @@ std::optional<std::string> repository(const std::string& cwd)
     return std::nullopt;
 }
 
-std::vector<Message> parse_file(const fs::path& path, addon::Invocation_context& context, std::uint64_t& bytes_read)
+// Empty when the transcript changed while it was read: a live session is still
+// appending to it, and a later scan reads it at rest.
+std::optional<std::vector<Message>> parse_file(
+    const fs::path& path, addon::Invocation_context& context, file_fingerprint_t& observed)
 {
-    const auto size = fs::file_size(path);
-    const auto modified = fs::last_write_time(path);
-    if (size > k_max_history_bytes - bytes_read) throw std::runtime_error("usage_history_capacity");
-    bytes_read += size;
-    std::ifstream file(path, std::ios::binary);
-    if (!file) throw std::runtime_error("usage_file_unreadable");
+    observed = fingerprint(path);
+    Line_reader file(path);
+    if (!file.is_open()) throw std::runtime_error("usage_file_unreadable");
     std::vector<Message> result;
-    std::string line;
-    while (std::getline(file, line)) {
+    std::string_view line;
+    bool terminated = false;
+    while (file.next(line, terminated)) {
         if (context.cancel_requested()) throw std::runtime_error("cancelled");
-        if (file.eof()) break; // An unterminated record is still being written.
+        if (!terminated) break; // An unterminated record is still being written.
         const auto first = line.find_first_not_of('\0');
-        const auto event = usage_object(first == std::string::npos ? std::string_view{} : std::string_view(line).substr(first));
+        const auto event = usage_object(first == std::string_view::npos ? std::string_view{} : line.substr(first));
         if (text(event, "type") != "assistant") continue;
         const auto* message = event.find("message");
         if (!message || !message->is_object()) continue;
@@ -203,14 +283,20 @@ std::vector<Message> parse_file(const fs::path& path, addon::Invocation_context&
         if (result.size() >= k_max_messages) throw std::runtime_error("usage_history_capacity");
         result.push_back(std::move(record));
     }
-    if (file.bad() || fs::file_size(path) != size || fs::last_write_time(path) != modified) {
-        throw std::runtime_error("usage_file_changed");
-    }
+    if (file.failed()) throw std::runtime_error("usage_file_unreadable");
+    if (fingerprint(path) != observed) return std::nullopt;
     return result;
 }
 
+struct Cached_file
+{
+    // Absent for evidence adopted from a native seed, which is parsed again
+    // whenever its transcript is present.
+    std::optional<file_fingerprint_t> fingerprint;
+    std::vector<Message>              messages;
+};
 
-using File_cache = std::map<std::string, std::vector<Message>>;
+using File_cache = std::map<std::string, Cached_file>;
 
 std::vector<Message> reconcile_messages(
     const std::vector<Message>& retained, std::vector<Message> observed)
@@ -321,21 +407,30 @@ Message cached_message(const Json& value, bool native)
     return result;
 }
 
+std::optional<file_fingerprint_t> cached_fingerprint(const Json& wrapper)
+{
+    const auto* size     = wrapper.find("size");
+    const auto* modified = wrapper.find("modified");
+    if (!size && !modified) return std::nullopt;
+    if (!size || !modified || !size->is_integer() || !modified->is_integer() || size->as_integer() < 0) {
+        throw std::runtime_error("usage_cache_invalid");
+    }
+    return file_fingerprint_t{size->as_integer(), modified->as_integer()};
+}
+
 std::string read_cache(const fs::path& path, bool native, File_cache& cache, addon::Invocation_context& context, std::string_view expected_hash = {})
 {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) throw std::runtime_error("usage_cache_unavailable");
-    std::uint64_t bytes = 0;
+    Line_reader stream(path);
+    if (!stream.is_open()) throw std::runtime_error("usage_cache_unavailable");
     addon::Sha256 digest;
     std::string receipt;
     bool header_seen = native;
     std::size_t messages = 0;
-    std::string line;
-    while (std::getline(stream, line)) {
+    std::string_view line;
+    bool terminated = false;
+    while (stream.next(line, terminated)) {
         if (context.cancel_requested()) throw std::runtime_error("cancelled");
-        if (stream.eof()) throw std::runtime_error("usage_cache_incomplete");
-        if (line.size() > k_max_history_bytes - bytes) throw std::runtime_error("usage_history_capacity");
-        bytes += line.size();
+        if (!terminated) throw std::runtime_error("usage_cache_incomplete");
         digest.update(line);
         digest.update("\n");
         const auto wrapper = usage_object(line);
@@ -351,12 +446,13 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
         const auto* records = wrapper.find("records");
         if (!records || !records->is_array() || cache.contains(source)) throw std::runtime_error("usage_cache_invalid");
         auto& destination = cache[source];
+        if (!native) destination.fingerprint = cached_fingerprint(wrapper);
         for (const auto& record : records->as_array()) {
             if (++messages > k_max_messages) throw std::runtime_error("usage_history_capacity");
-            destination.push_back(cached_message(record, native));
+            destination.messages.push_back(cached_message(record, native));
         }
     }
-    if (stream.bad() || !header_seen) throw std::runtime_error("usage_cache_unavailable");
+    if (stream.failed() || !header_seen) throw std::runtime_error("usage_cache_unavailable");
     if (native && (expected_hash.empty() || addon::to_hex(digest.finish()) != expected_hash)) {
         throw std::runtime_error("usage_seed_digest_mismatch");
     }
@@ -409,12 +505,16 @@ void write_cache(const fs::path& path, const File_cache& cache, addon::Invocatio
         header.set("format", Json("claude-message-cache-v1"));
         header.set("seed_sha256_hex", Json(seed_receipt));
         stream << addon::serialize_json(header) << '\n';
-        for (const auto& [source, records] : cache) {
+        for (const auto& [source, file] : cache) {
             if (context.cancel_requested()) throw std::runtime_error("cancelled");
             Json wrapper = Json::object();
             wrapper.set("path", Json(source));
+            if (file.fingerprint) {
+                wrapper.set("size",     Json(file.fingerprint->size));
+                wrapper.set("modified", Json(file.fingerprint->modified));
+            }
             Json entries = Json::array();
-            for (const auto& record : records) entries.push_back(cache_record(record));
+            for (const auto& record : file.messages) entries.push_back(cache_record(record));
             wrapper.set("records", std::move(entries));
             stream << addon::serialize_json(wrapper) << '\n';
         }
@@ -505,7 +605,7 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     // validated empty seed (or a header-only local cache) proves only framing
     // and a receipt, not the message evidence needed to reconstruct that history.
     const bool retained_messages = std::any_of(cache.begin(), cache.end(),
-        [](const auto& entry) { return !entry.second.empty(); });
+        [](const auto& entry) { return !entry.second.messages.empty(); });
     if (cache_input.cache_required && (!cache_loaded || !retained_messages)) {
         throw std::runtime_error("usage_required_cache_unavailable");
     }
@@ -518,17 +618,34 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     std::sort(files.begin(), files.end());
     std::map<std::string, Message> messages;
     std::vector<std::string> order;
-    std::uint64_t bytes_read = 0;
+    // Messages share a few working directories; probe each one once per scan.
+    std::map<std::string, std::optional<std::string>> repositories;
+    const auto repository_of = [&repositories](const std::string& cwd) -> const std::optional<std::string>& {
+        auto found = repositories.find(cwd);
+        if (found == repositories.end()) {
+            found = repositories.emplace(cwd, repository(cwd)).first;
+        }
+        return found->second;
+    };
     std::uint64_t processed = 0;
     for (const auto& file : files) {
-        auto observed = parse_file(file, context, bytes_read);
-        auto& retained = cache[cache_path(file)];
-        retained = reconcile_messages(retained, std::move(observed));
+        auto& cached = cache[cache_path(file)];
+        // Incremental scans keep the evidence of a transcript whose size and
+        // modification time still match the ones recorded when it was parsed.
+        // A transcript that changes while it is read also keeps its evidence
+        // and fingerprint, so the next scan reads it again.
+        if (!cache_input.incremental || cached.fingerprint != fingerprint(file)) {
+            file_fingerprint_t observed;
+            if (auto parsed = parse_file(file, context, observed)) {
+                cached.messages    = reconcile_messages(cached.messages, std::move(*parsed));
+                cached.fingerprint = observed;
+            }
+        }
         context.report_progress(++processed, files.size());
     }
-    for (const auto& [path, records] : cache) {
+    for (const auto& [path, file] : cache) {
         (void)path;
-        for (const auto& record : records) {
+        for (const auto& record : file.messages) {
             const auto previous = messages.find(record.id);
             if (previous == messages.end()) {
                 if (messages.size() == k_max_messages) throw std::runtime_error("usage_history_capacity");
@@ -550,7 +667,7 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
                     existing.categories = record.categories;
                 }
             }
-            if (!existing.repository_conflicted && repository(existing.cwd) != repository(record.cwd)) {
+            if (!existing.repository_conflicted && repository_of(existing.cwd) != repository_of(record.cwd)) {
                 existing.cwd.clear();
                 existing.repository_conflicted = true;
             }
@@ -574,7 +691,7 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
                 ++session.category_coverage[index];
             }
         }
-        const auto repo = repository(message.cwd);
+        const auto& repo = repository_of(message.cwd);
         if (repo) add(session.repository_tokens[*repo], message.total);
         else add(session.unattributed_tokens, message.total);
     }
@@ -643,6 +760,7 @@ void handle_usage(addon::Invocation_context& context)
         snapshot.profile = profile_key;
         if (!input->context.profile_storage) throw std::runtime_error("profile_storage_unavailable");
         Usage_cache_input cache;
+        cache.incremental  = input->mode == "incremental";
         cache.storage_file = addon::path_from_utf8(input->context.profile_storage->root) / "claude-message-cache-v1.jsonl";
         if (version == 3) {
             const auto& selection = *input->cache_selection;
