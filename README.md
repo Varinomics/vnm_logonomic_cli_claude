@@ -41,9 +41,9 @@ commits a package-owned per-file cache before returning results. The cache
 records each transcript's size and modification time; an incremental scan
 parses only transcripts whose values changed, while repair and reset parse all
 of them. A transcript that changes while it is read keeps its previous evidence
-until a later scan reads it at rest. Only a single record is bounded in size,
-not a transcript or the history. Deleted files remain represented by their
-retained per-message evidence. Historical coverage
+until a later scan reads it at rest. Only a single record is bounded in size;
+the size and number of transcripts and messages are not. Deleted files remain
+represented by their retained per-message evidence. Historical coverage
 remains explicitly incomplete because transcripts do not prove a complete
 lifetime history.
 

@@ -503,6 +503,34 @@ void large_history_contract(const fs::path& fixture)
     fs::remove_all(profile);
 }
 
+void many_messages_contract(const fs::path& fixture)
+{
+    // Nor is the number of messages bounded: one transcript holds more than a
+    // million completed messages.
+    const auto profile = fixture / "many-profile";
+    const auto path    = profile / "projects/many/session.jsonl";
+    constexpr unsigned messages = 1000001;
+    fs::create_directories(path.parent_path());
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        for (unsigned index = 0; index < messages; ++index) {
+            output << assistant_record("many", "message-" + std::to_string(index), 1);
+        }
+        output.close();
+        check(output.good(), "many-message transcript written");
+    }
+    Scan_context context;
+    const auto started  = std::chrono::steady_clock::now();
+    const auto sessions = claude::scan_usage(profile, context);
+    const auto elapsed  = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    std::cout << "scanned " << messages << " messages in " << elapsed.count() << " ms\n";
+    check(sessions.size() == 1 && sessions[0].message_count == messages &&
+        sessions[0].record.total_tokens == messages,
+        "a history of more than a million messages scans completely");
+    fs::remove_all(profile);
+}
+
 void live_transcript_contract(const fs::path& fixture)
 {
     const auto profile = fixture / "live-profile";
@@ -560,6 +588,7 @@ int main(int argc, char** argv)
     const auto package = addon::path_from_utf8(argv[1]);
     run("adapter cache", [&package](const fs::path& fixture) { adapter_cache_contract(package, fixture); });
     run("large history", large_history_contract);
+    run("many messages", many_messages_contract);
     run("live transcript", live_transcript_contract);
     return failures == 0 ? 0 : 1;
 }

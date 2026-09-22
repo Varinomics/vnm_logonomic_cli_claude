@@ -25,6 +25,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace claude {
@@ -36,10 +37,10 @@ using Json = addon::Json_value;
 
 constexpr std::uint64_t k_max_exact = 9007199254740991;
 // A transcript or cache line is held and parsed whole, so each record is
-// bounded. Files and the history as a whole are not: they are read one line at
-// a time, and an incremental scan reads only the transcripts that changed.
+// bounded. Nothing else is: transcripts are read one line at a time, a scan
+// holds each retained message once, and an incremental scan parses only the
+// transcripts that changed.
 constexpr std::size_t k_max_record_bytes = 512 * 1024 * 1024;
-constexpr std::size_t k_max_messages = 1000000;
 constexpr std::size_t k_read_bytes = 1024 * 1024;
 
 Json usage_object(std::string_view bytes)
@@ -138,8 +139,6 @@ struct Message
     std::string model;
     std::array<std::optional<std::uint64_t>, 4> categories;
     std::uint64_t total = 0;
-    bool breakdown_conflicted = false;
-    bool repository_conflicted = false;
 };
 
 struct Snapshot
@@ -250,6 +249,7 @@ std::optional<std::vector<Message>> parse_file(
     observed = fingerprint(path);
     Line_reader file(path);
     if (!file.is_open()) throw std::runtime_error("usage_file_unreadable");
+    const auto source = path_string(fs::absolute(path).lexically_normal());
     std::vector<Message> result;
     std::string_view line;
     bool terminated = false;
@@ -272,7 +272,7 @@ std::optional<std::vector<Message>> parse_file(
         record.session = text(event, "sessionId");
         if (record.session.empty()) record.session = path_string(path.stem());
         record.date   = local_date(text(event, "timestamp"));
-        record.source = path_string(fs::absolute(path).lexically_normal());
+        record.source = source;
         record.cwd    = text(event, "cwd");
         record.model  = text(*message, "model");
         record.categories = {count(values, "input_tokens"), count(values, "output_tokens"),
@@ -280,7 +280,6 @@ std::optional<std::vector<Message>> parse_file(
         for (const auto& category : record.categories) {
             if (category) add(record.total, *category);
         }
-        if (result.size() >= k_max_messages) throw std::runtime_error("usage_history_capacity");
         result.push_back(std::move(record));
     }
     if (file.failed()) throw std::runtime_error("usage_file_unreadable");
@@ -298,6 +297,16 @@ struct Cached_file
 
 using File_cache = std::map<std::string, Cached_file>;
 
+// One message ID across every transcript that recorded it: the first retained
+// copy and what the other copies agree on.
+struct merged_message_t
+{
+    const Message*                              first;
+    std::array<std::optional<std::uint64_t>, 4> categories;
+    bool                                        breakdown_conflicted;
+    bool                                        repository_conflicted;
+};
+
 std::vector<Message> reconcile_messages(
     const std::vector<Message>& retained, std::vector<Message> observed)
 {
@@ -309,9 +318,6 @@ std::vector<Message> reconcile_messages(
     // messages provide no evidence that previously completed usage disappeared.
     for (const auto& message : retained) {
         if (!observed_ids.contains(message.id)) {
-            if (observed.size() >= k_max_messages) {
-                throw std::runtime_error("usage_history_capacity");
-            }
             observed.push_back(message);
         }
     }
@@ -425,7 +431,6 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
     addon::Sha256 digest;
     std::string receipt;
     bool header_seen = native;
-    std::size_t messages = 0;
     std::string_view line;
     bool terminated = false;
     while (stream.next(line, terminated)) {
@@ -448,7 +453,6 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
         auto& destination = cache[source];
         if (!native) destination.fingerprint = cached_fingerprint(wrapper);
         for (const auto& record : records->as_array()) {
-            if (++messages > k_max_messages) throw std::runtime_error("usage_history_capacity");
             destination.messages.push_back(cached_message(record, native));
         }
     }
@@ -613,11 +617,8 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     if (projects_present) for (const auto& entry : fs::recursive_directory_iterator(projects)) {
         if (context.cancel_requested()) throw std::runtime_error("cancelled");
         if (entry.is_regular_file() && entry.path().extension() == ".jsonl") files.push_back(entry.path());
-        if (files.size() > 100000) throw std::runtime_error("usage_history_capacity");
     }
     std::sort(files.begin(), files.end());
-    std::map<std::string, Message> messages;
-    std::vector<std::string> order;
     // Messages share a few working directories; probe each one once per scan.
     std::map<std::string, std::optional<std::string>> repositories;
     const auto repository_of = [&repositories](const std::string& cwd) -> const std::optional<std::string>& {
@@ -643,18 +644,21 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
         }
         context.report_progress(++processed, files.size());
     }
+    // The retained messages stay in the cache; deduplication keys on their IDs
+    // and refers to each ID's first copy in the order the cache holds them.
+    std::unordered_map<std::string_view, merged_message_t> merged;
+    std::vector<const merged_message_t*> order;
     for (const auto& [path, file] : cache) {
         (void)path;
         for (const auto& record : file.messages) {
-            const auto previous = messages.find(record.id);
-            if (previous == messages.end()) {
-                if (messages.size() == k_max_messages) throw std::runtime_error("usage_history_capacity");
-                order.push_back(record.id);
-                messages.emplace(record.id, record);
+            const auto [previous, inserted] = merged.try_emplace(
+                record.id, merged_message_t{&record, record.categories, false, false});
+            if (inserted) {
+                order.push_back(&previous->second);
                 continue;
             }
             auto& existing = previous->second;
-            if (existing.total != record.total) throw std::runtime_error("conflicting_message_usage");
+            if (existing.first->total != record.total) throw std::runtime_error("conflicting_message_usage");
             if (!existing.breakdown_conflicted) {
                 const auto present = [](const auto& categories) {
                     return std::any_of(categories.begin(), categories.end(), [](const auto& value) { return value.has_value(); });
@@ -667,15 +671,15 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
                     existing.categories = record.categories;
                 }
             }
-            if (!existing.repository_conflicted && repository_of(existing.cwd) != repository_of(record.cwd)) {
-                existing.cwd.clear();
+            if (!existing.repository_conflicted && repository_of(existing.first->cwd) != repository_of(record.cwd)) {
                 existing.repository_conflicted = true;
             }
         }
     }
     std::map<std::string, Usage_session> sessions;
-    for (const auto& id : order) {
-        const auto& message = messages.at(id);
+    const std::optional<std::string> unattributed;
+    for (const auto* entry : order) {
+        const auto& message = *entry->first;
         auto& session = sessions[message.session];
         session.record.record_id = message.session;
         session.record.session_key = message.session;
@@ -685,13 +689,13 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
         session.record.completed_date = std::max(session.record.completed_date, message.date);
         add(session.record.total_tokens, message.total);
         ++session.message_count;
-        for (std::size_t index = 0; index < message.categories.size(); ++index) {
-            if (message.categories[index]) {
-                add(session.category_values[index], *message.categories[index]);
+        for (std::size_t index = 0; index < entry->categories.size(); ++index) {
+            if (entry->categories[index]) {
+                add(session.category_values[index], *entry->categories[index]);
                 ++session.category_coverage[index];
             }
         }
-        const auto& repo = repository_of(message.cwd);
+        const auto& repo = entry->repository_conflicted ? unattributed : repository_of(message.cwd);
         if (repo) add(session.repository_tokens[*repo], message.total);
         else add(session.unattributed_tokens, message.total);
     }
