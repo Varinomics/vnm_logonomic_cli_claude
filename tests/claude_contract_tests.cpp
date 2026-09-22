@@ -1269,7 +1269,7 @@ void account_name_contract()
     const std::string home     = "/home/jane";
     const std::string home_env = "HOME";
 #endif
-    const auto discovered_name = [&](const std::string& config_dir) {
+    const auto discovered_account = [&](const std::string& config_dir) -> std::optional<addon::Account_record> {
         addon::Accounts_launcher_request request;
         request.launcher.script_body = "claude";
         request.launcher.runner_key  = addon::k_runner_direct;
@@ -1286,13 +1286,25 @@ void account_name_contract()
         claude::handle_accounts(discovery);
         addon::Contract_failure failure;
         const auto accounts = addon::decode_accounts_result(discovery.m_payload, &failure);
-        return accounts && accounts->size() == 1 ? accounts->front().display_name : std::string{};
+        return accounts && accounts->size() == 1 ? std::optional(accounts->front()) : std::nullopt;
+    };
+    const auto discovered_name = [&](const std::string& config_dir) {
+        const auto account = discovered_account(config_dir);
+        return account ? account->display_name : std::string{};
     };
     require(discovered_name(home + "/.claude-work/") == ".claude-work",
         "a trailing separator does not hide the profile folder's name");
     const std::string long_home = home + "/.claude-account-for-the-varinomics-nightly-release-builds";
     require(discovered_name(long_home) == addon::account_display_name(long_home),
         "an over-long folder name is fitted by the SDK's account display-name rule");
+#ifdef _WIN32
+    // A profile on a share that cannot be reached is an unavailable account;
+    // it must not fail the discovery of every account.
+    const auto unreachable = discovered_account("\\\\localhost\\logonomic-absent-share\\");
+    require(unreachable && unreachable->display_name == "\\\\localhost\\logonomic-absent-share" &&
+        unreachable->status == addon::Account_status::UNAVAILABLE,
+        "a profile on an unreachable share is discovered as an unavailable account");
+#endif
 }
 
 } // namespace
