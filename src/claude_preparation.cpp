@@ -5,6 +5,7 @@
 #include "claude_support.h"
 
 #include <logonomic_cli_addon/launch_preparation.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
 #include <algorithm>
@@ -132,7 +133,7 @@ std::optional<std::vector<std::string>> literal_command(const std::vector<std::s
 bool node_available(const addon::Launch_environment& launch, const std::string& working_directory)
 {
     const bool windows = launch.platform_id == "windows-x86_64";
-    std::istringstream paths(text(launch.effective_environment, "PATH"));
+    std::istringstream paths(addon::environment_value(addon::environment_pairs(launch.effective_environment), "PATH"));
     for (std::string directory; std::getline(paths, directory, windows ? ';' : ':');) {
         if (directory.empty()) continue;
         std::error_code error;

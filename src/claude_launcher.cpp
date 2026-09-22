@@ -2,6 +2,7 @@
 #include "claude_support.h"
 #include "claude_accounts.h"
 
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
 
 #include <algorithm>
@@ -349,7 +350,7 @@ logonomic::cli_addon::Process_proposal cli_process(
         return result;
     }
     if (preserve_arguments) throw std::runtime_error("unsupported_launcher");
-    const auto& environment = context.launch_environment->effective_environment;
+    const auto environment = addon::environment_pairs(context.launch_environment->effective_environment);
     const bool windows = context.launch_environment->platform_id == "windows-x86_64";
     std::vector<fs::path> candidates;
     auto program = addon::path_from_utf8(command->program);
@@ -357,7 +358,7 @@ logonomic::cli_addon::Process_proposal cli_process(
         candidates.push_back(program.is_absolute() ? program : addon::path_from_utf8(context.working_directory) / program);
     }
     else {
-        std::istringstream directories(text(environment, "PATH"));
+        std::istringstream directories(addon::environment_value(environment, "PATH"));
         for (std::string directory; std::getline(directories, directory, windows ? ';' : ':');) {
             if (directory.empty()) continue;
             auto path = addon::path_from_utf8(directory);

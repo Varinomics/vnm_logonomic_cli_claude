@@ -3,6 +3,7 @@
 #include "claude_lifecycle.h"
 #include "claude_support.h"
 
+#include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/sha256.h>
 
@@ -31,11 +32,12 @@ fs::path normalize(const fs::path& profile)
 
 fs::path selected_profile(const addon::Launch_environment& launch, std::string_view fallback, std::string_view normalization_directory)
 {
-    const auto& environment = launch.effective_environment;
-    auto profile = text(environment, "CLAUDE_CONFIG_DIR");
+    const auto environment = addon::environment_pairs(launch.effective_environment);
+    auto profile = addon::environment_value(environment, "CLAUDE_CONFIG_DIR");
     if (profile.empty()) {
-        auto home = text(environment, launch.platform_id == "windows-x86_64" ? "USERPROFILE" : "HOME");
-        if (home.empty()) home = text(environment, "HOME");
+        auto home = addon::environment_value(
+            environment, launch.platform_id == "windows-x86_64" ? "USERPROFILE" : "HOME");
+        if (home.empty()) home = addon::environment_value(environment, "HOME");
         if (home.empty()) home = std::string(fallback);
         if (home.empty()) throw std::runtime_error("profile_unavailable");
         return normalize(addon::path_from_utf8(home) / ".claude");
