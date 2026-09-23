@@ -12,9 +12,11 @@
 #include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/probe_contracts.h>
 #include <logonomic_cli_addon/session_contracts.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -26,11 +28,24 @@
 #include <utility>
 #include <vector>
 
+namespace claude {
+bool is_valid_claude_config_environment_text(std::string_view environment_text);
+}
+
 namespace {
 
 namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
 using Json = addon::Json_value;
+
+std::size_t unicode_scalar_count(std::string_view value)
+{
+    std::size_t count = 0;
+    for (const unsigned char character : value) {
+        if ((character & 0xC0) != 0x80) ++count;
+    }
+    return count;
+}
 
 class Context : public addon::Invocation_context
 {
@@ -88,6 +103,245 @@ void launcher_contract()
         "PowerShell prefix and apostrophes preserved");
     require(!claude::prepared_argv({"bash", "-c", "claude; echo done"}, "Instruction", std::nullopt, {}),
         "control syntax is not rewritten");
+    const std::string environment_prefix = "CLAUDE_CONFIG_DIR=";
+    const std::string largest_path(addon::limits::k_max_environment_text_bytes - environment_prefix.size(), 'x');
+    require(claude::is_valid_claude_config_environment_text(environment_prefix + largest_path),
+        "Claude config environment text accepts the SDK byte limit");
+    require(!claude::is_valid_claude_config_environment_text(environment_prefix + largest_path + "x"),
+        "Claude config environment text rejects values over the SDK byte limit");
+    require(!claude::is_valid_claude_config_environment_text(environment_prefix + std::string("bad\xFF", 4)),
+        "Claude config environment text rejects invalid UTF-8");
+}
+
+void launcher_discovery_contract()
+{
+    const auto root = fs::temp_directory_path() / ("claude-discovery-" + addon::random_nonce_hex());
+    const auto home = root / "home";
+    const auto selected = home / ".claude";
+    const auto sibling = home / ".claude-work";
+#ifndef _WIN32
+    const auto selected_alias = home / ".claude-alias";
+    const auto tab_profile = home / ".claude-tab\tprofile";
+#endif
+#ifndef _WIN32
+    const auto newline_profile = home / ".claude-newline\nCLAUDE_OTHER=owned";
+#endif
+    std::string long_profile_name = ".claude-long-";
+    for (int i = 0; i < 60; ++i) long_profile_name += "\xC3\xA9";
+    const auto long_profile = home / addon::path_from_utf8(long_profile_name);
+    const auto bin = root / "bin";
+    fs::create_directories(selected);
+    fs::create_directories(sibling);
+    fs::create_directories(long_profile);
+#ifndef _WIN32
+    fs::create_directories(newline_profile);
+    fs::create_directories(tab_profile);
+#endif
+    fs::create_directories(bin);
+    try {
+#ifdef _WIN32
+        const std::string platform = "windows-x86_64";
+        const auto executable = bin / "claude.cmd";
+#else
+        const std::string platform = "linux-x86_64";
+        const auto executable = bin / "claude";
+#endif
+        std::ofstream(executable).close();
+        std::ofstream(selected / ".credentials.json") << "{}";
+        std::ofstream(sibling / ".credentials.json") << "{}";
+        std::ofstream(long_profile / ".credentials.json") << "{}";
+#ifndef _WIN32
+        std::ofstream(newline_profile / ".credentials.json") << "{}";
+        std::ofstream(tab_profile / ".credentials.json") << "{}";
+        fs::create_directory_symlink(selected, selected_alias);
+#endif
+
+        addon::Discover_request request;
+        request.platform_id = platform;
+        request.ambient_environment = Json::object();
+        request.ambient_environment.set("PATH", Json(claude::path_string(bin)));
+#ifdef _WIN32
+        request.ambient_environment.set("USERPROFILE", Json(claude::path_string(home)));
+#else
+        request.ambient_environment.set("HOME", Json(claude::path_string(home)));
+#endif
+        request.default_home_fallback = claude::path_string(home);
+
+        const auto candidates = claude::discover_launchers(request);
+#ifdef _WIN32
+        require(candidates.size() == 3, "discovery returns every authenticated Claude profile");
+#else
+        require(candidates.size() == 4,
+            "discovery rejects a profile path with a newline and retains the tab-named profile");
+        require(std::none_of(candidates.begin(), candidates.end(), [](const auto& candidate) {
+            return candidate.environment_text.find_first_of("\r\n") != std::string::npos;
+        }), "profile paths cannot inject another line into launcher environment text");
+        const auto tab_candidate = std::find_if(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+            return candidate.environment_text == "CLAUDE_CONFIG_DIR=" + claude::path_string(tab_profile);
+        });
+        require(tab_candidate != candidates.end() && std::none_of(
+            tab_candidate->display_name.begin(), tab_candidate->display_name.end(), [](unsigned char character) {
+                return character < 0x20 || character == 0x7f;
+            }), "a tab in an authenticated profile name is sanitized from its display label");
+        require(std::count_if(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+            return candidate.environment_text == "CLAUDE_CONFIG_DIR=" + claude::path_string(selected) ||
+                candidate.environment_text == "CLAUDE_CONFIG_DIR=" + claude::path_string(selected_alias);
+        }) == 1, "a symlink alias does not duplicate the selected Claude profile");
+#endif
+        const auto long_name_candidate = std::find_if(candidates.begin(), candidates.end(), [](const auto& candidate) {
+            return candidate.environment_text.find("long-") != std::string::npos;
+        });
+        require(long_name_candidate != candidates.end() &&
+            unicode_scalar_count(long_name_candidate->display_name) == addon::limits::k_max_display_name_scalars,
+            "long Unicode profile labels are truncated at the display-name scalar limit");
+        require(std::all_of(candidates.begin(), candidates.end(), [](const auto& candidate) {
+            return unicode_scalar_count(candidate.display_name) <= addon::limits::k_max_display_name_scalars &&
+                candidate.display_name.size() <= addon::limits::k_max_display_name_bytes;
+        }), "all discovered profile labels fit the SDK display-name bounds");
+        addon::Contract_failure failure;
+        const auto decoded = addon::decode_discover_result(
+            addon::encode_candidates(candidates), platform, &failure);
+        require(decoded && decoded->size() == candidates.size(),
+            "authenticated Claude candidates satisfy the public discovery contract");
+        require(candidates[0].display_name == "Claude" && candidates[0].is_default &&
+            candidates[0].environment_text == "CLAUDE_CONFIG_DIR=" + claude::path_string(selected),
+            "the selected Claude profile is the valid default candidate");
+        const auto sibling_candidate = std::find_if(candidates.begin(), candidates.end(), [&](const auto& candidate) {
+            return candidate.environment_text == "CLAUDE_CONFIG_DIR=" + claude::path_string(sibling);
+        });
+        require(sibling_candidate != candidates.end() && sibling_candidate->display_name == "Claude work" &&
+            !sibling_candidate->is_default,
+            "a sibling Claude profile has its own valid launcher candidate");
+
+        fs::remove(selected / ".credentials.json");
+        const auto without_configured_credentials = claude::discover_launchers(request);
+        require(!without_configured_credentials.empty() &&
+            std::none_of(without_configured_credentials.begin(), without_configured_credentials.end(),
+                [](const auto& candidate) { return candidate.is_default; }),
+            "no sibling profile becomes default when the configured profile lacks credentials");
+    }
+    catch (...) {
+        std::error_code error;
+        fs::remove_all(root, error);
+        throw;
+    }
+    std::error_code error;
+    fs::remove_all(root, error);
+}
+
+void launcher_discovery_candidate_limit()
+{
+    const auto root = fs::temp_directory_path() / ("claude-discovery-limit-" + addon::random_nonce_hex());
+    const auto home = root / "home";
+    const auto selected = home / ".claude";
+    const auto bin = root / "bin";
+    fs::create_directories(selected);
+    fs::create_directories(bin);
+    try {
+#ifdef _WIN32
+        const std::string platform = "windows-x86_64";
+        std::ofstream(bin / "claude.cmd").close();
+#else
+        const std::string platform = "linux-x86_64";
+        std::ofstream(bin / "claude").close();
+#endif
+        std::ofstream(selected / ".credentials.json") << "{}";
+        for (int i = 0; i < 24; ++i) {
+            const auto profile = home / (".claude-profile-" + std::to_string(i));
+            fs::create_directories(profile);
+            std::ofstream(profile / ".credentials.json") << "{}";
+        }
+
+        addon::Discover_request request;
+        request.platform_id = platform;
+        request.ambient_environment = Json::object();
+        request.ambient_environment.set("PATH", Json(claude::path_string(bin)));
+#ifdef _WIN32
+        request.ambient_environment.set("USERPROFILE", Json(claude::path_string(home)));
+#else
+        request.ambient_environment.set("HOME", Json(claude::path_string(home)));
+#endif
+        request.default_home_fallback = claude::path_string(home);
+
+        const auto candidates = claude::discover_launchers(request);
+        require(candidates.size() == addon::limits::k_max_discovery_candidates,
+            "profile inventory is capped at the SDK discovery candidate limit");
+        require(candidates.front().is_default &&
+            candidates.front().environment_text == "CLAUDE_CONFIG_DIR=" + claude::path_string(selected),
+            "the selected Claude profile is retained as the default at the candidate limit");
+        addon::Contract_failure failure;
+        const auto decoded = addon::decode_discover_result(
+            addon::encode_candidates(candidates), platform, &failure);
+        require(decoded && decoded->size() == addon::limits::k_max_discovery_candidates,
+            "candidate-limited discovery satisfies the public SDK contract");
+    }
+    catch (...) {
+        std::error_code error;
+        fs::remove_all(root, error);
+        throw;
+    }
+    std::error_code error;
+    fs::remove_all(root, error);
+}
+
+void launcher_discovery_scan_limit()
+{
+    constexpr std::size_t scan_limit = 256;
+    const auto root = fs::temp_directory_path() / ("claude-discovery-scan-limit-" + addon::random_nonce_hex());
+    const auto home = root / "home";
+    const auto selected = home / ".claude";
+    const auto bin = root / "bin";
+    fs::create_directories(selected);
+    fs::create_directories(bin);
+    try {
+#ifdef _WIN32
+        const std::string platform = "windows-x86_64";
+        std::ofstream(bin / "claude.cmd").close();
+#else
+        const std::string platform = "linux-x86_64";
+        std::ofstream(bin / "claude").close();
+#endif
+        std::ofstream(selected / ".credentials.json") << "{}";
+        for (std::size_t i = 0; i < scan_limit + 8; ++i) {
+            fs::create_directories(home / (".claude-scan-" + std::to_string(i)));
+        }
+
+        std::vector<fs::path> directory_entries;
+        for (const auto& entry : fs::directory_iterator(home)) directory_entries.push_back(entry.path());
+        require(directory_entries.size() > scan_limit + 1,
+            "the fixture has entries beyond the Claude profile scan bound");
+        const auto configured_entry = std::find(directory_entries.begin(), directory_entries.end(), selected);
+        require(configured_entry != directory_entries.end(), "the configured profile appears in its parent directory");
+        auto target = directory_entries.begin() + static_cast<std::ptrdiff_t>(scan_limit);
+        if (*target == selected) ++target;
+        require(target != directory_entries.end() &&
+            static_cast<std::size_t>(std::distance(directory_entries.begin(), target)) >= scan_limit,
+            "the extra authenticated profile is positioned outside the inspected entries");
+        std::ofstream(*target / ".credentials.json") << "{}";
+
+        addon::Discover_request request;
+        request.platform_id = platform;
+        request.ambient_environment = Json::object();
+        request.ambient_environment.set("PATH", Json(claude::path_string(bin)));
+#ifdef _WIN32
+        request.ambient_environment.set("USERPROFILE", Json(claude::path_string(home)));
+#else
+        request.ambient_environment.set("HOME", Json(claude::path_string(home)));
+#endif
+        request.default_home_fallback = claude::path_string(home);
+
+        const auto candidates = claude::discover_launchers(request);
+        require(candidates.size() == 1 && candidates.front().is_default &&
+            candidates.front().environment_text == "CLAUDE_CONFIG_DIR=" + claude::path_string(selected),
+            "discovery stops at the directory-entry bound and retains only the configured default");
+    }
+    catch (...) {
+        std::error_code error;
+        fs::remove_all(root, error);
+        throw;
+    }
+    std::error_code error;
+    fs::remove_all(root, error);
 }
 
 void launcher_directory_contract()
@@ -1031,6 +1285,9 @@ int main()
 {
     try {
         launcher_contract();
+        launcher_discovery_contract();
+        launcher_discovery_candidate_limit();
+        launcher_discovery_scan_limit();
         launcher_directory_contract();
         lifecycle_contract();
         structured_contract();
