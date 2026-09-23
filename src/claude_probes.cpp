@@ -17,24 +17,32 @@ namespace {
 namespace addon = logonomic::cli_addon;
 using Json = addon::Json_value;
 
-std::string usage_result(const Json& event)
+struct Usage_result
 {
-    if (text(event, "type") != "result") return {};
+    std::string content;
+    bool local_usage_command = false;
+};
+
+std::optional<Usage_result> usage_result(const Json& event)
+{
+    if (text(event, "type") != "result") return std::nullopt;
     if (flag(event, "is_error") || text(event, "subtype") == "error") {
         throw std::runtime_error("quota_failed");
     }
-    return text(event, "result");
+    return Usage_result{text(event, "result"), text(event, "local_command") == "usage"};
 }
 
-std::string usage_text(std::string_view bytes)
+Usage_result usage_text(std::string_view bytes)
 {
     addon::Json_parse_error error;
     const auto value = addon::parse_json(bytes, addon::Json_parse_limits{}, &error);
-    if (value && value->is_object()) return usage_result(*value);
+    if (value && value->is_object()) {
+        if (auto result = usage_result(*value); result && !result->content.empty()) return *result;
+    }
     if (value && value->is_array()) {
         for (const auto& event : value->as_array()) {
             const auto result = usage_result(event);
-            if (!result.empty()) return result;
+            if (result && !result->content.empty()) return *result;
         }
     }
     std::istringstream lines{std::string(bytes)};
@@ -42,17 +50,18 @@ std::string usage_text(std::string_view bytes)
         const auto event = addon::parse_json(line, addon::Json_parse_limits{}, &error);
         if (!event || !event->is_object()) continue;
         const auto result = usage_result(*event);
-        if (!result.empty()) return result;
+        if (result && !result->content.empty()) return *result;
     }
     throw std::runtime_error("quota_output_unavailable");
 }
 
-addon::Quota_window quota_window(const std::string& content, const std::string& name, std::uint64_t minutes)
+std::optional<addon::Quota_window> quota_window(
+    const std::string& content, const std::string& name, std::uint64_t minutes)
 {
     const std::regex pattern("Current " + name + R"([^:]*:\s*(\d+(?:\.\d+)?)% used[\s\S]*?resets\s*([^\r\n]+))",
         std::regex::icase);
     std::smatch match;
-    if (!std::regex_search(content, match, pattern)) throw std::runtime_error("quota_window_missing");
+    if (!std::regex_search(content, match, pattern)) return std::nullopt;
     const double used = std::stod(match[1].str());
     if (!std::isfinite(used)) throw std::runtime_error("quota_window_invalid");
     auto reset = match[2].str();
@@ -110,10 +119,19 @@ addon::Quota_observation inspect_quota(const addon::Structured_inspection& inspe
     result.state = addon::Quota_status::FAILED;
     if (inspection.timed_out || inspection.exit_code != 0) return result;
     try {
-        const auto content = usage_text(inspection.stdout_bytes);
-        result.primary   = quota_window(content, "session", 300);
-        result.secondary = quota_window(content, "week", 10080);
-        result.state = addon::Quota_status::READY;
+        const auto usage = usage_text(inspection.stdout_bytes);
+        result.primary   = quota_window(usage.content, "session", 300);
+        result.secondary = quota_window(usage.content, "week", 10080);
+        if (result.primary && result.secondary) {
+            result.state = addon::Quota_status::READY;
+        }
+        else {
+            if (!result.primary && !result.secondary && usage.local_usage_command) {
+                result.state = addon::Quota_status::UNAVAILABLE;
+            }
+            result.primary.reset();
+            result.secondary.reset();
+        }
     }
     catch (const std::exception&) {
         result.primary.reset();

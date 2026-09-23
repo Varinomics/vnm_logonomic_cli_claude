@@ -871,6 +871,22 @@ void probe_contract()
     const auto overage = claude::inspect_quota(input);
     require(overage.state == addon::Quota_status::READY && overage.primary->used_percent == 135.5 &&
         overage.secondary->used_percent == 121, "native quota overage remains observable without clamping");
+
+    input.stdout_bytes =
+        R"([{"type":"system","subtype":"init"},)"
+        R"({"type":"result","subtype":"success","is_error":false,)"
+        R"("local_command":"usage","result":"Total cost: $0.0000\n)"
+        R"(Total duration (API): 0s\nUsage: 0 input, 0 output, 0 cache read, 0 cache write"}])";
+    const auto print_mode = claude::inspect_quota(input);
+    require(print_mode.state == addon::Quota_status::UNAVAILABLE && !print_mode.primary && !print_mode.secondary,
+        "print-mode usage totals do not authenticate subscription quota windows");
+
+    input.stdout_bytes =
+        R"({"type":"result","subtype":"success","is_error":false,)"
+        R"("local_command":"usage","result":"Current session: 35% used, resets 3pm"})";
+    const auto incomplete = claude::inspect_quota(input);
+    require(incomplete.state == addon::Quota_status::FAILED && !incomplete.primary && !incomplete.secondary,
+        "incomplete quota evidence remains a failed observation without partial windows");
 }
 
 #ifdef _WIN32
