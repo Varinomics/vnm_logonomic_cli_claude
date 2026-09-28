@@ -16,6 +16,7 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <system_error>
 
 namespace claude {
 namespace {
@@ -472,20 +473,25 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
                     }
                 };
                 if (selected_path.is_absolute()) {
-                    if (fs::is_regular_file(selected_path / ".credentials.json")) {
+                    // A profile that cannot be checked, such as one on an unreachable
+                    // share, is not a candidate: it must not fail the discovery of
+                    // the launcher. A folder that cannot be read is skipped.
+                    std::error_code profile_error;
+                    if (fs::is_regular_file(selected_path / ".credentials.json", profile_error)) {
                         add_profile(selected_path);
                     }
                     const auto parent = selected_path.parent_path();
-                    if (fs::is_directory(parent)) {
+                    if (fs::is_directory(parent, profile_error)) {
                         std::size_t scanned_entries = 0;
-                        for (auto entry = fs::directory_iterator(parent), end = fs::directory_iterator();
-                            entry != end && scanned_entries < k_max_profile_directory_entries_to_scan;
-                            ++entry, ++scanned_entries)
+                        for (fs::directory_iterator entry(parent, profile_error), end;
+                            !profile_error && entry != end &&
+                            scanned_entries < k_max_profile_directory_entries_to_scan;
+                            entry.increment(profile_error), ++scanned_entries)
                         {
-                            const auto& directory_entry = *entry;
-                            const auto profile = directory_entry.path();
-                            if (directory_entry.is_directory() && path_string(profile.filename()).starts_with(".claude") &&
-                                fs::is_regular_file(profile / ".credentials.json"))
+                            const auto profile = entry->path();
+                            std::error_code entry_error;
+                            if (entry->is_directory(entry_error) && path_string(profile.filename()).starts_with(".claude") &&
+                                fs::is_regular_file(profile / ".credentials.json", entry_error))
                             {
                                 add_profile(profile);
                                 if (profiles.size() == addon::limits::k_max_discovery_candidates) {

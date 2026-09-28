@@ -219,6 +219,15 @@ void launcher_discovery_contract()
             std::none_of(without_configured_credentials.begin(), without_configured_credentials.end(),
                 [](const auto& candidate) { return candidate.is_default; }),
             "no sibling profile becomes default when the configured profile lacks credentials");
+#ifdef _WIN32
+        // A configured profile on a share that cannot be reached is not a
+        // candidate; it must not fail the discovery of the Claude launcher.
+        request.ambient_environment.set("CLAUDE_CONFIG_DIR", Json("\\\\localhost\\logonomic-absent-share\\"));
+        const auto unreachable = claude::discover_launchers(request);
+        require(unreachable.size() == 1 && unreachable.front().is_default &&
+            unreachable.front().display_name == "Claude" && unreachable.front().environment_text.empty(),
+            "a configured profile on an unreachable share leaves the plain Claude launcher discoverable");
+#endif
     }
     catch (...) {
         std::error_code error;
