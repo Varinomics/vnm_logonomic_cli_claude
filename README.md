@@ -73,6 +73,17 @@ and root-result provenance still apply. Task-server children remain
 within the host-owned process lifetime.
 Non-delegated sessions retain their one-shot input behavior.
 
+A structured or delegated implementation keeps the launcher's permission
+posture: the launcher's own options, such as `--permission-mode` or
+`--allowedTools`, and the user's Claude settings. The package adds no
+permission mode and pre-approves only the task's own Task tools
+(`--allowedTools mcp__logonomic-task-<task>-<server>__<action>`), so the
+headless run denies whatever else the launcher and settings do not grant. An
+implementation that edits files needs a launcher that grants edits, for example
+with `--permission-mode acceptEdits`. A run whose settings or options remove or
+refuse one of its Task tools, for example with a `permissions.deny` rule
+matching `mcp__logonomic-task-...`, fails with `task_tools_not_permitted`.
+
 Interactive launch preparation also accepts the host's
 `interactive-initial-prompt@1` member. The prepared invocation starts a new
 interactive session whose first user message is the host's text, passed as

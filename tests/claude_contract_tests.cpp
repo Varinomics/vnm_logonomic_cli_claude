@@ -136,7 +136,7 @@ Claude_reading claude_reading(const std::vector<std::string>& argv)
             if (index + 1 < argv.size() && !is_option(argv[index + 1])) values.push_back(argv[++index]);
         }
         else
-        if (name == "--add-dir") {
+        if (name == "--add-dir" || name == "--allowedTools" || name == "--mcp-config") {
             while (index + 1 < argv.size() && !is_option(argv[index + 1])) values.push_back(argv[++index]);
         }
         reading.options.emplace_back(name, std::move(values));
@@ -146,7 +146,7 @@ Claude_reading claude_reading(const std::vector<std::string>& argv)
 
 Json protocol(bool review)
 {
-    auto result = claude::object(R"({"initialized":false,"pending_base64":"","result_base64":"","root_session_id":"","working_directory":"","expected_tools":["Read","Glob","Grep"],"expected_mcp_servers":[]})");
+    auto result = claude::object(R"({"initialized":false,"pending_base64":"","result_base64":"","root_session_id":"","working_directory":"","expected_tools":["Read","Glob","Grep"],"task_tools":[],"expected_mcp_servers":[]})");
     if (review) result.set("working_directory", Json(claude::path_string(fs::current_path())));
     return result;
 }
@@ -1173,7 +1173,10 @@ void delegated_readiness_contract()
         }
         auto init = claude::object(R"({"type":"system","subtype":"init","session_id":"root","permissionMode":"plan","tools":[],"mcp_servers":[{"name":"logonomic-task-readiness-task-coordination","status":"connected"},{"name":"logonomic-task-readiness-task-delegation","status":"connected"}],"plugins":[],"cwd":""})");
         const auto state = claude::object(released);
-        init.set("tools", *state.find("expected_tools"));
+        const auto* session_tools = state.find(purpose == addon::Structured_purpose::READ_ONLY_REVIEW
+            ? "expected_tools" : "task_tools");
+        require(session_tools != nullptr, "the prepared state names the tools the session must carry");
+        init.set("tools", *session_tools);
         init.set("cwd", *state.find("working_directory"));
         result = inspect_readiness(purpose, released, addon::serialize_json(init) + '\n');
         require(!result.complete && !result.failure_reason && !result.stdin_bytes && !result.close_stdin,
@@ -1298,6 +1301,135 @@ void delegated_readiness_contract()
         ended.timed_out = false;
         require(claude::inspect_session(purpose, ended).failure_reason == "mcp_readiness_incomplete",
             "clean native exit without readiness cannot authenticate the task");
+    }
+}
+
+// A delegated request from the direct launcher `claude` followed by `options`,
+// with one Task server.
+addon::Delegated_prepare_request posture_request(addon::Structured_purpose purpose, std::vector<std::string> options)
+{
+    addon::Delegated_prepare_request request;
+    request.purpose = purpose;
+    request.prompt  = "Review the retry budget.";
+    request.context.launcher.runner_key = "direct";
+    request.context.launcher_argv = {"claude"};
+    request.context.launcher_argv.insert(request.context.launcher_argv.end(), options.begin(), options.end());
+    for (const auto& word : request.context.launcher_argv) {
+        request.context.launcher.script_body += (request.context.launcher.script_body.empty() ? "" : " ") + word;
+    }
+    request.context.working_directory = claude::path_string(fs::current_path());
+    addon::Launch_environment environment;
+#ifdef _WIN32
+    environment.platform_id = "windows-x86_64";
+#else
+    environment.platform_id = "linux-x86_64";
+#endif
+    environment.effective_environment = Json::object();
+    environment.effective_environment.set("CLAUDE_CONFIG_DIR", Json(request.context.working_directory));
+    request.context.launch_environment = environment;
+    request.control.task_id = "posture-task";
+    request.control.private_artifact_root = claude::path_string(fs::current_path() / "private-posture");
+    request.control.connection = addon::Delegated_connection{
+        claude::path_string(fs::current_path() / "host relay"),
+        claude::path_string(fs::current_path() / "private-posture/.logonomic/task-servers.json")};
+    addon::Delegated_task_server server;
+    server.server_id = "delegation";
+    server.program   = claude::path_string(fs::current_path() / "task-control");
+    server.actions   = {"targets", "submit"};
+    request.control.servers.push_back(std::move(server));
+    return request;
+}
+
+Context posture_prepare(const addon::Delegated_prepare_request& request, bool delegated)
+{
+    Context invocation;
+    invocation.m_request.operation = "prepare";
+    if (delegated) {
+        invocation.m_request.capability.capability_id = "delegated-session";
+        invocation.m_request.payload = addon::encode_delegated_prepare_request(request, 3);
+    }
+    else {
+        addon::Structured_prepare_request structured;
+        structured.purpose = request.purpose;
+        structured.context = request.context;
+        structured.prompt  = request.prompt;
+        invocation.m_request.capability.capability_id = "structured-session";
+        invocation.m_request.payload = addon::encode_structured_prepare_request(structured, 3);
+    }
+    claude::handle_sessions(invocation, fs::current_path());
+    return invocation;
+}
+
+// How Claude reads a prepared process's argv, whose executable is the
+// launcher's own program.
+Claude_reading prepared_reading(const Context& invocation, bool delegated)
+{
+    addon::Contract_failure failure;
+    const auto process = delegated
+        ? addon::decode_delegated_prepare_result(invocation.m_payload, &failure, 3)->process
+        : addon::decode_structured_prepare_result(invocation.m_payload, &failure, 3)->process;
+    std::vector<std::string> argv{"claude"};
+    argv.insert(argv.end(), process.argv.begin(), process.argv.end());
+    return claude_reading(argv);
+}
+
+bool has_option(const Claude_reading& reading, std::string_view name)
+{
+    return std::any_of(reading.options.begin(), reading.options.end(),
+        [name](const auto& option) { return option.first == name; });
+}
+
+// Oracle: the owner's rule for delegated runs (2026-09-28): a run gets the
+// permission posture its launcher specifies, its options and the user's own
+// Claude settings, and the package pre-approves only its own Task tools.
+// Claude Code 2.1.282's headless behaviour was recorded against a scripted
+// endpoint: default mode denies an ungranted Write and runs a Task tool named
+// by --allowedTools; the launcher's --permission-mode acceptEdits admits the
+// Write; two --allowedTools occurrences both apply; a user deny rule for a
+// Task server removes its tools from the session.
+void permission_posture_contract()
+{
+    using Purpose = addon::Structured_purpose;
+    const std::string task_tools =
+        "mcp__logonomic-task-posture-task-delegation__targets,mcp__logonomic-task-posture-task-delegation__submit";
+    for (const bool delegated : {true, false}) {
+        const auto request = posture_request(Purpose::IMPLEMENTATION, {"--permission-mode", "acceptEdits"});
+        const auto invocation = posture_prepare(request, delegated);
+        require(invocation.m_status == addon::Result_status::SUCCESS, "implementation is prepared");
+        const auto reading = prepared_reading(invocation, delegated);
+        require(reading.values("--permission-mode") == std::vector<std::string>{"acceptEdits"} &&
+            !has_option(reading, "--dangerously-skip-permissions"),
+            "implementation runs in the launcher's own permission mode");
+        require(delegated
+            ? reading.values("--allowedTools") == std::vector<std::string>{task_tools}
+            : !has_option(reading, "--allowedTools"),
+            "implementation pre-approves exactly its own Task tools and nothing else");
+    }
+
+    const std::string task_tool = "mcp__logonomic-task-posture-task-delegation__submit";
+    for (const auto purpose : {Purpose::IMPLEMENTATION, Purpose::READ_ONLY_REVIEW}) {
+        auto state = protocol(purpose == Purpose::READ_ONLY_REVIEW);
+        state.set("task_tools", claude::strings({task_tool}));
+        state.set("expected_tools", claude::strings({"Read", "Glob", "Grep", task_tool}));
+        auto init = claude::object(R"({"type":"system","subtype":"init","session_id":"root","permissionMode":"plan","tools":["Read","Glob","Grep"],"mcp_servers":[],"plugins":[],"cwd":""})");
+        init.set("cwd", Json(claude::path_string(fs::current_path())));
+        addon::Structured_inspection input;
+        input.protocol_state = addon::serialize_json(state);
+        input.stdout_bytes = addon::serialize_json(init) + '\n';
+        require(claude::inspect_session(purpose, input).failure_reason == "task_tools_not_permitted",
+            "a session whose settings removed a Task tool cannot run the task");
+        init.find("tools")->push_back(Json(task_tool));
+        input.stdout_bytes = addon::serialize_json(init) + '\n';
+        const auto initialized = claude::inspect_session(purpose, input);
+        require(!initialized.complete && !initialized.failure_reason, "a session with its Task tools runs");
+        input.protocol_state = initialized.protocol_state;
+        input.stdout_bytes = R"({"type":"result","session_id":"root","subtype":"success","is_error":false,"result":"Done","permission_denials":[{"tool_name":")" +
+            task_tool + R"(","tool_use_id":"toolu_1","tool_input":{}}]})" "\n";
+        require(claude::inspect_session(purpose, input).failure_reason == "task_tools_not_permitted",
+            "a refused Task tool call fails the task");
+        input.stdout_bytes = R"({"type":"result","session_id":"root","subtype":"success","is_error":false,"result":"Done","permission_denials":[{"tool_name":"Write","tool_use_id":"toolu_1","tool_input":{}}]})" "\n";
+        require(!claude::inspect_session(purpose, input).failure_reason,
+            "a denial of another tool is the launcher's posture, not a failure");
     }
 }
 
@@ -1776,6 +1908,7 @@ int main(int argc, char** argv)
         declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
         structured_contract();
         delegated_readiness_contract();
+        permission_posture_contract();
         probe_contract();
 #ifdef _WIN32
         probe_profile_contract();

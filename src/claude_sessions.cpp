@@ -85,6 +85,47 @@ bool valid_review_init(const Json& event, const Json& state)
     return same_strings(std::move(names), string_array(*expected_servers));
 }
 
+std::vector<std::string> task_tools(const Json& state)
+{
+    const auto* tools = state.find("task_tools");
+    if (!tools) {
+        throw std::runtime_error("invalid_protocol_state");
+    }
+    return string_array(*tools);
+}
+
+// The launcher's options and the user's own settings decide what Claude may
+// do; a deny rule for a Task server removes its tools from the session.
+bool task_tools_available(const Json& init, const Json& state)
+{
+    const auto required = task_tools(state);
+    if (required.empty()) {
+        return true;
+    }
+    const auto* tools = init.find("tools");
+    if (!tools) {
+        return false;
+    }
+    const auto available = string_array(*tools);
+    return std::all_of(required.begin(), required.end(), [&available](const std::string& tool) {
+        return std::find(available.begin(), available.end(), tool) != available.end();
+    });
+}
+
+// A rule or hook that refuses one Task tool call is recorded among the root
+// result's permission denials.
+bool task_tool_denied(const Json& result, const Json& state)
+{
+    const auto* denials = result.find("permission_denials");
+    if (!denials || !denials->is_array()) {
+        return false;
+    }
+    const auto required = task_tools(state);
+    return std::any_of(denials->as_array().begin(), denials->as_array().end(), [&required](const Json& denial) {
+        return std::find(required.begin(), required.end(), text(denial, "tool_name")) != required.end();
+    });
+}
+
 addon::Structured_inspect_result failed(std::string reason)
 {
     addon::Structured_inspect_result result;
@@ -245,20 +286,25 @@ addon::Structured_prepare_result prepare(
     addon::Structured_prepare_result result;
     result.process = cli_process(context, !review);
     apply_account(context, result.process);
-    std::vector<std::string> tools = review ? std::vector<std::string>{"Read", "Glob", "Grep"}
-        : std::vector<std::string>{"Read", "Glob", "Grep", "Edit", "Write"};
-    tools.insert(tools.end(), delegated_tools.begin(), delegated_tools.end());
     auto& args = result.process.argv;
     args.insert(args.end(), {"-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"});
+    std::vector<std::string> review_tools{"Read", "Glob", "Grep"};
+    review_tools.insert(review_tools.end(), delegated_tools.begin(), delegated_tools.end());
     if (review) {
         args.insert(args.end(), {"--safe-mode", "--strict-mcp-config", "--mcp-config", mcp_path,
-            "--tools", join(tools), "--allowedTools", join(tools), "--permission-mode", "plan",
+            "--tools", join(review_tools), "--allowedTools", join(review_tools), "--permission-mode", "plan",
             "--setting-sources", "project", "--model", "sonnet"});
     }
     else {
-        args.insert(args.end(), {"--permission-mode", "dontAsk", "--allowedTools", join(tools)});
+        // An implementation keeps the launcher's own options and the user's
+        // settings, which alone decide what Claude may do; headless Claude
+        // denies what they do not grant. The package pre-approves only this
+        // task's own Task tools.
         if (!server_names.empty()) {
             args.insert(args.end(), {"--mcp-config", mcp_path});
+        }
+        if (!delegated_tools.empty()) {
+            args.insert(args.end(), {"--allowedTools", join(delegated_tools)});
         }
     }
     result.process.stdin_behavior = addon::Stdin_behavior::PAYLOAD;
@@ -272,7 +318,10 @@ addon::Structured_prepare_result prepare(
     state.set("result_base64", Json(""));
     state.set("root_session_id", Json(""));
     state.set("working_directory", Json(context.working_directory));
-    state.set("expected_tools", strings(tools));
+    if (review) {
+        state.set("expected_tools", strings(review_tools));
+    }
+    state.set("task_tools", strings(delegated_tools));
     state.set("expected_mcp_servers", strings(server_names));
     if (!server_names.empty()) {
         args.insert(args.end(), {"--input-format", "stream-json"});
@@ -356,6 +405,9 @@ addon::Structured_inspect_result inspect_session(
                 if (id.empty() || (!root_session.empty() && id != root_session)) {
                     return failed("session_provenance_mismatch");
                 }
+                if (!initialized && !task_tools_available(event, state)) {
+                    return failed("task_tools_not_permitted");
+                }
                 if (review) {
                     if (initialized || !valid_review_init(event, state)) return failed("review_surface_mismatch");
                     record(addon::Presentation_event_kind::REVIEW_INITIALIZED);
@@ -391,6 +443,9 @@ addon::Structured_inspect_result inspect_session(
                 }
                 if (id != root_session || (parent && !parent->is_null())) {
                     continue;
+                }
+                if (task_tool_denied(event, state)) {
+                    return failed("task_tools_not_permitted");
                 }
                 const auto* is_error = event.find("is_error");
                 const auto value = text(event, "result");
