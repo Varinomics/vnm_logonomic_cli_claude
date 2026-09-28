@@ -51,15 +51,17 @@ remains explicitly incomplete because transcripts do not prove a complete
 lifetime history.
 
 Delegated review and implementation use session contract version 3 and keep
-native stdin open through initialization, an awaited reconnect/discovery for
-each required host stdio server, and a live status/catalog check. The task is
+native stdin open through initialization and live status/catalog checks of
+each required host stdio server's initial connection. Pending discovery is
+checked at 100 ms intervals for up to 30 seconds after initialization is
+acknowledged, subject to the host's process deadline. The task is
 sent only when every requested server is connected and every required raw
 action is present, followed by stdin closure. Unsupported or uncorrelated
 control replies, missing catalogs/actions and premature model output fail before
 task release. This is protocol feature admission, not an upstream version pin.
 Native permission decisions, review initialization validation, account binding
-and root-result provenance still apply. Reconnected task-server children remain
-within the host-owned process lifetime; unrelated servers are not reconnected.
+and root-result provenance still apply. Task-server children remain
+within the host-owned process lifetime.
 Non-delegated sessions retain their one-shot input behavior.
 
 Contract tests cover launcher and resume restrictions, root/child structured

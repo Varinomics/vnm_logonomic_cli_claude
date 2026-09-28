@@ -6,10 +6,12 @@
 #include <logonomic_cli_addon/ids.h>
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -101,17 +103,13 @@ std::string join(const std::vector<std::string>& items)
     return result;
 }
 
-std::string control_request(Json& state, const std::string& phase, const std::string& server = {})
+std::string control_request(Json& state, const std::string& phase)
 {
     const auto id = addon::random_nonce_hex();
     state.set("mcp_phase", Json(phase));
     state.set("mcp_request_id", Json(id));
     Json request = Json::object();
-    request.set("subtype", Json(phase == "initialize" ? "initialize" :
-        phase == "reconnect" ? "mcp_reconnect" : "mcp_status"));
-    if (!server.empty()) {
-        request.set("serverName", Json(server));
-    }
+    request.set("subtype", Json(phase == "initialize" ? "initialize" : "mcp_status"));
     Json frame = Json::object();
     frame.set("type", Json("control_request"));
     frame.set("request_id", Json(id));
@@ -119,46 +117,60 @@ std::string control_request(Json& state, const std::string& phase, const std::st
     return addon::serialize_json(frame) + '\n';
 }
 
-bool required_catalog_ready(const Json& response, const Json& state)
+std::optional<bool> required_catalog_ready(const Json& response, const Json& state)
 {
     const auto* servers = response.find("mcpServers");
     const auto* required = state.find("required_mcp_servers");
     if (!servers || !servers->is_array() || !required || !required->is_array()) {
-        return false;
+        return std::nullopt;
     }
     std::set<std::string> seen;
     for (const auto& server : servers->as_array()) {
         const auto name = text(server, "name");
         if (name.empty() || !seen.insert(name).second) {
-            return false;
+            return std::nullopt;
         }
     }
+    bool pending = false;
     for (const auto& expected : required->as_array()) {
         const auto name = text(expected, "name");
         const auto server = std::find_if(servers->as_array().begin(), servers->as_array().end(),
             [&name](const Json& entry) { return text(entry, "name") == name; });
-        if (server == servers->as_array().end() || text(*server, "status") != "connected") {
-            return false;
+        if (server == servers->as_array().end()) {
+            return std::nullopt;
+        }
+        if (text(*server, "status") == "pending") {
+            pending = true;
+            continue;
+        }
+        if (text(*server, "status") != "connected") {
+            return std::nullopt;
         }
         const auto* tools = server->find("tools");
         const auto* actions = expected.find("actions");
         if (!tools || !tools->is_array() || !actions) {
-            return false;
+            return std::nullopt;
         }
         std::set<std::string> names;
         for (const auto& tool : tools->as_array()) {
             const auto action = text(tool, "name");
             if (action.empty() || !names.insert(action).second) {
-                return false;
+                return std::nullopt;
             }
         }
         for (const auto& action : string_array(*actions)) {
             if (!names.contains(action)) {
-                return false;
+                return std::nullopt;
             }
         }
     }
-    return true;
+    return !pending;
+}
+
+double readiness_clock_ms()
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 std::optional<std::string> advance_readiness(
@@ -172,34 +184,44 @@ std::optional<std::string> advance_readiness(
     }
     const auto* payload = response->find("response");
     const auto phase = text(state, "mcp_phase");
-    // Native reconnect success omits its undefined response payload.
-    if (text(*response, "subtype") != "success" || (payload && !payload->is_object()) ||
-        (!payload && phase != "reconnect"))
+    if (text(*response, "subtype") != "success" || !payload || !payload->is_object())
     {
         return "mcp_control_unavailable";
     }
     if (phase == "status") {
-        if (!required_catalog_ready(*payload, state)) {
+        const auto ready = required_catalog_ready(*payload, state);
+        if (!ready) {
             return "required_mcp_unavailable";
+        }
+        const auto* deadline = state.find("mcp_deadline_ms");
+        if (!deadline || !deadline->is_number()) {
+            return "invalid_protocol_state";
+        }
+        if (readiness_clock_ms() >= deadline->as_number()) {
+            return "mcp_readiness_incomplete";
+        }
+        if (!*ready) {
+            // Inspection runs in the add-on process. Pace native status queries
+            // while discovery is pending without replacing its stdio connection.
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (readiness_clock_ms() >= deadline->as_number()) {
+                return "mcp_readiness_incomplete";
+            }
+            result.stdin_bytes = control_request(state, "status");
+            return std::nullopt;
         }
         // Classify the entire buffered native stream before releasing input;
         // an administrative frame may be split after this status response.
         state.set("mcp_phase", Json("verified"));
         state.set("mcp_request_id", Json(""));
+        state.erase("mcp_deadline_ms");
         return std::nullopt;
     }
-    auto* remaining = state.find("mcp_remaining");
-    if (!remaining || !remaining->is_array() || (phase != "initialize" && phase != "reconnect")) {
+    if (phase != "initialize") {
         return "invalid_protocol_state";
     }
-    if (phase == "reconnect") {
-        if (remaining->as_array().empty()) {
-            return "invalid_protocol_state";
-        }
-        remaining->as_array().erase(remaining->as_array().begin());
-    }
-    result.stdin_bytes = remaining->as_array().empty() ? control_request(state, "status") :
-        control_request(state, "reconnect", remaining->as_array().front().as_string());
+    state.set("mcp_deadline_ms", Json(readiness_clock_ms() + 30000.0));
+    result.stdin_bytes = control_request(state, "status");
     return std::nullopt;
 }
 
@@ -255,7 +277,6 @@ addon::Structured_prepare_result prepare(
     if (!server_names.empty()) {
         args.insert(args.end(), {"--input-format", "stream-json"});
         state.set("required_mcp_servers", required_servers);
-        state.set("mcp_remaining", strings(server_names));
         state.set("prompt_base64", Json(addon::encode_base64(prompt)));
         result.process.stdin_payload = control_request(state, "initialize");
         result.inspection.keep_stdin_open = true;
@@ -486,6 +507,11 @@ void handle_sessions(addon::Invocation_context& invocation, const std::filesyste
         invocation.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
     }
+    if (!input->control.connection) {
+        invocation.fail(addon::Result_status::UNAVAILABLE, "task_server_connection_unavailable");
+        return;
+    }
+    const auto& connection = *input->control.connection;
     Json servers = Json::object();
     std::vector<std::string> tools;
     std::vector<std::string> names;
@@ -499,16 +525,15 @@ void handle_sessions(addon::Invocation_context& invocation, const std::filesyste
         required.set("actions", strings(server.actions));
         required_servers.push_back(std::move(required));
         for (const auto& action : server.actions) tools.push_back("mcp__" + name + "__" + action);
-        Json environment = Json::object();
-        for (const auto& [key, value] : server.environment) environment.set(key, Json(value));
         Json config = Json::object();
         config.set("type", Json("stdio"));
-        config.set("command", Json(server.program));
-        config.set("args", Json::array());
-        config.set("env", std::move(environment));
+        config.set("command", Json(connection.relay_program));
+        config.set("args", strings({"--descriptor", connection.descriptor_path, "--server", server.server_id}));
+        config.set("env", Json::object());
         servers.set(name, std::move(config));
         result.acknowledgment.server_ids.push_back(server.server_id);
     }
+    result.acknowledgment.connection_version = addon::k_delegated_connection_version;
     Json config = Json::object();
     config.set("mcpServers", std::move(servers));
     const std::string relative = "mcp/" + input->control.task_id + ".json";

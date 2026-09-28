@@ -586,10 +586,14 @@ addon::Delegated_prepare_result delegated_fixture(addon::Structured_purpose purp
     request.context.launch_environment = environment;
     request.control.task_id = "readiness-task";
     request.control.private_artifact_root = claude::path_string(fs::current_path() / "private-readiness");
+    request.control.connection = addon::Delegated_connection{
+        claude::path_string(fs::current_path() / "host relay"),
+        claude::path_string(fs::current_path() / "private-readiness/.logonomic/task-servers.json")};
     for (const auto* id : {"coordination", "delegation"}) {
         addon::Delegated_task_server server;
         server.server_id = id;
         server.program = claude::path_string(fs::current_path() / "task-control");
+        server.environment = {{"VNM_CONTROL_TOKEN", "claude-host-authority-canary"}};
         server.actions = std::string_view(id) == "coordination" ?
             std::vector<std::string>{"status", "notice"} : std::vector<std::string>{"delegate", "inspect_task"};
         request.control.servers.push_back(std::move(server));
@@ -602,6 +606,30 @@ addon::Delegated_prepare_result delegated_fixture(addon::Structured_purpose purp
     addon::Contract_failure failure;
     const auto prepared = addon::decode_delegated_prepare_result(invocation.m_payload, &failure, 3);
     require(prepared.has_value(), "delegated native preparation satisfies session@3 codec");
+    require(prepared->acknowledgment.connection_version == addon::k_delegated_connection_version,
+        "delegated preparation acknowledges the configured connection");
+    const auto config = claude::object(prepared->private_artifacts.front().content);
+    for (const auto& server : request.control.servers) {
+        const auto* entry = config.find("mcpServers")->find("logonomic-task-readiness-task-" + server.server_id);
+        require(entry && claude::text(*entry, "command") == request.control.connection->relay_program &&
+            entry->find("env")->as_object().empty(), "MCP configuration uses the nonsecret relay");
+        const auto& args = entry->find("args")->as_array();
+        require(args.size() == 4 && args[0].as_string() == "--descriptor" &&
+            args[1].as_string() == request.control.connection->descriptor_path &&
+            args[2].as_string() == "--server" && args[3].as_string() == server.server_id,
+            "MCP configuration preserves exact connection arguments");
+    }
+    require(prepared->private_artifacts.front().content.find("claude-host-authority-canary") == std::string::npos &&
+        addon::serialize_json(invocation.m_payload).find("claude-host-authority-canary") == std::string::npos,
+        "host credentials must not enter private artifacts or protocol results");
+    auto disconnected = request;
+    disconnected.control.connection.reset();
+    Context refused;
+    refused.m_request = invocation.m_request;
+    refused.m_request.payload = addon::encode_delegated_prepare_request(disconnected, 3);
+    claude::handle_sessions(refused, fs::current_path());
+    require(refused.m_status == addon::Result_status::UNAVAILABLE &&
+        refused.m_reason == "task_server_connection_unavailable", "missing connection refuses delegation locally");
     require(prepared->inspection.keep_stdin_open && prepared->inspection.incremental,
         "readiness retains native input across incremental inspection");
     require(prepared->acknowledgment.server_ids == std::vector<std::string>{"coordination", "delegation"},
@@ -625,9 +653,7 @@ std::string control_reply(const std::string& state, Json payload = Json::object(
     Json response = Json::object();
     response.set("subtype", Json("success"));
     response.set("request_id", Json(claude::text(claude::object(state), "mcp_request_id")));
-    if (claude::text(claude::object(state), "mcp_phase") != "reconnect") {
-        response.set("response", std::move(payload));
-    }
+    response.set("response", std::move(payload));
     Json frame = Json::object();
     frame.set("type", Json("control_response"));
     frame.set("response", std::move(response));
@@ -665,22 +691,37 @@ void delegated_readiness_contract()
         result = inspect_readiness(purpose, result.protocol_state, ack.substr(ack.size() / 2));
         require(!result.complete && result.stdin_bytes && !result.close_stdin,
             "initialize acknowledgment starts awaited discovery without task release");
-        const auto reconnect_state = result.protocol_state;
-        for (const auto* id : {"coordination", "delegation"}) {
-            const auto reconnect = claude::object(*result.stdin_bytes);
-            require(claude::text(*reconnect.find("request"), "subtype") == "mcp_reconnect" &&
-                claude::text(*reconnect.find("request"), "serverName") ==
-                    std::string("logonomic-task-readiness-task-") + id,
-                "only the next required host server is reconnected");
-            const auto waiting = inspect_readiness(purpose, result.protocol_state, "");
-            require(!waiting.complete && !waiting.stdin_bytes && !waiting.close_stdin,
-                "delayed discovery does not poll or release the prompt");
-            result = inspect_readiness(purpose, waiting.protocol_state, control_reply(waiting.protocol_state));
-        }
         require(claude::text(*claude::object(*result.stdin_bytes).find("request"), "subtype") == "mcp_status",
-            "awaited reconnects precede the live catalog snapshot");
+            "initial discovery is inspected through the live catalog snapshot");
         const auto status_state = result.protocol_state;
         auto catalog = claude::object(R"({"mcpServers":[{"name":"logonomic-task-readiness-task-coordination","status":"connected","tools":[{"name":"status"},{"name":"notice"},{"name":"extra"}]},{"name":"logonomic-task-readiness-task-delegation","status":"connected","tools":[{"name":"delegate"},{"name":"inspect_task"}]},{"name":"unrelated-native-server","status":"disabled"}]})");
+        auto pending_catalog = catalog;
+        auto& pending_server = pending_catalog.find("mcpServers")->as_array()[1];
+        pending_server.set("status", Json("pending"));
+        pending_server.erase("tools");
+        const auto pending = inspect_readiness(purpose, status_state, control_reply(status_state, pending_catalog));
+        require(!pending.complete && !pending.failure_reason && pending.stdin_bytes && !pending.close_stdin &&
+            claude::text(*claude::object(*pending.stdin_bytes).find("request"), "subtype") == "mcp_status",
+            "pending native discovery requests another catalog without releasing task input");
+        const auto waiting = inspect_readiness(purpose, pending.protocol_state, "");
+        require(!waiting.complete && !waiting.stdin_bytes && !waiting.close_stdin,
+            "one catalog request stays outstanding until its response");
+        require(claude::object(waiting.protocol_state).find("mcp_deadline_ms")->as_number() ==
+            claude::object(status_state).find("mcp_deadline_ms")->as_number(),
+            "pending discovery cannot extend the original readiness deadline");
+        const auto discovered = inspect_readiness(purpose, waiting.protocol_state,
+            control_reply(waiting.protocol_state, catalog));
+        require(discovered.stdin_bytes && discovered.close_stdin && !discovered.failure_reason,
+            "actual initial catalog after pending discovery admits task input");
+        auto expired = claude::object(status_state);
+        expired.set("mcp_deadline_ms", Json(0.0));
+        const auto expired_state = addon::serialize_json(expired);
+        for (const auto& snapshot : {pending_catalog, catalog}) {
+            const auto timed_out = inspect_readiness(purpose, expired_state,
+                control_reply(expired_state, snapshot));
+            require(timed_out.failure_reason == "mcp_readiness_incomplete" && !timed_out.stdin_bytes,
+                "elapsed readiness deadline refuses pending and late connected catalogs");
+        }
         result = inspect_readiness(purpose, status_state, control_reply(status_state, catalog));
         require(!result.complete && !result.failure_reason && result.stdin_bytes && result.close_stdin,
             "positive catalog returns task input and ordered EOF in the same incomplete reply");
@@ -765,7 +806,7 @@ void delegated_readiness_contract()
             "duplicate buffered acknowledgments cannot advance unsent requests");
         require(inspect_readiness(purpose, released, control_reply(status_state, catalog)).failure_reason ==
             "mcp_control_response_mismatch", "late status cannot release the task twice");
-        for (const auto& phase_state : {initial, reconnect_state, status_state}) {
+        for (const auto& phase_state : {initial, status_state}) {
             for (const int defect : {0, 1, 2, 3}) {
                 auto reply = claude::object(control_reply(phase_state));
                 auto* response = reply.find("response");
@@ -773,9 +814,6 @@ void delegated_readiness_contract()
                 if (defect == 1) response->set("response", Json("not-an-object"));
                 if (defect == 2) response->set("subtype", Json("error"));
                 if (defect == 3) reply.set("type", Json("assistant"));
-                if (defect == 0 && phase_state == reconnect_state) {
-                    continue; // The positive reconnect fixture already covers its omitted payload.
-                }
                 const auto refused = inspect_readiness(purpose, phase_state, addon::serialize_json(reply) + '\n');
                 require(refused.failure_reason ==
                     (defect == 3 ? "unexpected_preprompt_output" : "mcp_control_unavailable") && !refused.stdin_bytes,
