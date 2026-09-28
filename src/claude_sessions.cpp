@@ -62,21 +62,27 @@ bool valid_review_init(const Json& event, const Json& state)
 {
     const auto* tools   = event.find("tools");
     const auto* servers = event.find("mcp_servers");
-    const auto* plugins = event.find("plugins");
     const auto* expected_tools   = state.find("expected_tools");
     const auto* expected_servers = state.find("expected_mcp_servers");
-    if (text(event, "permissionMode") != "plan" || !tools || !servers || !servers->is_array() ||
-        !plugins || !plugins->is_array() || !plugins->as_array().empty() ||
-        !expected_tools || !expected_servers ||
-        !same_strings(string_array(*tools), string_array(*expected_tools)) ||
+    if (!tools || !servers || !servers->is_array() || !expected_tools || !expected_servers ||
         !same_directory(text(event, "cwd"), text(state, "working_directory")))
+    {
+        return false;
+    }
+    // Settings and hooks remain the user's own. Plugin metadata is not a
+    // capability grant: attest the actual tools, allowing user deny rules to
+    // narrow the read-only ceiling. Required Task tools are checked separately.
+    const auto available = string_array(*tools);
+    const auto allowed   = string_array(*expected_tools);
+    if (!std::all_of(available.begin(), available.end(), [&allowed](const std::string& tool) {
+            return std::find(allowed.begin(), allowed.end(), tool) != allowed.end();
+        }))
     {
         return false;
     }
     std::vector<std::string> names;
     for (const auto& server : servers->as_array()) {
-        if (!server.is_object() || server.as_object().size() != 2 ||
-            text(server, "name").empty() || text(server, "status") != "connected")
+        if (!server.is_object() || text(server, "name").empty() || text(server, "status") != "connected")
         {
             return false;
         }
@@ -280,20 +286,36 @@ addon::Structured_prepare_result prepare(
     }
     const bool review = purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
     const auto command = recognize_launcher(context.launcher.script_body);
-    if (!command || (!review && !direct_implementation_arguments(context))) {
+    if (!command || !direct_implementation_arguments(context)) {
         throw std::runtime_error("unsupported_launcher");
     }
+    if (review) {
+        // Inspect the same normalized argv that will execute. Quoted pieces
+        // of option names must not evade the review ceiling, and '--' would
+        // turn our appended restrictions into positional input.
+        for (std::size_t index = *cli_argument_index(context.launcher_argv) + 1;
+             index < context.launcher_argv.size(); ++index)
+        {
+            const auto& argument = context.launcher_argv[index];
+            const auto name = argument.substr(0, argument.find('='));
+            if (name == "--tools" || name == "--mcp-config" || name == "--") {
+                throw std::runtime_error("review_launcher_conflict");
+            }
+            index += claude_option_value_words(context.launcher_argv, index);
+        }
+    }
     addon::Structured_prepare_result result;
-    result.process = cli_process(context, !review);
+    result.process = cli_process(context, true);
     apply_account(context, result.process);
     auto& args = result.process.argv;
     args.insert(args.end(), {"-p", "--output-format", "stream-json", "--verbose", "--no-session-persistence"});
     std::vector<std::string> review_tools{"Read", "Glob", "Grep"};
     review_tools.insert(review_tools.end(), delegated_tools.begin(), delegated_tools.end());
     if (review) {
-        args.insert(args.end(), {"--safe-mode", "--strict-mcp-config", "--mcp-config", mcp_path,
-            "--tools", join(review_tools), "--allowedTools", join(review_tools), "--permission-mode", "plan",
-            "--setting-sources", "project", "--model", "sonnet"});
+        // A tool ceiling enforces the review purpose without overriding the
+        // launcher's permission mode or disabling user permission hooks.
+        // Plan mode itself denies Task tools in current Claude Code.
+        args.insert(args.end(), {"--strict-mcp-config", "--mcp-config", mcp_path, "--tools", join(review_tools)});
     }
     else {
         // An implementation keeps the launcher's own options and the user's
@@ -303,9 +325,9 @@ addon::Structured_prepare_result prepare(
         if (!server_names.empty()) {
             args.insert(args.end(), {"--mcp-config", mcp_path});
         }
-        if (!delegated_tools.empty()) {
-            args.insert(args.end(), {"--allowedTools", join(delegated_tools)});
-        }
+    }
+    if (!delegated_tools.empty()) {
+        args.insert(args.end(), {"--allowedTools", join(delegated_tools)});
     }
     result.process.stdin_behavior = addon::Stdin_behavior::PAYLOAD;
     result.process.stdin_payload  = prompt;
@@ -379,16 +401,28 @@ addon::Structured_inspect_result inspect_session(
             const auto type = text(event, "type");
             const auto subtype = text(event, "subtype");
             if (type.empty() || (review && !answer.empty())) return failed("invalid_structured_output");
+            const bool hook = subtype == "hook_started" || subtype == "hook_progress" || subtype == "hook_response";
+            const bool administrative = type == "system" &&
+                ((review && (hook || subtype == "commands_changed" || subtype == "informational")) ||
+                 (!review && !initialized && hook));
+            if (administrative) {
+                const auto id = text(event, "session_id");
+                if (id.empty() || (!root_session.empty() && id != root_session)) {
+                    return failed("session_provenance_mismatch");
+                }
+                root_session = id;
+                pending_before_input = false;
+                record(addon::Presentation_event_kind::REASONING);
+                continue;
+            }
             // A reply cannot acknowledge input that this inspection has not
-            // returned to the host yet. Retain only established startup hooks.
-            const bool startup_hook = !review && !initialized && type == "system" &&
-                (subtype == "hook_started" || subtype == "hook_progress" || subtype == "hook_response");
-            if ((result.stdin_bytes || pending_before_input) && !startup_hook) {
+            // returned to the host yet. Only administration may cross it.
+            if (result.stdin_bytes || pending_before_input) {
                 return failed("unexpected_preprompt_output");
             }
             pending_before_input = false;
             const auto phase = text(state, "mcp_phase");
-            if (!phase.empty() && phase != "released" && !startup_hook) {
+            if (!phase.empty() && phase != "released") {
                 if (type != "control_response") {
                     return failed("unexpected_preprompt_output");
                 }
@@ -420,15 +454,7 @@ addon::Structured_inspect_result inspect_session(
                 continue;
             }
             if (!review && !initialized) {
-                const auto id = text(event, "session_id");
-                if (type != "system" || (subtype != "hook_started" && subtype != "hook_progress" && subtype != "hook_response") ||
-                    id.empty() || (!root_session.empty() && id != root_session))
-                {
-                    return failed("session_provenance_mismatch");
-                }
-                root_session = id;
-                record(addon::Presentation_event_kind::REASONING);
-                continue;
+                return failed("session_provenance_mismatch");
             }
             if (type == "result") {
                 if (!initialized) return failed("result_before_initialization");
@@ -475,11 +501,6 @@ addon::Structured_inspect_result inspect_session(
         if (result.stdin_bytes && pending.find_first_not_of(" \t\r\n") != std::string::npos) {
             pending_before_input = true;
         }
-        if (review && text(state, "mcp_phase") == "verified" &&
-            pending.find_first_not_of(" \t\r\n") != std::string::npos)
-        {
-            return failed("unexpected_preprompt_output");
-        }
         if (text(state, "mcp_phase") == "verified" && pending.find_first_not_of(" \t\r\n") == std::string::npos) {
             const auto prompt = addon::decode_base64(text(state, "prompt_base64"));
             if (!prompt || prompt->empty()) {
@@ -508,7 +529,7 @@ addon::Structured_inspect_result inspect_session(
                 return failed("unauthenticated_final_result");
             }
         }
-        result.complete = inspection.final || (review && !answer.empty() && text(state, "mcp_phase").empty());
+        result.complete = inspection.final;
         if (result.complete) {
             result.result_bytes = std::move(answer);
         }

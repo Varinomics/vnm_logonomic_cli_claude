@@ -84,6 +84,22 @@ with `--permission-mode acceptEdits`. A run whose settings or options remove or
 refuse one of its Task tools, for example with a `permissions.deny` rule
 matching `mcp__logonomic-task-...`, fails with `task_tools_not_permitted`.
 
+Read-only review likewise keeps the launcher's options, model, settings and
+hooks. The package limits the native tools to `Read`, `Glob`, `Grep` and its
+own Task tools, and loads only the host's Task MCP configuration. It adds only
+the exact Task-tool pre-approvals. It does not select plan mode: current Claude
+Code refuses Task calls in that mode even when individually pre-approved.
+User deny rules and permission hooks still apply. Review checks the actual
+native tool/server surface, including when plugins are configured, and waits
+for a successful process exit before returning its authenticated root result.
+
+Both session purposes require a direct launcher whose normalized arguments
+match the host's invocation. Review additionally refuses `--tools`,
+`--mcp-config` and `--`, including quoted spellings, because they conflict with
+its fixed tool ceiling or appended arguments. Use a separate direct launcher
+without those options for review; retain permission restrictions with the
+launcher's normal settings and `--disallowedTools`.
+
 Interactive launch preparation also accepts the host's
 `interactive-initial-prompt@1` member. The prepared invocation starts a new
 interactive session whose first user message is the host's text, passed as

@@ -136,7 +136,8 @@ Claude_reading claude_reading(const std::vector<std::string>& argv)
             if (index + 1 < argv.size() && !is_option(argv[index + 1])) values.push_back(argv[++index]);
         }
         else
-        if (name == "--add-dir" || name == "--allowedTools" || name == "--mcp-config") {
+        if (name == "--add-dir" || name == "--allowedTools" || name == "--mcp-config" ||
+            name == "--disallowedTools" || name == "--tools") {
             while (index + 1 < argv.size() && !is_option(argv[index + 1])) values.push_back(argv[++index]);
         }
         reading.options.emplace_back(name, std::move(values));
@@ -960,8 +961,15 @@ void structured_contract()
     input.protocol_state = result.protocol_state;
     input.stdout_bytes = R"({"type":"result","session_id":"root","subtype":"success","is_error":false,"result":"Root review"})" "\n";
     result = claude::inspect_session(addon::Structured_purpose::READ_ONLY_REVIEW, input);
+    require(!result.complete && !result.failure_reason && !result.result_bytes,
+        "review retains the root result until final exit");
+    input.protocol_state = result.protocol_state;
+    input.stdout_bytes.clear();
+    input.final = true;
+    result = claude::inspect_session(addon::Structured_purpose::READ_ONLY_REVIEW, input);
     require(result.complete && result.result_bytes == "Root review",
         "review root identity survives incremental inspection");
+    input.final = false;
     input.protocol_state = review_state;
     input.stdout_bytes = R"({"type":"result","subtype":"success","is_error":false,"result":"Unbound review"})" "\n";
     require(claude::inspect_session(addon::Structured_purpose::READ_ONLY_REVIEW, input).failure_reason ==
@@ -1148,7 +1156,7 @@ void delegated_readiness_contract()
             control_reply(status_state, catalog) + "{\"type\":");
         require(!early_tail.stdin_bytes && !early_tail.close_stdin,
             "an unclassified preprompt tail withholds task release");
-        if (purpose == addon::Structured_purpose::IMPLEMENTATION) {
+        {
             require(!early_tail.complete && !early_tail.failure_reason &&
                 claude::text(claude::object(early_tail.protocol_state), "mcp_phase") == "verified",
                 "verified catalog retains the prompt until administrative tail classification");
@@ -1166,10 +1174,6 @@ void delegated_readiness_contract()
             const auto exited = claude::inspect_session(purpose, ended);
             require(exited.failure_reason == "mcp_readiness_incomplete" && !exited.stdin_bytes,
                 "verified-but-unreleased process exit cannot release the prompt");
-        }
-        else {
-            require(early_tail.failure_reason == "unexpected_preprompt_output",
-                "review has no accepted administrative preprompt tail");
         }
         auto init = claude::object(R"({"type":"system","subtype":"init","session_id":"root","permissionMode":"plan","tools":[],"mcp_servers":[{"name":"logonomic-task-readiness-task-coordination","status":"connected"},{"name":"logonomic-task-readiness-task-delegation","status":"connected"}],"plugins":[],"cwd":""})");
         const auto state = claude::object(released);
@@ -1196,7 +1200,7 @@ void delegated_readiness_contract()
         require(claude::inspect_session(purpose, final).failure_reason == "process_failed",
             "delegated root result cannot override failed process exit after EOF");
         if (purpose == addon::Structured_purpose::READ_ONLY_REVIEW) {
-            init.set("permissionMode", Json("dontAsk"));
+            init.find("tools")->push_back(Json("Write"));
             require(inspect_readiness(purpose, released, addon::serialize_json(init) + '\n').failure_reason ==
                 "review_surface_mismatch", "readiness does not relax review's native surface attestation");
         }
@@ -1237,10 +1241,10 @@ void delegated_readiness_contract()
         }
         const std::string hook = R"({"type":"system","subtype":"hook_started","session_id":"hook-root"})" "\n";
         const auto administrative = inspect_readiness(purpose, initial, hook);
-        if (purpose == addon::Structured_purpose::IMPLEMENTATION) {
+        {
             require(!administrative.failure_reason && !administrative.stdin_bytes &&
                 claude::text(claude::object(administrative.protocol_state), "root_session_id") == "hook-root",
-                "implementation retains its exact startup hook provenance before readiness");
+                "both purposes retain exact startup hook provenance before readiness");
             auto partial_hook = inspect_readiness(purpose, initial, ack + hook.substr(0, 15));
             require(partial_hook.stdin_bytes && !partial_hook.failure_reason,
                 "fragmented administrative output does not block an accepted control reply");
@@ -1259,10 +1263,6 @@ void delegated_readiness_contract()
                     deferred.close_stdin && deferred.protocol_state == complete_hook.protocol_state,
                     "administrative stream chunk boundaries do not change readiness disposition");
             }
-        }
-        else {
-            require(administrative.failure_reason == "unexpected_preprompt_output",
-                "review does not acquire implementation startup-hook tolerance");
         }
         auto partial_model = inspect_readiness(purpose, initial, ack + "{\"type\":");
         require(partial_model.stdin_bytes && !partial_model.close_stdin,
@@ -1431,6 +1431,152 @@ void permission_posture_contract()
         require(!claude::inspect_session(purpose, input).failure_reason,
             "a denial of another tool is the launcher's posture, not a failure");
     }
+}
+
+// Oracle: the owner's read-only purpose and launcher-posture requirement,
+// together with the recorded Claude Code 2.1.282 scripted review stream.
+void review_contract()
+{
+    constexpr auto purpose = addon::Structured_purpose::READ_ONLY_REVIEW;
+    int failures = 0;
+    const auto check = [&failures](bool condition, const char* message) {
+        if (!condition) {
+            std::cerr << "Review: " << message << '\n';
+            ++failures;
+        }
+    };
+    for (const bool delegated : {true, false}) {
+        auto request = posture_request(purpose,
+            {"--disallowedTools", "Read(private/**)", "--settings", "review-settings.json", "--model", "opus"});
+        // The host's normalized argv is the actual invocation, including a
+        // valid embedded quotation in an option name.
+        request.context.launcher.script_body =
+            "claude --disallowed\"Tools\" Read(private/**) --settings review-settings.json --model opus";
+        const auto invocation = posture_prepare(request, delegated);
+        const auto reading = prepared_reading(invocation, delegated);
+        check(reading.values("--disallowedTools") == std::vector<std::string>{"Read(private/**)"} &&
+            reading.values("--settings") == std::vector<std::string>{"review-settings.json"} &&
+            reading.values("--model") == std::vector<std::string>{"opus"},
+            "normalized quoted launcher restrictions, settings and model survive review");
+        check(!has_option(reading, "--safe-mode") && !has_option(reading, "--setting-sources"),
+            "review keeps user hooks and all settings sources");
+        check(!has_option(reading, "--permission-mode"), "review preserves the default permission mode");
+        const std::string task_tools =
+            "mcp__logonomic-task-posture-task-delegation__targets,mcp__logonomic-task-posture-task-delegation__submit";
+        check(reading.values("--tools") == std::vector<std::string>{
+            delegated ? "Read,Glob,Grep," + task_tools : "Read,Glob,Grep"},
+            "review exposes only reads and its own Task tools");
+        check(reading.values("--allowedTools") ==
+            (delegated ? std::vector<std::string>{task_tools} : std::vector<std::string>{}),
+            "review pre-approves only its own Task tools");
+        for (const std::string option : {"--tools", "--mcp-config", "--"}) {
+            request = posture_request(purpose, {option, "unsafe"});
+            request.context.launcher.script_body = "claude \"" + option + "\" unsafe";
+            bool refused = false;
+            try { posture_prepare(request, delegated); }
+            catch (const std::exception& error) { refused = std::string(error.what()) == "review_launcher_conflict"; }
+            check(refused, "normalized quoted conflicting options are refused");
+        }
+        request = posture_request(purpose, {});
+        request.context.launcher.script_body = "claude --disallowedTools Read";
+        bool refused = false;
+        try { posture_prepare(request, delegated); }
+        catch (const std::exception& error) { refused = std::string(error.what()) == "unsupported_launcher"; }
+        check(refused, "review refuses a launcher whose effective argv is not established");
+    }
+
+    auto init = claude::object(R"({"type":"system","subtype":"init","session_id":"root","permissionMode":"plan","tools":["Glob","Grep"],"mcp_servers":[],"plugins":[{"name":"agents-md","path":"builtin","source":"agents-md@builtin"}],"cwd":""})");
+    init.set("cwd", Json(claude::path_string(fs::current_path())));
+    addon::Structured_inspection input;
+    input.protocol_state = addon::serialize_json(protocol(true));
+    input.stdout_bytes = addon::serialize_json(init) + '\n';
+    auto inspected = claude::inspect_session(purpose, input);
+    check(!inspected.failure_reason, "builtin plugin and user-denied Read preserve the read-only ceiling");
+    init.set("permissionMode", Json("bypassPermissions"));
+    init.set("plugins", Json::array());
+    init.set("tools", claude::strings({"Read", "Glob", "Grep"}));
+    input.stdout_bytes = addon::serialize_json(init) + '\n';
+    check(!claude::inspect_session(purpose, input).failure_reason,
+        "the read-only tool ceiling also admits a launcher's bypass mode");
+    init.find("tools")->push_back(Json("Write"));
+    input.stdout_bytes = addon::serialize_json(init) + '\n';
+    check(claude::inspect_session(purpose, input).failure_reason == "review_surface_mismatch",
+        "plugin metadata cannot authorize a writing tool");
+
+    const auto prepared = delegated_fixture(purpose);
+    const auto initial = prepared.inspection.protocol_state;
+    for (const std::string subtype : {"commands_changed", "informational", "hook_started", "hook_progress", "hook_response"}) {
+        const std::string event = "{\"type\":\"system\",\"subtype\":\"" + subtype + "\",\"session_id\":\"root\"}\n";
+        auto result = inspect_readiness(purpose, initial, event);
+        check(!result.failure_reason && !result.stdin_bytes,
+            "administrative events do not fail or release a review before readiness");
+        auto verified = claude::object(initial);
+        verified.set("mcp_phase", Json("verified"));
+        result = inspect_readiness(purpose, addon::serialize_json(verified), event.substr(0, 15));
+        const bool buffered = !result.failure_reason && !result.stdin_bytes;
+        check(buffered, "fragmented review administration withholds input until classification");
+        if (buffered) {
+            result = inspect_readiness(purpose, result.protocol_state, event.substr(15));
+            check(!result.failure_reason && result.stdin_bytes && result.close_stdin,
+                "classified administrative tail releases exactly the ready task prompt");
+        }
+    }
+    auto delegated_init = init;
+    const auto delegated_state = claude::object(initial);
+    delegated_init.set("tools", *delegated_state.find("expected_tools"));
+    auto servers = Json::array();
+    for (const auto& name : delegated_state.find("expected_mcp_servers")->as_array()) {
+        auto server = Json::object();
+        server.set("name", name);
+        server.set("status", Json("connected"));
+        server.set("source", Json("dynamic"));
+        servers.push_back(std::move(server));
+    }
+    delegated_init.set("mcp_servers", servers);
+    auto released = delegated_state;
+    released.set("mcp_phase", Json("released"));
+    check(!inspect_readiness(purpose, addon::serialize_json(released), addon::serialize_json(delegated_init) + '\n').failure_reason,
+        "current native MCP server metadata preserves exact connected server attestation");
+
+    std::ifstream fixture(fs::path(__FILE__).parent_path() / "fixtures/review_2_1_282.jsonl");
+    require(bool(fixture), "recorded review fixture opens");
+    std::string stream;
+    for (std::string line; std::getline(fixture, line);) {
+        if (line.find_first_not_of(" \r\t") == std::string::npos) continue;
+        auto event = claude::object(line);
+        if (claude::text(event, "subtype") == "init") event.set("cwd", *init.find("cwd"));
+        stream += addon::serialize_json(event) + '\n';
+    }
+    for (const std::size_t chunk_size : {stream.size(), std::size_t{17}}) {
+        input = {};
+        input.protocol_state = addon::serialize_json(protocol(true));
+        bool accepted = true;
+        for (std::size_t offset = 0; offset < stream.size(); offset += chunk_size) {
+            input.stdout_bytes = stream.substr(offset, chunk_size);
+            inspected = claude::inspect_session(purpose, input);
+            if (inspected.failure_reason || inspected.complete) { accepted = false; break; }
+            input.protocol_state = inspected.protocol_state;
+        }
+        check(accepted, "recorded administrative review stream is accepted and waits for exit");
+        if (!accepted) continue;
+        input.stdout_bytes.clear();
+        input.final = true;
+        inspected = claude::inspect_session(purpose, input);
+        check(inspected.complete && !inspected.failure_reason && inspected.result_bytes == "scripted-no-tool",
+            "recorded review result authenticates after successful exit");
+        input.exit_code = 1;
+        check(claude::inspect_session(purpose, input).failure_reason == "process_failed",
+            "recorded review cannot authenticate after failed exit");
+    }
+    input = {};
+    input.protocol_state = addon::serialize_json(protocol(true));
+    init.set("tools", claude::strings({"Read", "Glob", "Grep"}));
+    init.set("plugins", Json::array());
+    input.stdout_bytes = addon::serialize_json(init) + '\n' +
+        R"({"type":"result","session_id":"root","subtype":"success","is_error":false,"result":"done"})" "\n";
+    inspected = claude::inspect_session(purpose, input);
+    check(!inspected.complete && !inspected.failure_reason, "standalone review waits for final exit");
+    require(failures == 0, "read-only review contract failures");
 }
 
 void probe_contract()
@@ -1898,6 +2044,7 @@ int main(int argc, char** argv)
         return 2;
     }
     try {
+        review_contract();
         launcher_contract();
         launcher_discovery_contract();
         launcher_discovery_candidate_limit();
