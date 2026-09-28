@@ -163,17 +163,22 @@ std::optional<std::vector<std::string>> prepared_argv(
     auto command = literal_command(argv);
     if (!command) return std::nullopt;
     const auto cli_index = *cli_argument_index(*command);
+    // The scans step over each option's value, so a value that reads like an
+    // option, as in --system-prompt --append-system-prompt, stays a value.
+    const auto next_option = [&command](std::size_t index) {
+        return index + 1 + claude_option_value_words(*command, index);
+    };
     if (plugin) {
         std::optional<std::string> last;
-        for (std::size_t index = cli_index + 1; index < command->size(); ++index) {
-            if ((*command)[index] == "--plugin-dir" && index + 1 < command->size()) last = (*command)[++index];
+        for (std::size_t index = cli_index + 1; index < command->size(); index = next_option(index)) {
+            if ((*command)[index] == "--plugin-dir" && index + 1 < command->size()) last = (*command)[index + 1];
             else
             if ((*command)[index].starts_with("--plugin-dir=")) last = (*command)[index].substr(13);
         }
         if (!last || *last != *plugin) command->insert(command->end(), {"--plugin-dir", *plugin});
     }
     bool present = false;
-    for (std::size_t index = cli_index + 1; index < command->size(); ++index) {
+    for (std::size_t index = cli_index + 1; index < command->size(); index = next_option(index)) {
         auto& argument = (*command)[index];
         if (argument == "--append-system-prompt") {
             if (index + 1 == command->size()) command->push_back(instruction);

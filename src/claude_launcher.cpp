@@ -9,6 +9,7 @@
 #include <logonomic_cli_addon/presentation_record.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <filesystem>
@@ -22,6 +23,17 @@ namespace claude {
 namespace {
 using Environment = std::vector<std::pair<std::string, std::string>>;
 constexpr std::size_t k_max_profile_directory_entries_to_scan = 256;
+
+// Claude's options that take the next word as their value, whatever that word
+// is, among the options an interactive launch may carry.
+constexpr std::array<std::string_view, 15> k_value_options{
+    "--agent", "--agents", "--append-system-prompt", "--autocompact", "--debug-file",
+    "--effort", "--model", "-n", "--name", "--permission-mode", "--plugin-dir",
+    "--remote-control-session-name-prefix", "--setting-sources", "--settings", "--system-prompt",
+};
+// An option whose value is optional: it takes the next word only when that
+// word does not start with '-'.
+constexpr std::string_view k_prompt_suggestions = "--prompt-suggestions";
 
 std::string trim(std::string_view value)
 {
@@ -309,35 +321,61 @@ std::optional<std::size_t> cli_argument_index(const std::vector<std::string>& ar
     return std::nullopt;
 }
 
+std::size_t claude_option_value_words(const std::vector<std::string>& argv, std::size_t index)
+{
+    if (index + 1 >= argv.size()) {
+        return 0;
+    }
+    const auto& argument = argv[index];
+    if (std::find(k_value_options.begin(), k_value_options.end(), argument) != k_value_options.end()) {
+        return 1;
+    }
+    return argument == k_prompt_suggestions && !argv[index + 1].starts_with('-') ? 1 : 0;
+}
+
 bool interactive_resume_arguments(const std::vector<std::string>& argv)
 {
     const auto cli_index = cli_argument_index(argv);
     if (!cli_index) {
         return false;
     }
-    const std::vector<std::string_view> values{
-        "--agent", "--agents", "--append-system-prompt", "--autocompact", "--debug-file",
-        "--effort", "--model", "-n", "--name", "--permission-mode", "--plugin-dir",
-        "--prompt-suggestions", "--remote-control-session-name-prefix", "--setting-sources",
-        "--settings", "--system-prompt",
-    };
     const std::vector<std::string_view> switches{
         "--allow-dangerously-skip-permissions", "--ax-screen-reader", "--brief", "--chrome",
         "--dangerously-skip-permissions", "--disable-slash-commands",
         "--exclude-dynamic-system-prompt-sections", "--ide", "--no-chrome", "--restricted",
         "--strict-mcp-config", "--verbose",
     };
+    // Claude refuses to start an interactive session with prompt suggestions
+    // on, which --prompt-suggestions alone and every value but Claude's own
+    // off words turn on.
+    const auto suggestions_off = [](std::string_view value) {
+        const auto word = lower(trim(value));
+        return word == "0" || word == "false" || word == "no" || word == "off";
+    };
     for (std::size_t index = *cli_index + 1; index < argv.size(); ++index) {
         const auto& argument = argv[index];
-        if (std::find(values.begin(), values.end(), argument) != values.end()) {
-            if (++index >= argv.size() || argv[index].empty()) {
+        if (argument == k_prompt_suggestions) {
+            if (claude_option_value_words(argv, index) == 0 || !suggestions_off(argv[++index])) {
+                return false;
+            }
+            continue;
+        }
+        if (argument.starts_with(std::string(k_prompt_suggestions) + '=')) {
+            if (!suggestions_off(std::string_view(argument).substr(k_prompt_suggestions.size() + 1))) {
+                return false;
+            }
+            continue;
+        }
+        if (claude_option_value_words(argv, index) == 1) {
+            if (argv[++index].empty()) {
                 return false;
             }
             continue;
         }
         const auto equals = argument.find('=');
         if (equals != std::string::npos && equals + 1 < argument.size() &&
-            (std::find(values.begin(), values.end(), argument.substr(0, equals)) != values.end() ||
+            (std::find(k_value_options.begin(), k_value_options.end(), argument.substr(0, equals)) !=
+                 k_value_options.end() ||
              argument.substr(0, equals) == "--debug"))
         {
             continue;

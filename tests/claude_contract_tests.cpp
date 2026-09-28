@@ -79,6 +79,70 @@ void require(bool condition, const char* message)
     if (!condition) throw std::runtime_error(message);
 }
 
+// Oracle: how Claude itself reads its arguments. Claude parses them with
+// commander's parseOptions: a word longer than one character that starts with
+// '-' is an option; an option declared <value> takes the next word whatever it
+// is, one declared [value] takes it unless it starts with '-', and one declared
+// <values...> takes every word up to the next option; --name=value carries its
+// value. The declarations are Claude Code 2.1's own (claude --help).
+struct Claude_reading
+{
+    std::vector<std::pair<std::string, std::vector<std::string>>> options;
+    std::vector<std::string>                                      operands;
+
+    // The values of every occurrence of `name`, in order.
+    std::vector<std::string> values(std::string_view name) const
+    {
+        std::vector<std::string> result;
+        for (const auto& [option, option_values] : options) {
+            if (option == name) result.insert(result.end(), option_values.begin(), option_values.end());
+        }
+        return result;
+    }
+};
+
+Claude_reading claude_reading(const std::vector<std::string>& argv)
+{
+    const std::vector<std::string_view> required{
+        "--agent", "--agents", "--append-system-prompt", "--autocompact", "--debug-file", "--effort",
+        "--model", "-n", "--name", "--permission-mode", "--plugin-dir",
+        "--remote-control-session-name-prefix", "--setting-sources", "--settings", "--system-prompt",
+    };
+    const std::vector<std::string_view> optional{"-d", "--debug", "--prompt-suggestions", "-r", "--resume"};
+    const auto is_option = [](const std::string& word) { return word.size() > 1 && word.front() == '-'; };
+    const auto declared = [](const std::vector<std::string_view>& names, std::string_view name) {
+        return std::find(names.begin(), names.end(), name) != names.end();
+    };
+    Claude_reading reading;
+    for (std::size_t index = 1; index < argv.size(); ++index) {
+        const auto& word = argv[index];
+        if (!is_option(word)) {
+            reading.operands.push_back(word);
+            continue;
+        }
+        const auto equals = word.find('=');
+        const auto name   = word.substr(0, equals);
+        std::vector<std::string> values;
+        if (equals != std::string::npos) {
+            values.push_back(word.substr(equals + 1));
+        }
+        else
+        if (declared(required, name)) {
+            if (index + 1 < argv.size()) values.push_back(argv[++index]);
+        }
+        else
+        if (declared(optional, name)) {
+            if (index + 1 < argv.size() && !is_option(argv[index + 1])) values.push_back(argv[++index]);
+        }
+        else
+        if (name == "--add-dir") {
+            while (index + 1 < argv.size() && !is_option(argv[index + 1])) values.push_back(argv[++index]);
+        }
+        reading.options.emplace_back(name, std::move(values));
+    }
+    return reading;
+}
+
 Json protocol(bool review)
 {
     auto result = claude::object(R"({"initialized":false,"pending_base64":"","result_base64":"","root_session_id":"","working_directory":"","expected_tools":["Read","Glob","Grep"],"expected_mcp_servers":[]})");
@@ -97,6 +161,28 @@ void launcher_contract()
     require(claude::interactive_resume_arguments({"claude", "--model", "sonnet"}), "stock resume flags");
     require(!claude::interactive_resume_arguments({"claude", "--resume", "already-selected"}), "resume cannot overwrite existing selector");
     require(!claude::interactive_resume_arguments({"claude", "-p", "existing prompt"}), "resume cannot steal print input");
+    // Claude refuses to start an interactive session with prompt suggestions on.
+    for (const auto& launcher : std::vector<std::vector<std::string>>{
+            {"claude", "--prompt-suggestions"}, {"claude", "--prompt-suggestions", "true"},
+            {"claude", "--prompt-suggestions", "--verbose"}, {"claude", "--prompt-suggestions=yes"}})
+    {
+        require(!claude::interactive_resume_arguments(launcher), "resume refuses a launcher with prompt suggestions on");
+    }
+    for (const auto& launcher : std::vector<std::vector<std::string>>{
+            {"claude", "--prompt-suggestions", "Off", "--verbose"}, {"claude", "--prompt-suggestions=0"}})
+    {
+        require(claude::interactive_resume_arguments(launcher), "resume keeps a launcher with prompt suggestions off");
+    }
+    const std::string session = "a375d05e-f6cf-4812-80f5-91b33d24c053";
+    const auto resumed = claude::prepared_argv({"claude", "--system-prompt", "--append-system-prompt"},
+        "Logonomic instruction", std::string("C:/plugin root"), {"--resume", session});
+    const auto resumed_reading = claude_reading(*resumed);
+    require(resumed_reading.operands.empty() &&
+        resumed_reading.values("--system-prompt") == std::vector<std::string>{"--append-system-prompt"} &&
+        resumed_reading.values("--append-system-prompt") == std::vector<std::string>{"Logonomic instruction"} &&
+        resumed_reading.values("--plugin-dir") == std::vector<std::string>{"C:/plugin root"} &&
+        resumed_reading.values("--resume") == std::vector<std::string>{session},
+        "a resume keeps an option value that reads like an option, and adds no prompt");
     const auto prepared = claude::prepared_argv({"claude", "--append-system-prompt", "User instruction"},
         "Logonomic instruction", std::string("C:/plugin root"), {});
     require(prepared && (*prepared)[2] == "User instruction Logonomic instruction", "preserve and append user instruction");

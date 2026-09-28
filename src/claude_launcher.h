@@ -21,6 +21,10 @@ struct Launcher_command
 std::optional<Launcher_command> recognize_launcher(std::string_view script);
 std::vector<std::string> literal_argv(std::string_view script);
 std::optional<std::size_t> cli_argument_index(const std::vector<std::string>& argv);
+// The words that follow argv[index] as its value when Claude parses argv, for
+// the options an interactive launch may carry: one after an option that takes
+// a value, none after a switch, an option=value word or an unknown option.
+std::size_t claude_option_value_words(const std::vector<std::string>& argv, std::size_t index);
 bool interactive_resume_arguments(const std::vector<std::string>& argv);
 bool direct_implementation_arguments(const logonomic::cli_addon::Session_launch_context& context);
 logonomic::cli_addon::Process_proposal cli_process(
