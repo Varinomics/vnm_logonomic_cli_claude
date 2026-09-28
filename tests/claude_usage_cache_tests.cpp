@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <utility>
 #include <stdexcept>
@@ -114,6 +115,65 @@ private:
     addon::Invoke_request m_request;
     fs::path              m_transcript;
     mutable unsigned      m_appended = 0;
+};
+
+// The host cancels the scan when it reports its first progress.
+class Cancel_on_progress_context final : public addon::Invocation_context
+{
+public:
+    const addon::Invoke_request& request() const override { return m_request; }
+    bool cancel_requested() const override { return m_progress_reports > 0; }
+    bool wait_for_cancel(int) override { return cancel_requested(); }
+    void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override
+    {
+        ++m_progress_reports;
+    }
+    void succeed(addon::Json_value) override {}
+    void fail(addon::Result_status, std::string, std::string) override {}
+    bool finished() const override { return false; }
+
+    unsigned progress_reports() const { return m_progress_reports; }
+
+private:
+    addon::Invoke_request m_request;
+    unsigned              m_progress_reports = 0;
+};
+
+// The host cancels the scan once the scan has written its whole new cache to
+// a temporary file, before that file replaces the cache.
+class Cancel_on_written_cache_context final : public addon::Invocation_context
+{
+public:
+    Cancel_on_written_cache_context(fs::path directory, std::uintmax_t cache_size)
+    :
+        m_directory(std::move(directory)),
+        m_cache_size(cache_size)
+    {}
+
+    const addon::Invoke_request& request() const override { return m_request; }
+    bool cancel_requested() const override
+    {
+        for (const auto& entry : fs::directory_iterator(m_directory)) {
+            const auto name = entry.path().filename().string();
+            std::error_code error;
+            if (name.starts_with("claude-cache-") && name.ends_with(".tmp") &&
+                fs::file_size(entry.path(), error) == m_cache_size && !error)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    bool wait_for_cancel(int) override { return cancel_requested(); }
+    void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
+    void succeed(addon::Json_value) override {}
+    void fail(addon::Result_status, std::string, std::string) override {}
+    bool finished() const override { return false; }
+
+private:
+    addon::Invoke_request m_request;
+    fs::path              m_directory;
+    std::uintmax_t        m_cache_size;
 };
 
 class Workspace
@@ -663,6 +723,69 @@ void live_transcript_contract(const fs::path& fixture)
         "the next scan reads the settled transcript completely");
 }
 
+void cancelled_scan_contract(const fs::path& fixture)
+{
+    // A cancelled scan stops at its next transcript and keeps the cache it
+    // started from, so the next scan still has the exact totals.
+    const auto profile = fixture / "cancelled-profile";
+    for (unsigned index = 0; index < 3; ++index) {
+        const auto session = "cancelled-" + std::to_string(index);
+        const auto path    = profile / "projects/cancelled" / (session + ".jsonl");
+        write(path, assistant_record(session, session + "-1", 5));
+    }
+    claude::Usage_cache_input cache;
+    cache.storage_file = fixture / "cancelled-cache.jsonl";
+    cache.incremental  = true;
+    const auto cache_bytes = [&] {
+        std::ifstream input(*cache.storage_file, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
+    const auto total = [](const std::vector<claude::Usage_session>& sessions) {
+        std::uint64_t sum = 0;
+        for (const auto& session : sessions) {
+            sum += session.record.total_tokens;
+        }
+        return sum;
+    };
+    const auto failure_of = [&](addon::Invocation_context& context) {
+        try {
+            claude::scan_usage(profile, context, cache);
+        }
+        catch (const std::runtime_error& error) {
+            return std::string(error.what());
+        }
+        return std::string{};
+    };
+    Scan_context quiet;
+    check(total(claude::scan_usage(profile, quiet, cache)) == 15, "the first scan counts every transcript");
+    const auto retained = cache_bytes();
+
+    Cancel_on_progress_context cancelling;
+    check(failure_of(cancelling) == "cancelled", "a cancelled scan reports cancellation");
+    check(cancelling.progress_reports() == 1, "a cancelled scan stops before its next transcript");
+    check(cache_bytes() == retained, "a cancelled scan leaves the retained cache unchanged");
+    check(total(claude::scan_usage(profile, quiet, cache)) == 15,
+        "the scan after a cancelled one keeps the exact totals");
+
+    // Replacing the cache commits the scan: cancellation that arrives once the
+    // new cache is written, but before it replaces the retained one, keeps the
+    // retained cache. A changed transcript makes the new cache differ from it.
+    const auto changed = assistant_record("cancelled-0", "cancelled-0-1", 5) +
+        assistant_record("cancelled-0", "cancelled-0-2", 5);
+    write(profile / "projects/cancelled/cancelled-0.jsonl", changed);
+    auto reference = cache;
+    reference.storage_file = fixture / "reference/cancelled-cache.jsonl";
+    fs::create_directories(reference.storage_file->parent_path());
+    fs::copy_file(*cache.storage_file, *reference.storage_file);
+    check(total(claude::scan_usage(profile, quiet, reference)) == 20, "the changed transcript adds its message");
+    check(fs::file_size(*reference.storage_file) != retained.size(), "the new cache differs from the retained one");
+
+    Cancel_on_written_cache_context committing(fixture, fs::file_size(*reference.storage_file));
+    check(failure_of(committing) == "cancelled",
+        "a scan cancelled before it replaces the cache reports cancellation");
+    check(cache_bytes() == retained, "a scan cancelled before it replaces the cache keeps the retained cache");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -688,5 +811,6 @@ int main(int argc, char** argv)
     run("many messages", many_messages_contract);
     run("bounded cache lines", bounded_cache_lines_contract);
     run("live transcript", live_transcript_contract);
+    run("cancelled scan", cancelled_scan_contract);
     return failures == 0 ? 0 : 1;
 }

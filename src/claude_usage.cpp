@@ -315,15 +315,17 @@ struct merged_message_t
 };
 
 std::vector<Message> reconcile_messages(
-    const std::vector<Message>& retained, std::vector<Message> observed)
+    const std::vector<Message>& retained, std::vector<Message> observed, addon::Invocation_context& context)
 {
     std::set<std::string> observed_ids;
     for (const auto& message : observed) {
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
         observed_ids.insert(message.id);
     }
     // A completed observation can correct its own message. Missing or unfinished
     // messages provide no evidence that previously completed usage disappeared.
     for (const auto& message : retained) {
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
         if (!observed_ids.contains(message.id)) {
             observed.push_back(message);
         }
@@ -468,6 +470,7 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
         auto& destination = cache[source];
         if (!continued) destination.fingerprint = fingerprint;
         for (const auto& record : records->as_array()) {
+            if (context.cancel_requested()) throw std::runtime_error("cancelled");
             destination.messages.push_back(cached_message(record, native));
         }
     }
@@ -538,6 +541,7 @@ void write_cache(const fs::path& path, const File_cache& cache, addon::Invocatio
                 Json entries = Json::array();
                 std::size_t bytes = 0;
                 for (; next != file.messages.end() && bytes < k_cache_line_bytes; ++next) {
+                    if (context.cancel_requested()) throw std::runtime_error("cancelled");
                     auto entry = cache_record(*next);
                     bytes += addon::serialize_json(entry).size();
                     entries.push_back(std::move(entry));
@@ -550,7 +554,11 @@ void write_cache(const fs::path& path, const File_cache& cache, addon::Invocatio
         }
         stream.close();
         if (!stream) throw std::runtime_error("usage_cache_write_failed");
+        // Replacing the cache commits the scan, so cancellation is checked once
+        // more immediately before it: a cancelled scan keeps the cache it
+        // started from.
 #ifdef _WIN32
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
         if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             throw std::runtime_error("usage_cache_write_failed");
         }
@@ -558,6 +566,7 @@ void write_cache(const fs::path& path, const File_cache& cache, addon::Invocatio
         // The host removes the native seed after success: both its adopted
         // contents and the replacement directory entry must survive power loss.
         sync_cache_path(temporary, 0);
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
         fs::rename(temporary, path);
         sync_cache_path(path.parent_path(), O_DIRECTORY);
 #endif
@@ -656,6 +665,7 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     };
     std::uint64_t processed = 0;
     for (const auto& file : files) {
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
         auto& cached = cache[cache_path(file)];
         // Incremental scans keep the evidence of a transcript whose size and
         // modification time still match the ones recorded when it was parsed.
@@ -664,7 +674,7 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
         if (!cache_input.incremental || cached.fingerprint != fingerprint(file)) {
             file_fingerprint_t observed;
             if (auto parsed = parse_file(file, context, observed)) {
-                cached.messages    = reconcile_messages(cached.messages, std::move(*parsed));
+                cached.messages    = reconcile_messages(cached.messages, std::move(*parsed), context);
                 cached.fingerprint = observed;
             }
         }
@@ -677,6 +687,7 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     for (const auto& [path, file] : cache) {
         (void)path;
         for (const auto& record : file.messages) {
+            if (context.cancel_requested()) throw std::runtime_error("cancelled");
             const auto [previous, inserted] = merged.try_emplace(
                 record.id, merged_message_t{&record, record.categories, false, false});
             if (inserted) {
@@ -705,6 +716,7 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     std::map<std::string, Usage_session> sessions;
     const std::optional<std::string> unattributed;
     for (const auto* entry : order) {
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
         const auto& message = *entry->first;
         auto& session = sessions[message.session];
         session.record.record_id = message.session;
@@ -727,6 +739,7 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     }
     std::vector<Usage_session> result;
     for (auto& [id, session] : sessions) {
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
         (void)id;
         populate_amounts(session);
         result.push_back(std::move(session));
