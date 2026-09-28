@@ -8,13 +8,17 @@
 #include "claude_usage.h"
 #include <logonomic_cli_addon/sha256.h>
 
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/probe_contracts.h>
 #include <logonomic_cli_addon/session_contracts.h>
+#include <logonomic_cli_addon/sidecar.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -514,6 +518,65 @@ void lifecycle_contract()
     request.event.body.set("prompt_id", Json("turn"));
     require(claude::classify_event(request).observations[0].outcome_transition == addon::Outcome_transition::FAILED,
         "native turn correlation authorizes failure");
+}
+
+// Oracle: the host's feature gate. It rejects an observation carrying a fact
+// the package's own declaration leaves unsupported, phase and all.
+void declared_profile_admits_every_shape(const fs::path& package)
+{
+    const addon::Directory_package_source source(package);
+    const auto bytes = source.read(
+        addon::sidecar_relative_path(addon::k_lifecycle_events_capability_id, addon::k_lifecycle_events_version),
+        addon::limits::k_max_sidecar_bytes,
+        nullptr);
+    const auto sidecar = bytes ? addon::parse_sidecar(*bytes, nullptr) : std::nullopt;
+    const auto declaration = sidecar ? addon::decode_lifecycle_declaration(sidecar->payload, nullptr) : std::nullopt;
+    require(declaration.has_value(), "package lifecycle declaration is readable");
+    addon::Attention_classification_request request;
+    request.base.ledger.current_epoch = 1;
+    const auto classify = [
+            &request,
+            &declaration
+        ](
+            const std::string& name,
+            const std::string& members,
+            const char*        shape)
+        {
+            request.base.event.name = name;
+            request.base.event.body = claude::object(
+                R"({"hook_event_name":")" + name + R"(","session_id":"a375d05e-f6cf-4812-80f5-91b33d24c053")" +
+                members + "}");
+            const auto result = claude::classify_attention(request);
+            require(!result.base.observations.empty(), shape);
+            for (const auto& observation : result.base.observations) {
+                require(addon::lifecycle_profile_admits(declaration->features, observation), shape);
+            }
+            return result;
+        };
+    classify("SessionStart", R"(,"source":"startup")", "the declaration refuses a session start");
+    classify("SessionStart", R"(,"source":"resume")", "the declaration refuses a session resume");
+    classify("UserPromptSubmit", R"(,"prompt_id":"turn-a")", "the declaration refuses a turn start");
+    classify("PermissionRequest", R"(,"prompt_id":"turn-a")", "the declaration refuses an approval request");
+    classify("Stop", R"(,"prompt_id":"turn-a")", "the declaration refuses a turn completion");
+    const auto hint = classify("Stop", R"(,"prompt_id":"turn-a","last_assistant_message":"Which directory?")",
+        "the declaration refuses a completion that ends in a question");
+    request.pending_conversational_request_id = hint.base.observations.front().attention_request_id;
+    classify("UserPromptSubmit", R"(,"prompt_id":"turn-b")",
+        "the declaration refuses the reply that resolves a conversational hint");
+    request.pending_conversational_request_id.reset();
+    classify("StopFailure", R"(,"prompt_id":"turn-b","error":"provider failure")",
+        "the declaration refuses a failed turn");
+    for (const std::string tool : {"AskUserQuestion", "ExitPlanMode"}) {
+        for (const std::string name : {"PreToolUse", "PostToolUse", "PostToolUseFailure"}) {
+            classify(name, R"(,"tool_use_id":"native-tool-request","tool_name":")" + tool + "\"",
+                "the declaration refuses a structured question, plan approval or its answer");
+        }
+    }
+    for (const std::string name : {"SubagentStart", "SubagentStop"}) {
+        classify(name, R"(,"agent_id":"child-a","agent_type":"worker")",
+            "the declaration refuses a subagent transition");
+    }
+    classify("SessionEnd", R"(,"reason":"exit")", "the declaration refuses a session end");
 }
 
 void structured_contract()
@@ -1356,8 +1419,12 @@ void account_name_contract()
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    if (argc != 2) {
+        std::cerr << "usage: claude_contract_tests <package directory>\n";
+        return 2;
+    }
     try {
         launcher_contract();
         launcher_discovery_contract();
@@ -1365,6 +1432,7 @@ int main()
         launcher_discovery_scan_limit();
         launcher_directory_contract();
         lifecycle_contract();
+        declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
         structured_contract();
         delegated_readiness_contract();
         probe_contract();
