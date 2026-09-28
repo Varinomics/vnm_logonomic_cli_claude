@@ -83,14 +83,17 @@ std::string account_key(const fs::path& profile)
     return "profile-" + addon::to_hex(addon::Sha256::digest(path_string(normalized)));
 }
 
+fs::path profile_for_account(const addon::Account_context& account)
+{
+    if (!account.profile_path) throw std::runtime_error("account_unavailable");
+    const auto profile = normalize(addon::path_from_utf8(*account.profile_path));
+    if (account_key(profile) != account.adapter_account_key) throw std::runtime_error("account_profile_mismatch");
+    return profile;
+}
+
 fs::path profile_for_context(const addon::Session_launch_context& context)
 {
-    if (context.account_context) {
-        if (!context.account_context->profile_path) throw std::runtime_error("account_unavailable");
-        const auto profile = normalize(addon::path_from_utf8(*context.account_context->profile_path));
-        if (account_key(profile) != context.account_context->adapter_account_key) throw std::runtime_error("account_profile_mismatch");
-        return profile;
-    }
+    if (context.account_context) return profile_for_account(*context.account_context);
     if (!context.launch_environment) throw std::runtime_error("launch_environment_unavailable");
     return selected_profile(*context.launch_environment, {}, context.working_directory);
 }

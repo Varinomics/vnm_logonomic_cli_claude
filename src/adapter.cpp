@@ -5,6 +5,7 @@
 #include "claude_probes.h"
 #include "claude_sessions.h"
 #include "claude_usage.h"
+#include "claude_usage_summary.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/profile_storage.h>
@@ -93,6 +94,10 @@ void invoke(addon::Invocation_context& context, const fs::path& package_root)
         else
         if (capability == "usage-scan") claude::handle_usage(context);
         else
+        if (capability == "usage-lifetime-summary") claude::handle_usage_summary(context);
+        else
+        if (capability == "usage-saved-daily-tokens") claude::handle_usage_daily(context);
+        else
         if (capability == "auth-status" || capability == "quota") claude::handle_probes(context, package_root);
         else
         if (capability == "structured-session" || capability == "delegated-session") claude::handle_sessions(context, package_root);
@@ -121,6 +126,8 @@ int main()
         {"accounts", 2}, {"launch-preparation", 3}, {"interactive-resume", 2},
         {"structured-session", 3}, {"delegated-session", 3}, {"auth-status", 2}, {"quota", 2},
         {"usage-scan", 2}, {"usage-scan", 3}, {"legacy-state-import", 1}, {"lifecycle-events", 1}, {"helper-ingress", 2},
+        {"usage-lifetime-summary", 1},
+        {"usage-saved-daily-tokens", 1},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"coordination-delivery", 1},
     };

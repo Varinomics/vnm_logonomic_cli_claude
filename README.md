@@ -50,6 +50,15 @@ represented by their retained per-message evidence. Historical coverage
 remains explicitly incomplete because transcripts do not prove a complete
 lifetime history.
 
+Saved lifetime and daily totals come from Claude Code's own `stats-cache.json`
+in the selected profile, read through `usage-lifetime-summary@1` and
+`usage-saved-daily-tokens@1`: the per-model token classes and the dated
+per-model totals Claude Code saved, with the digest of the exact file and the
+version and date it states. A profile without the file, or a file without a
+dated series, reports that capability as unavailable; a malformed part fails
+only the capabilities that read it. These totals are reported apart from the
+transcript scan and are never added to it.
+
 Delegated review and implementation use session contract version 3 and keep
 native stdin open through initialization and live status/catalog checks of
 each required host stdio server's initial connection. Pending discovery is

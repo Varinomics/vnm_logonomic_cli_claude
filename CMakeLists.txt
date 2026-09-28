@@ -58,7 +58,8 @@ endfunction()
 
 add_library(claude_provider STATIC
     src/claude_accounts.cpp src/claude_launcher.cpp src/claude_lifecycle.cpp
-    src/claude_preparation.cpp src/claude_probes.cpp src/claude_sessions.cpp src/claude_usage.cpp)
+    src/claude_preparation.cpp src/claude_probes.cpp src/claude_sessions.cpp src/claude_usage.cpp
+    src/claude_usage_summary.cpp)
 claude_target(claude_provider)
 target_include_directories(claude_provider PUBLIC src)
 target_link_libraries(claude_provider PUBLIC logonomic_cli_addon_sdk::sdk)
@@ -176,6 +177,13 @@ if(BUILD_TESTING)
     add_dependencies(claude_usage_host_tests claude_package)
     add_test(NAME claude_usage_host_tests COMMAND claude_usage_host_tests "${CLAUDE_PACKAGE_DIRECTORY}")
     set_tests_properties(claude_usage_host_tests PROPERTIES TIMEOUT 180 LABELS "usage;cache;packaged-adapter")
+    add_executable(claude_usage_summary_tests tests/claude_usage_summary_tests.cpp)
+    target_link_libraries(claude_usage_summary_tests PRIVATE claude_provider)
+    claude_target(claude_usage_summary_tests)
+    add_dependencies(claude_usage_summary_tests claude_package)
+    add_test(NAME claude_usage_summary_tests
+        COMMAND claude_usage_summary_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    set_tests_properties(claude_usage_summary_tests PROPERTIES TIMEOUT 120 LABELS "usage;packaged-adapter")
 endif()
 
 option(LOGONOMIC_CLI_ADDON_RECIPE_TESTS
