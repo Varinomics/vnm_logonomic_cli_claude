@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -71,6 +73,45 @@ public:
 
 private:
     addon::Invoke_request m_request;
+};
+
+class Failing_progress_context final : public addon::Invocation_context
+{
+public:
+    Failing_progress_context(const addon::Usage_scan_request& input, std::exception_ptr failure)
+    :
+        m_failure(std::move(failure))
+    {
+        m_request.capability = {"usage-scan", 3};
+        m_request.operation = "scan";
+        m_request.payload = addon::encode_usage_scan_request(input, 3);
+    }
+
+    const addon::Invoke_request& request() const override { return m_request; }
+    bool cancel_requested() const override { return false; }
+    bool wait_for_cancel(int) override { return false; }
+    void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override
+    {
+        std::rethrow_exception(m_failure);
+    }
+    void succeed(addon::Json_value) override { throw std::runtime_error("failure fixture succeeded"); }
+    void fail(addon::Result_status status, std::string reason, std::string diagnostic) override
+    {
+        m_status = status;
+        m_reason = std::move(reason);
+        m_diagnostic = std::move(diagnostic);
+        m_finished = true;
+    }
+    bool finished() const override { return m_finished; }
+
+    addon::Result_status m_status = addon::Result_status::SUCCESS;
+    std::string m_reason;
+    std::string m_diagnostic;
+
+private:
+    addon::Invoke_request m_request;
+    std::exception_ptr m_failure;
+    bool m_finished = false;
 };
 
 std::string assistant_record(std::string_view session, std::string_view id, unsigned tokens)
@@ -405,7 +446,8 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
     // bypass the native provider's existing explicit-account admission.
     const auto version_one = outcome_for(request, 3);
     check(version_one.status != addon::Host_status::SUCCESS &&
-        version_one.reason_code == "claude_operation_failed",
+        version_one.reason_code == "account_unavailable" &&
+        version_one.message.find("selected account has no available profile") != std::string::npos,
         "version-one account without a profile locator retains its explicit refusal");
     request.context = first_request.context;
     validate(*first.cache_candidate);
@@ -467,7 +509,10 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
     select("occupied", first.cache_candidate);
     write(addon::usage_cache_io_path(addon::path_from_utf8(request.cache_selection->candidate_root) / "foreign"),
         "occupied");
-    check(outcome_for(request, 3).status != addon::Host_status::SUCCESS,
+    const auto occupied = outcome_for(request, 3);
+    check(occupied.status != addon::Host_status::SUCCESS &&
+        occupied.reason_code == "usage_cache_unavailable" &&
+        occupied.message.find("checking usage cache storage") != std::string::npos,
         "provider refuses a nonempty host allocation");
     validate(*first.cache_candidate);
 
@@ -575,8 +620,56 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
 
     select("incremental-repair", next.cache_candidate);
     request.mode = "repair";
-    check(outcome_for(request, 3).status != addon::Host_status::SUCCESS,
+    const auto invalid_json = outcome_for(request, 3);
+    check(invalid_json.status != addon::Host_status::SUCCESS &&
+        invalid_json.reason_code == "usage_json_invalid" &&
+        invalid_json.message.find("not valid JSON") != std::string::npos,
         "repair rereads every transcript instead of trusting its recorded fingerprint");
+
+    write(steady, message("steady", "steady-1", 600));
+    const std::string private_text = "credential-and-transcript-content-must-stay-private";
+    const auto invalid_counter = profile / "projects" / private_text / "message.jsonl";
+    auto invalid_record = message("private-session", "private-message", 10);
+    const auto token_value = invalid_record.find("\"input_tokens\":10") + std::string_view("\"input_tokens\":").size();
+    invalid_record.replace(token_value, 2, '"' + private_text + '"');
+    write(invalid_counter, invalid_record);
+    select("invalid-counter", next.cache_candidate);
+    request.mode = "repair";
+    const auto counter_failure = outcome_for(request, 3);
+    check(counter_failure.status != addon::Host_status::SUCCESS &&
+        counter_failure.reason_code == "usage_counter_invalid" &&
+        counter_failure.message.find("invalid token count") != std::string::npos,
+        "actual adapter explains the failing usage check");
+    check(counter_failure.message.find(private_text) == std::string::npos &&
+        counter_failure.message.find(native_profile) == std::string::npos &&
+        host.stderr_text().find(private_text) == std::string::npos,
+        "actual adapter does not expose transcript content or native profile paths");
+    validate(*next.cache_candidate);
+    check(fs::remove(invalid_counter), "remove invalid counter fixture");
+
+    const auto diagnostic_for = [&](std::string name, std::exception_ptr exception) {
+        select(std::move(name), next.cache_candidate);
+        Failing_progress_context context(request, std::move(exception));
+        claude::handle_usage(context);
+        check(context.finished() && context.m_status == addon::Result_status::FAILED,
+            "usage boundary reports the injected failure");
+        check(context.m_diagnostic.find(private_text) == std::string::npos &&
+            context.m_diagnostic.find(native_profile) == std::string::npos,
+            "exception messages and filesystem paths stay private");
+        validate(*next.cache_candidate);
+        return std::pair{context.m_reason, context.m_diagnostic};
+    };
+    const auto unexpected = diagnostic_for("unexpected-exception",
+        std::make_exception_ptr(std::runtime_error(private_text)));
+    check(unexpected.first == "claude_usage_failed" &&
+        unexpected.second.find("unexpected provider error") != std::string::npos,
+        "unknown exception text is replaced with a static explanation");
+    const auto filesystem = diagnostic_for("filesystem-exception", std::make_exception_ptr(
+        fs::filesystem_error(private_text, invalid_counter, std::make_error_code(std::errc::permission_denied))));
+    check(filesystem.first == "claude_usage_filesystem_failed" &&
+        filesystem.second.find("system error " +
+            std::to_string(std::make_error_code(std::errc::permission_denied).value())) != std::string::npos,
+        "filesystem failure retains its numeric cause without private exception text");
     check(host.shutdown(1000, nullptr), "packaged adapter exits without contacting a model");
 }
 

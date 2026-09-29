@@ -50,6 +50,10 @@ represented by their retained per-message evidence. Historical coverage
 remains explicitly incomplete because transcripts do not prove a complete
 lifetime history.
 
+Usage failures report the operation that failed and a safe explanation. Native
+profile paths, transcript contents and credentials are excluded from these
+diagnostics. Failed scans do not replace the host's accepted usage cache.
+
 Saved lifetime and daily totals come from Claude Code's own `stats-cache.json`
 in the selected profile, read through `usage-lifetime-summary@1` and
 `usage-saved-daily-tokens@1`: the per-model token classes and the dated

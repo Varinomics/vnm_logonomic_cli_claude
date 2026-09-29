@@ -21,10 +21,12 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <new>
 #include <regex>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -748,7 +750,9 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     return result;
 }
 
-void handle_usage(addon::Invocation_context& context)
+namespace {
+
+void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
 {
     if (context.request().operation != "scan") {
         context.reject_unknown_operation();
@@ -761,9 +765,11 @@ void handle_usage(addon::Invocation_context& context)
         context.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
     }
+    stage = "selecting the Claude profile";
     const auto profile = profile_for_context(input->context);
     auto profile_key = account_key(profile);
     if (version == 3) {
+        stage = "checking usage cache storage";
         auto identity = *input;
         identity.snapshot_id.reset();
         identity.cursor.reset();
@@ -813,6 +819,7 @@ void handle_usage(addon::Invocation_context& context)
             }
             cache.storage_file = addon::usage_cache_io_path(addon::path_from_utf8(selection.candidate_root)) / "messages.jsonl";
             if (selection.accepted) {
+                stage = "verifying the saved usage cache";
                 const auto manifest = addon::validate_usage_cache_candidate(
                     *selection.accepted, root, input->context.account_context,
                     [&context] { return context.cancel_requested(); }, &failure);
@@ -836,6 +843,7 @@ void handle_usage(addon::Invocation_context& context)
             cache.seed_sha256_hex = input->native_file_cache->sha256_hex;
             cache.cache_required = input->native_file_cache->cache_required;
         }
+        stage = "reading usage history and saving its candidate cache";
         snapshot.sessions = scan_usage(profile, context, cache);
         snapshot.scope.observed_at_ms = now_ms();
         snapshot.scope.fresh_for_ms = 60000;
@@ -843,6 +851,7 @@ void handle_usage(addon::Invocation_context& context)
         snapshot.touched_ms = now_ms();
         snapshot_id = addon::random_nonce_hex();
         if (version == 3) {
+            stage = "sealing the candidate usage cache";
             // Surviving transcripts do not prove that all contributing messages remain.
             for (auto& session : snapshot.sessions) session.record.aggregate_evidence = "partial";
             snapshot.cache_candidate = addon::seal_usage_cache_candidate(
@@ -864,6 +873,7 @@ void handle_usage(addon::Invocation_context& context)
             throw std::runtime_error("usage_cursor_invalid");
         }
     }
+    stage = "returning the usage snapshot";
     addon::Usage_scan_page page;
     page.incomplete_historical_coverage = true;
     {
@@ -888,6 +898,75 @@ void handle_usage(addon::Invocation_context& context)
         else s_snapshots.erase(found);
     }
     context.succeed(addon::encode_usage_scan_result(page, version));
+}
+
+void fail_usage(addon::Invocation_context& context, const char* stage,
+    const char* reason, const std::string& explanation)
+{
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
+    context.fail(addon::Result_status::FAILED, reason,
+        "Claude could not finish " + std::string(stage) + ". " + explanation);
+}
+
+} // namespace
+
+void handle_usage(addon::Invocation_context& context)
+{
+    const char* stage = "preparing the usage scan";
+    try {
+        handle_usage_scan(context, stage);
+    }
+    catch (const fs::filesystem_error& error) {
+        fail_usage(context, stage, "claude_usage_filesystem_failed",
+            "A filesystem operation failed (system error " + std::to_string(error.code().value()) + ").");
+    }
+    catch (const std::bad_alloc&) {
+        fail_usage(context, stage, "claude_usage_memory_unavailable",
+            "The provider could not allocate the memory needed to complete the scan.");
+    }
+    catch (const std::exception& error) {
+        // Only exact provider-owned reasons may leave this boundary. Other
+        // exceptions can contain transcript text, credentials or native paths.
+        constexpr std::pair<const char*, const char*> reasons[] = {
+            {"account_unavailable", "The selected account has no available profile."},
+            {"account_profile_mismatch", "The selected profile does not match its account."},
+            {"launch_environment_unavailable", "The launcher environment is unavailable."},
+            {"profile_normalization_failed", "The selected profile could not be resolved."},
+            {"usage_projects_unavailable", "The profile's transcript directory is unavailable."},
+            {"usage_json_invalid", "A usage record is not valid JSON."},
+            {"usage_record_capacity", "A usage record exceeds the supported record size."},
+            {"usage_timestamp_invalid", "A usage record has an invalid timestamp."},
+            {"usage_counter_invalid", "A usage record has an invalid token count."},
+            {"usage_overflow", "The token counts exceed the range that can be represented exactly."},
+            {"usage_file_unreadable", "A transcript could not be read."},
+            {"usage_cache_path_invalid", "A saved usage cache path is invalid."},
+            {"usage_cache_invalid", "The saved usage cache contains invalid records."},
+            {"usage_cache_unavailable", "The usage cache is unavailable or could not be verified."},
+            {"usage_cache_incomplete", "The saved usage cache is incomplete."},
+            {"usage_cache_format_unsupported", "The saved usage cache format is unsupported."},
+            {"usage_cache_write_failed", "The candidate usage cache could not be written."},
+            {"usage_cache_namespace_conflict", "The candidate cache conflicts with another cache location."},
+            {"usage_seed_digest_mismatch", "The imported history could not be verified."},
+            {"usage_seed_receipt_mismatch", "The imported history does not match the saved cache receipt."},
+            {"usage_seed_account_mismatch", "The imported history belongs to a different account."},
+            {"usage_required_cache_unavailable", "The saved message history required for this scan is unavailable."},
+            {"conflicting_message_usage", "Copies of the same message disagree about its token count."},
+            {"profile_storage_unavailable", "The provider's usage cache storage is unavailable."},
+            {"usage_snapshot_capacity", "The provider is retaining too many unfinished usage snapshots."},
+            {"usage_snapshot_unavailable", "The requested usage snapshot is no longer available."},
+            {"usage_cursor_invalid", "The requested usage page is invalid."},
+        };
+        for (const auto& [reason, explanation] : reasons) {
+            if (std::string_view(error.what()) == reason) {
+                fail_usage(context, stage, reason, explanation);
+                return;
+            }
+        }
+        fail_usage(context, stage, "claude_usage_failed", "An unexpected provider error occurred.");
+    }
 }
 
 } // namespace claude

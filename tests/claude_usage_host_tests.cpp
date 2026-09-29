@@ -540,7 +540,9 @@ void retained_history_survives_rollback_and_reimport(
         check(changed_digest != cache_seed_digest(*extended.cache_candidate),
             "the changed seed differs from the one the accepted cache names");
         const auto refused = host.scan_outcome();
-        check(refused.status == addon::Host_status::FAILED && refused.reason_code == "claude_operation_failed",
+        check(refused.status == addon::Host_status::FAILED &&
+            refused.reason_code == "usage_seed_receipt_mismatch" &&
+            refused.message.find("does not match the saved cache receipt") != std::string::npos,
             "a seed that contradicts the accepted cache fails the import: " + refused.reason_code);
         check(!host.candidate_sealed(), "a refused import seals no candidate");
         check(host.sealed(*extended.cache_candidate), "a refused import leaves the accepted cache intact");
