@@ -1595,6 +1595,12 @@ void probe_contract()
     require(quota.state == addon::Quota_status::READY && quota.primary->used_percent == 35 &&
         quota.secondary->used_percent == 21.5, "both native quota windows parsed");
     require(quota.secondary->reset_text == "September 17", "text reset retained without guessing epoch");
+    // Native y() omits the reset suffix for a null API resets_at value.
+    input.stdout_bytes = R"json({"type":"result","subtype":"success","local_command":"usage","result":"Current session: 0% used\nCurrent week (all models): 100% used · resets Oct 4, 10pm (Europe/Berlin)"})json";
+    const auto unknown_reset = claude::inspect_quota(input);
+    require(unknown_reset.state == addon::Quota_status::READY && unknown_reset.primary->used_percent == 0 &&
+        !unknown_reset.primary->reset_text && unknown_reset.secondary->reset_text == "Oct 4, 10pm (Europe/Berlin)",
+        "an unknown primary reset never borrows the weekly reset");
     input.stdout_bytes = R"({"type":"result","subtype":"success","is_error":false,"result":"Current session: 135.5% used, resets 3pm\nCurrent week: 121% used, resets September 17."})";
     const auto overage = claude::inspect_quota(input);
     require(overage.state == addon::Quota_status::READY && overage.primary->used_percent == 135.5 &&

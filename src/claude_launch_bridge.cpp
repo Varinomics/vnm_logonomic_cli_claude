@@ -1,3 +1,9 @@
+#include "claude_quota_direct.h"
+#include "claude_quota_http.h"
+#include "claude_support.h"
+
+#include <logonomic_cli_addon/host_simulator.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -5,6 +11,7 @@
 #endif
 
 #include <cstddef>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -37,6 +44,21 @@ std::wstring quote_argument(const std::wstring& argument)
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc >= 3 && std::wstring_view(argv[1]) == L"--quota") {
+        const auto deadline = claude::Quota_clock::now() + std::chrono::seconds(30);
+        std::vector<std::string> arguments;
+        for (int index = 3; index < argc; ++index) arguments.push_back(claude::path_string(argv[index]));
+        const auto result = claude::direct_quota_output(argv[2], arguments,
+            logonomic::cli_addon::current_process_environment(), std::filesystem::current_path(),
+            deadline, claude::get_subscription_quota);
+        if (result) {
+            std::fwrite(result->data(), 1, result->size(), stdout);
+            return 0;
+        }
+        if (claude::Quota_clock::now() >= deadline) return 3;
+        --argc;
+        ++argv;
+    }
     if (argc < 2) {
         return 2;
     }
@@ -117,6 +139,20 @@ int wmain(int argc, wchar_t** argv)
 #else
 int main(int argc, char** argv)
 {
+    if (argc >= 3 && std::string_view(argv[1]) == "--quota") {
+        const auto deadline = claude::Quota_clock::now() + std::chrono::seconds(30);
+        const std::vector<std::string> arguments(argv + 3, argv + argc);
+        const auto result = claude::direct_quota_output(argv[2], arguments,
+            logonomic::cli_addon::current_process_environment(), std::filesystem::current_path(),
+            deadline, claude::get_subscription_quota);
+        if (result) {
+            std::fwrite(result->data(), 1, result->size(), stdout);
+            return 0;
+        }
+        if (claude::Quota_clock::now() >= deadline) return 3;
+        --argc;
+        ++argv;
+    }
     if (argc < 2) {
         return 2;
     }

@@ -70,6 +70,16 @@ add_executable(claude_helper src/claude_helper.cpp)
 claude_target(claude_helper)
 add_executable(claude_launch_bridge src/claude_launch_bridge.cpp)
 claude_target(claude_launch_bridge)
+add_library(claude_quota_direct STATIC src/claude_quota_direct.cpp src/claude_quota_http.cpp)
+claude_target(claude_quota_direct)
+target_include_directories(claude_quota_direct PUBLIC src)
+target_link_libraries(claude_launch_bridge PRIVATE claude_quota_direct)
+if(WIN32)
+    target_link_libraries(claude_quota_direct PRIVATE winhttp advapi32)
+else()
+    find_package(CURL REQUIRED)
+    target_link_libraries(claude_quota_direct PRIVATE CURL::libcurl)
+endif()
 if(MINGW)
     # The bridge's Windows entry point is wmain, which MinGW links only with
     # -municode.
@@ -80,6 +90,26 @@ logonomic_cli_addon_package_platform(CLAUDE_PLATFORM)
 set(CLAUDE_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 logonomic_cli_addon_package_directory(logonomic.cli.claude CLAUDE_PACKAGE_DIRECTORY)
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
+set(claude_index_command "$<TARGET_FILE:logonomic_cli_addon_index>" "${CLAUDE_PACKAGE_DIRECTORY}"
+    --third-party assets/claude.svg notices/lobe_icons_mit.txt provenance/lobe_icons.json)
+set(claude_runtime_inputs "")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # The bridge also owns native fallback. Its HTTP runtime must travel with
+    # the package, so absence of a system libcurl cannot break ordinary launch.
+    foreach(target claude_adapter claude_helper claude_launch_bridge)
+        set_target_properties(${target} PROPERTIES
+            BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
+        target_link_options(${target} PRIVATE "LINKER:--disable-new-dtags")
+    endforeach()
+    set(CLAUDE_RUNTIME_NOTICES_DIRECTORY "" CACHE PATH
+        "Copyright/license files for external runtimes, named <library filename>.txt")
+    configure_file(cmake/claude_package_runtime.cmake.in generated/package-runtime.cmake @ONLY)
+    set(claude_index_command "${CMAKE_COMMAND}"
+        "-DPACKAGE=${CLAUDE_PACKAGE_DIRECTORY}" "-DINDEX=$<TARGET_FILE:logonomic_cli_addon_index>"
+        -P "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime.cmake")
+    list(APPEND claude_runtime_inputs "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime.cmake"
+        "$<TARGET_FILE:CURL::libcurl>")
+endif()
 file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/*"
     "${CMAKE_CURRENT_SOURCE_DIR}/package/capabilities/*"
@@ -111,11 +141,10 @@ add_custom_command(
         "${CLAUDE_PACKAGE_DIRECTORY}/helpers/claude_helper${CLAUDE_EXECUTABLE_SUFFIX}"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:claude_launch_bridge>"
         "${CLAUDE_PACKAGE_DIRECTORY}/helpers/claude_launch_bridge${CLAUDE_EXECUTABLE_SUFFIX}"
-    COMMAND "$<TARGET_FILE:logonomic_cli_addon_index>" "${CLAUDE_PACKAGE_DIRECTORY}"
-        --third-party "assets/claude.svg" "notices/lobe_icons_mit.txt"
-            "provenance/lobe_icons.json"
+    COMMAND ${claude_index_command}
     DEPENDS claude_adapter claude_helper claude_launch_bridge logonomic_cli_addon_index
-        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt" ${package_files}
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
+        ${package_files} ${claude_runtime_inputs}
     VERBATIM)
 add_custom_target(claude_package ALL DEPENDS "${CLAUDE_PACKAGE_DIRECTORY}/package.files.json")
 logonomic_cli_addon_install_package("${CLAUDE_PACKAGE_DIRECTORY}" logonomic.cli.claude TARGET claude_package)
@@ -128,6 +157,11 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(claude_quota_direct_tests tests/claude_quota_direct_tests.cpp)
+    claude_target(claude_quota_direct_tests)
+    target_link_libraries(claude_quota_direct_tests PRIVATE claude_quota_direct claude_provider)
+    add_test(NAME claude_quota_direct_tests COMMAND claude_quota_direct_tests)
+    set_tests_properties(claude_quota_direct_tests PROPERTIES TIMEOUT 30 LABELS "quota")
     add_executable(claude_session_declaration_tests tests/claude_session_declaration_tests.cpp)
     claude_target(claude_session_declaration_tests)
     add_dependencies(claude_session_declaration_tests claude_package)

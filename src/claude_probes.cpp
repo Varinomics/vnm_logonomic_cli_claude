@@ -58,13 +58,21 @@ Usage_result usage_text(std::string_view bytes)
 std::optional<addon::Quota_window> quota_window(
     const std::string& content, const std::string& name, std::uint64_t minutes)
 {
-    const std::regex pattern("Current " + name + R"([^:]*:\s*(\d+(?:\.\d+)?)% used[\s\S]*?resets\s*([^\r\n]+))",
+    const std::regex pattern("Current " + name + R"([^:\r\n]*:[ \t]*(\d+(?:\.\d+)?)% used([^\r\n]*))",
         std::regex::icase);
     std::smatch match;
     if (!std::regex_search(content, match, pattern)) return std::nullopt;
     const double used = std::stod(match[1].str());
     if (!std::isfinite(used)) throw std::runtime_error("quota_window_invalid");
-    auto reset = match[2].str();
+    addon::Quota_window window;
+    window.used_percent   = used;
+    window.window_minutes = minutes;
+    window.label          = "Current " + name;
+    // A missing native reset is unknown. Do not borrow the next window's reset.
+    const auto tail = match[2].str();
+    const std::regex reset_pattern(R"(resets[ \t]*([^\r\n]+))", std::regex::icase);
+    if (!std::regex_search(tail, match, reset_pattern)) return window;
+    auto reset = match[1].str();
     const auto trim_end = [&] {
         while (!reset.empty() && (reset.back() == ' ' || reset.back() == '\t')) reset.pop_back();
     };
@@ -82,10 +90,6 @@ std::optional<addon::Quota_window> quota_window(
     const auto begin = reset.find_first_not_of(" \t");
     if (begin == std::string::npos) throw std::runtime_error("quota_window_invalid");
     reset.erase(0, begin);
-    addon::Quota_window window;
-    window.used_percent = used;
-    window.window_minutes = minutes;
-    window.label = "Current " + name;
     window.reset_text = std::move(reset);
     return window;
 }
@@ -158,6 +162,9 @@ void handle_probes(addon::Invocation_context& context, const std::filesystem::pa
             args.insert(args.end(), {"auth", "status", "--json"});
         }
         else {
+            if (result.process.executable.kind == addon::Process_executable::Kind::PACKAGE_PATH) {
+                args.insert(args.begin(), "--quota");
+            }
             args.insert(args.end(), {"-p", "/usage", "--output-format", "json", "--verbose",
                 "--no-session-persistence", "--safe-mode", "--strict-mcp-config", "--mcp-config",
                 path_string(package_root / "assets/empty_mcp.json"), "--tools", "", "--allowedTools", "",
