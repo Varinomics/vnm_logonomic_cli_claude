@@ -20,6 +20,7 @@
 #include <logonomic_cli_addon/profile_storage.h>
 #include <logonomic_cli_addon/sha256.h>
 #include <logonomic_cli_addon/usage_scan.h>
+#include <logonomic_cli_addon/usage_temporal.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -200,6 +201,8 @@ public:
             return std::find(live.begin(), live.end(), pair) != live.end();
         };
         check(is_live({"usage-scan", 3}), "the package negotiates host-selected cache acceptance");
+        check(is_live({addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version}),
+            "the package negotiates optional temporal evidence independently");
         check(is_live({"legacy-state-import", 1}), "the package negotiates native history import");
 
         const auto native_profile = addon::path_to_utf8(profile);
@@ -266,6 +269,23 @@ public:
         const auto outcome = m_host.wait_outcome(id, 31000);
         check(outcome.has_value(), "packaged usage scan finishes");
         return *outcome;
+    }
+
+    addon::Usage_scan_page legacy_scan()
+    {
+        auto request = m_request;
+        request.cache_selection.reset();
+        request.snapshot_id.reset();
+        request.cursor.reset();
+        const auto id = m_host.invoke({"usage-scan", 2}, "scan",
+            addon::encode_usage_scan_request(request, 2), 30000);
+        const auto outcome = m_host.wait_outcome(id, 31000);
+        check(outcome && outcome->status == addon::Host_status::SUCCESS,
+            "legacy packaged usage scan succeeds: " + (outcome ? outcome->reason_code : "missing-outcome"));
+        addon::Contract_failure failure;
+        const auto page = addon::decode_usage_scan_result(outcome->payload, &failure, 2);
+        check(page && page->complete, "legacy packaged usage page decodes: " + failure.detail);
+        return *page;
     }
 
     // Every page of one snapshot, as the host reads them before staging.
@@ -417,6 +437,265 @@ enum class Third_session
     MULTIPLE_MESSAGES,
 };
 
+std::string dated_message(std::string_view id, std::string_view instant,
+    std::uint64_t input, std::uint64_t output = 0,
+    std::uint64_t cache_read = 0, std::uint64_t cache_creation = 0)
+{
+    auto event = addon::Json_value::object();
+    event.set("type", addon::Json_value("assistant"));
+    event.set("sessionId", addon::Json_value("temporal-conversation"));
+    event.set("timestamp", addon::Json_value(instant));
+    auto message = addon::Json_value::object();
+    message.set("id", addon::Json_value(id));
+    message.set("stop_reason", addon::Json_value("end_turn"));
+    auto usage = addon::Json_value::object();
+    usage.set("input_tokens", addon::Json_value(input));
+    usage.set("output_tokens", addon::Json_value(output));
+    usage.set("cache_read_input_tokens", addon::Json_value(cache_read));
+    usage.set("cache_creation_input_tokens", addon::Json_value(cache_creation));
+    message.set("usage", std::move(usage));
+    event.set("message", std::move(message));
+    return addon::serialize_json(event) + '\n';
+}
+
+void check_temporal_parent(const addon::Usage_scan_page& page, const addon::Usage_record& record,
+    std::string_view account)
+{
+    check(record.temporal && record.temporal->parent.record_id == record.record_id &&
+        record.temporal->parent.total_tokens == record.total_tokens &&
+        record.temporal->parent.snapshot_id == page.snapshot_id &&
+        record.temporal->parent.source_account_key == std::optional<std::string>(account),
+        "typed temporal evidence binds the exact accounting parent, source account and actual page snapshot");
+    std::uint64_t represented = record.temporal->unavailable_tokens;
+    for (const auto& portion : record.temporal->portions) {
+        check(portion.basis == "instant" && portion.total_tokens > 0,
+            "only positive proved instant portions enter transcript activity");
+        represented += portion.total_tokens;
+    }
+    check(represented == record.total_tokens, "temporal portions and unavailable remainder conserve H");
+    check(!addon::encode_usage_record(record, 2).find("capabilities"),
+        "usage-scan@2 retains its accounting grammar without temporal evidence");
+}
+
+void temporal_messages_and_retained_cache(const fs::path& package, const fs::path& fixture)
+{
+    const auto profile = fixture / "profile";
+    const auto source = source_path(profile, "conversation");
+    const auto copy = source_path(profile, "copy");
+    const std::string first_instant = "2026-10-08T23:59:59.999999999+02:00";
+    const std::string second_instant = "2026-10-10t03:00:00.000000000000000000001-04:00";
+    const auto first_message = dated_message("message-first", first_instant, 10, 4, 2, 3);
+    write(source, first_message + first_message +
+        dated_message("message-second", second_instant, 7, 5) +
+        dated_message("message-undated", "2026-10-09T12:00:00", 2) +
+        dated_message("message-zero", "2026-10-09T12:00:00Z", 0) +
+        "{\"type\":\"assistant\",\"message\":{\"id\":\"unfinished\",\"stop_reason\":null}}\n" +
+        "{\"type\":\"assistant\",\"message\":{");
+    write(copy, first_message);
+    Packaged_host host(package, fixture, profile);
+    host.select("observed", std::nullopt);
+    const auto observed = host.scan();
+    check(observed.records.size() == 1 && total(observed) == 33,
+        "finalized stable IDs deduplicate before conversation reduction and exclude unfinished records");
+    const auto& record = observed.records.front();
+    check_temporal_parent(observed, record, host.account_key());
+    check(record.temporal->portions.size() == 2 && record.temporal->unavailable_tokens == 2 &&
+        record.temporal->coverage_reason == "missing-evidence" &&
+        record.temporal->portions[0].instant == first_instant && record.temporal->portions[0].total_tokens == 19 &&
+        record.temporal->portions[1].instant == second_instant && record.temporal->portions[1].total_tokens == 12 &&
+        record.completed_date >= "2026-10-09" && record.input.value == 19 && record.output.value == 9 &&
+        record.cache_read.value == 2 && record.cache_creation.value == 3 && !record.cost_microusd.applicable,
+        "earlier activity survives a later parent date, raw offset/fraction precision and original accounting partition");
+    const auto original_lines = cache_lines(*observed.cache_candidate);
+    check(fs::remove(source) && fs::remove(copy), "delete only isolated original transcripts");
+    host.select("deleted-originals", observed.cache_candidate);
+    const auto retained = host.scan();
+    check_temporal_parent(retained, retained.records.front(), host.account_key());
+    check(retained.records.front().temporal->portions.size() == 2 &&
+        retained.records.front().temporal->portions[0].instant == first_instant &&
+        retained.records.front().temporal->retained_from &&
+        retained.records.front().temporal->retained_from->snapshot_id == observed.snapshot_id &&
+        retained.records.front().temporal->retained_from->manifest_sha256_hex ==
+            observed.cache_candidate->manifest_sha256_hex && total(retained) == 33,
+        "selected accepted cache retains deleted-source instants with exact prior snapshot and manifest custody");
+
+    const auto cache_fixture = [&](std::string name, const auto& change,
+        std::optional<addon::Account_context> account = std::nullopt)
+    {
+        const auto root = host.storage_root() / ("evidence-" + name);
+        check(fs::create_directory(root), "allocate isolated optional-cache fixture");
+        std::string bytes = original_lines.front() + '\n';
+        for (std::size_t index = 1; index < original_lines.size(); ++index) {
+            auto wrapper = addon::parse_json(original_lines[index], {}, nullptr);
+            check(wrapper.has_value(), "parse isolated cached accounting");
+            for (auto& message : wrapper->find("records")->as_array()) change(message);
+            bytes += addon::serialize_json(*wrapper) + '\n';
+        }
+        write(root / "messages.jsonl", bytes);
+        addon::Contract_failure failure;
+        const auto reference = addon::seal_usage_cache_candidate(addon::path_to_utf8(root),
+            addon::path_to_utf8(host.storage_root()), account ? account :
+                std::optional<addon::Account_context>{{2, host.account_key(), addon::path_to_utf8(profile)}},
+            "fixture-" + name, "claude-message-cache@2", [] { return false; }, &failure);
+        check(reference.has_value(), "seal isolated accounting fixture: " + failure.detail);
+        return *reference;
+    };
+    const auto replay = [&](std::string name, const auto& change, std::uint64_t unavailable,
+        std::string_view reason)
+    {
+        const auto accepted = cache_fixture(name, change);
+        host.select("replay-" + name, accepted);
+        const auto page = host.scan();
+        check(page.records.size() == 1 && total(page) == 33, "optional damage preserves admitted accounting: " + name);
+        check_temporal_parent(page, page.records.front(), host.account_key());
+        check(page.records.front().temporal->unavailable_tokens == unavailable &&
+            page.records.front().temporal->coverage_reason == reason,
+            "optional carrier withdrawal is truthful: " + name);
+        check(host.sealed(accepted), "replay leaves selected accepted candidate immutable");
+        return page;
+    };
+    replay("date-only", [](auto& message) { message.erase("usage-temporal"); }, 33, "missing-evidence");
+    replay("bad-digest", [](auto& message) {
+        if (auto* carrier = message.find("usage-temporal")) {
+            carrier->set("parent_sha256_hex", addon::Json_value(std::string(64, '0')));
+        }
+    }, 33, "missing-evidence");
+    replay("malformed", [](auto& message) {
+        if (message.find("usage-temporal")) message.set("usage-temporal", addon::Json_value("damaged"));
+    }, 33, "missing-evidence");
+    auto future = addon::Json_value::object();
+    future.set("version", addon::Json_value(9));
+    future.set("future_evidence", addon::Json_value("retained opaque evidence"));
+    const auto future_page = replay("future", [&future](auto& message) {
+        if (message.find("usage-temporal")) message.set("usage-temporal", future);
+    }, 33, "missing-evidence");
+    const auto future_lines = cache_lines(*future_page.cache_candidate);
+    const auto future_wrapper = addon::parse_json(future_lines[1], {}, nullptr);
+    check(*future_wrapper->find("records")->as_array().front().find("usage-temporal") == future,
+        "unknown independently versioned carrier remains opaque in candidate cache replay");
+    replay("oversize", [](auto& message) {
+        if (auto* carrier = message.find("usage-temporal")) {
+            carrier->set("instant", addon::Json_value(std::string(addon::k_max_usage_temporal_bytes + 1, 'x')));
+        }
+    }, 33, "missing-evidence");
+    const auto corrected_cache = cache_fixture("corrected-accounting", [](auto& message) {
+        if (message.find("id")->as_string() == "message-first") {
+            message.set("total", addon::Json_value(20));
+            message.find("categories")->set("input_tokens", addon::Json_value(11));
+        }
+    });
+    host.select("corrected-accounting", corrected_cache);
+    const auto corrected = host.scan();
+    check_temporal_parent(corrected, corrected.records.front(), host.account_key());
+    check(total(corrected) == 34 && corrected.records.front().input.value == 20 &&
+        corrected.records.front().temporal->portions.size() == 1 &&
+        corrected.records.front().temporal->portions.front().instant == second_instant &&
+        corrected.records.front().temporal->unavailable_tokens == 22,
+        "an accounting correction cannot inherit the prior message's stale temporal claim");
+
+    auto wrong_snapshot = *observed.cache_candidate;
+    wrong_snapshot.snapshot_id = "another-snapshot";
+    host.select("wrong-snapshot", wrong_snapshot);
+    check(host.scan_outcome().status != addon::Host_status::SUCCESS,
+        "accepted cache cannot be grafted from a different snapshot reference");
+    const auto wrong_account = cache_fixture("wrong-account", [](auto&) {},
+        addon::Account_context{2, "other-account", addon::path_to_utf8(profile)});
+    host.select("wrong-account", wrong_account);
+    check(host.scan_outcome().status != addon::Host_status::SUCCESS,
+        "accepted cache cannot be grafted from another source account");
+    check(host.sealed(*observed.cache_candidate), "failed custody checks preserve the original accepted cache");
+    host.finish();
+}
+
+void temporal_duplicate_and_capacity_contract(const fs::path& package, const fs::path& fixture)
+{
+    const auto profile = fixture / "profile";
+    const auto source = source_path(profile, "conversation");
+    const auto copy = source_path(profile, "copy");
+    write(source, dated_message("same-id", "2026-10-08T12:00:00Z", 17));
+    write(copy, dated_message("same-id", "2026-10-09T12:00:00Z", 17));
+    Packaged_host host(package, fixture, profile);
+    host.select("conflicting-instants", std::nullopt);
+    const auto conflict = host.scan();
+    check_temporal_parent(conflict, conflict.records.front(), host.account_key());
+    check(total(conflict) == 17 && conflict.records.front().temporal->portions.empty() &&
+        conflict.records.front().temporal->unavailable_tokens == 17 &&
+        conflict.records.front().temporal->coverage_reason == "unsupported",
+        "differing instants on the same admitted message ID withdraw temporal without duplicating accounting");
+    write(copy, dated_message("same-id", "2026-10-09T12:00:00Z", 18));
+    host.select("conflicting-totals", std::nullopt);
+    const auto accounting_conflict = host.scan_outcome();
+    check(accounting_conflict.status != addon::Host_status::SUCCESS &&
+        accounting_conflict.reason_code == "conflicting_message_usage",
+        "differing H on duplicate IDs retains the original accounting refusal");
+    check(fs::remove(copy), "remove only isolated duplicate transcript");
+    std::string bytes;
+    for (unsigned index = 0; index <= addon::k_max_usage_temporal_portions; ++index) {
+        bytes += dated_message("position-" + std::to_string(index),
+            "2026-10-09T12:00:00." + std::to_string(100000 + index) + 'Z', 1);
+    }
+    write(source, bytes);
+    host.select("optional-capacity", std::nullopt);
+    const auto capacity = host.scan();
+    check_temporal_parent(capacity, capacity.records.front(), host.account_key());
+    check(total(capacity) == addon::k_max_usage_temporal_portions + 1 &&
+        capacity.records.front().temporal->portions.empty() &&
+        capacity.records.front().temporal->unavailable_tokens == total(capacity) &&
+        capacity.records.front().temporal->coverage_reason == "capacity",
+        "optional position capacity preserves every admitted accounting message without a history ceiling");
+    bytes.clear();
+    for (unsigned index = 0; index <= addon::k_max_usage_temporal_portions; ++index) {
+        bytes += dated_message("position-" + std::to_string(index),
+            "2026-10-09T12:00:00." + std::to_string(100000 + index) + 'Z',
+            index == addon::k_max_usage_temporal_portions ? 0 : 1);
+    }
+    write(source, bytes);
+    host.select("zero-beyond-position-bound", std::nullopt);
+    const auto zero_position = host.scan();
+    check_temporal_parent(zero_position, zero_position.records.front(), host.account_key());
+    check(total(zero_position) == addon::k_max_usage_temporal_portions &&
+        zero_position.records.front().temporal->portions.size() == addon::k_max_usage_temporal_portions &&
+        zero_position.records.front().temporal->unavailable_tokens == 0,
+        "a zero-token message consumes no positive position capacity");
+    write(source, dated_message("zero", "2026-10-09T12:00:00Z", 0));
+    host.select("zero-parent", std::nullopt);
+    const auto zero = host.scan();
+    check_temporal_parent(zero, zero.records.front(), host.account_key());
+    check(total(zero) == 0 && zero.records.front().temporal->portions.empty(),
+        "H zero produces no positive temporal portion");
+    write(source, dated_message("compact-offset", "2026-10-09T12:00:00+0000", 3) +
+        dated_message("unknown-offset", "2026-10-09T12:00:00-00:00", 5));
+    host.select("unsupported-native-instants", std::nullopt);
+    const auto unsupported = host.scan();
+    check_temporal_parent(unsupported, unsupported.records.front(), host.account_key());
+    check(total(unsupported) == 8 && unsupported.records.front().temporal->portions.empty() &&
+        unsupported.records.front().temporal->unavailable_tokens == 8,
+        "broader accounting date admission cannot manufacture strict RFC3339 instant proof");
+    host.finish();
+}
+
+void optional_parent_grammar_contract(const fs::path& package, const fs::path& fixture)
+{
+    const auto profile = fixture / "profile";
+    const std::string session_id = "control-" + std::string(1, '\x01') + "-parent";
+    auto event = addon::parse_json(dated_message("control-message", "2026-10-09T12:00:00Z", 11, 6), {}, nullptr);
+    check(event.has_value(), "parse isolated optional-parent fixture");
+    event->set("sessionId", addon::Json_value(session_id));
+    write(source_path(profile, "conversation"), addon::serialize_json(*event) + '\n');
+    Packaged_host host(package, fixture, profile);
+    const auto legacy = host.legacy_scan();
+    check(legacy.records.size() == 1 && legacy.records.front().record_id == session_id &&
+        legacy.records.front().session_key == session_id && total(legacy) == 17,
+        "usage2 preserves the admitted nonNUL control-character parent ID and exact H");
+    host.select("optional-parent", std::nullopt);
+    const auto current = host.scan();
+    check(current.records.size() == 1 && current.records.front().record_id == session_id &&
+        current.records.front().session_key == session_id && total(current) == 17 &&
+        !current.records.front().temporal && host.sealed(*current.cache_candidate),
+        "usage3 omits invalid optional parent proof and preserves the same accounting ID, H and sealed cache");
+    host.finish();
+}
+
 enum class Reimport_seed
 {
     RETAINED,
@@ -564,6 +843,9 @@ int main(int argc, char** argv)
             Third_session::MULTIPLE_MESSAGES, Reimport_seed::RETAINED);
         retained_history_survives_rollback_and_reimport(package, fixture.path() / "changed-native-cache",
             Third_session::SINGLE_MESSAGE, Reimport_seed::CHANGED);
+        optional_parent_grammar_contract(package, fixture.path() / "optional-parent-grammar");
+        temporal_messages_and_retained_cache(package, fixture.path() / "temporal-cache");
+        temporal_duplicate_and_capacity_contract(package, fixture.path() / "temporal-admission");
         return 0;
     }
     catch (const std::exception& error) {

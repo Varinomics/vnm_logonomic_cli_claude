@@ -129,6 +129,7 @@ int main()
         {"usage-scan", 2}, {"usage-scan", 3}, {"legacy-state-import", 1}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {"usage-lifetime-summary", 1},
         {"usage-saved-daily-tokens", 1},
+        {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"coordination-delivery", 1},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},

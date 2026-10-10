@@ -54,6 +54,18 @@ Usage failures report the operation that failed and a safe explanation. Native
 profile paths, transcript contents and credentials are excluded from these
 diagnostics. Failed scans do not replace the host's accepted usage cache.
 
+The optional `usage-temporal@1` capability retains strict RFC 3339 instants
+from admitted finalized messages before conversation reduction. It allocates
+only the existing total-token amount; raw offsets and fractional precision
+remain intact for the host's selected display timezone. Missing or conflicting
+instants remain an unavailable remainder. The independently versioned
+per-message `usage-temporal` cache carrier binds its instant to the exact
+canonical message accounting digest, within the selected cache's sealed
+account and snapshot. Date-only retained history remains usable without
+invented instants, and unknown carriers remain opaque in cache replay.
+Temporal capacity withdraws optional evidence while preserving accounting
+history and its existing transport limits. Saved daily metrics remain separate.
+
 Saved lifetime and daily totals come from Claude Code's own `stats-cache.json`
 in the selected profile, read through `usage-lifetime-summary@1` and
 `usage-saved-daily-tokens@1`: the per-model token classes and the dated

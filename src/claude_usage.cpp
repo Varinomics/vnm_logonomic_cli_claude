@@ -148,7 +148,49 @@ struct Message
     std::string model;
     std::array<std::optional<std::uint64_t>, 4> categories;
     std::uint64_t total = 0;
+    std::optional<std::string> instant;
+    std::optional<Json> temporal_carrier;
+    bool temporal_unsupported = false;
+    bool temporal_retained = false;
 };
+
+Json cache_accounting_record(const Message& message);
+
+bool valid_message_instant(const std::string& instant)
+{
+    if (instant.size() > addon::k_max_usage_temporal_bytes) {
+        return false;
+    }
+    addon::Usage_temporal proof;
+    proof.parent = {"message", 1, "native-observation", std::nullopt};
+    proof.portions.push_back({"instant", instant, {}, {}, 1});
+    return addon::decode_usage_temporal(addon::encode_usage_temporal(proof), nullptr).has_value();
+}
+
+std::string message_accounting_digest(const Message& message)
+{
+    return addon::to_hex(addon::Sha256::digest(
+        addon::serialize_json_canonical(cache_accounting_record(message))));
+}
+
+void read_message_temporal(Message& message, const Json& carrier)
+{
+    message.temporal_carrier = carrier;
+    message.temporal_unsupported = true;
+    const auto* version = carrier.find("version");
+    const auto* digest = carrier.find("parent_sha256_hex");
+    const auto* instant = carrier.find("instant");
+    if (!carrier.is_object() || carrier.as_object().size() != 3 ||
+        !version || !version->is_integer() || version->as_integer() != 1 ||
+        !digest || !digest->is_string() || digest->as_string() != message_accounting_digest(message) ||
+        !instant || !instant->is_string() || !valid_message_instant(instant->as_string()))
+    {
+        return;
+    }
+    message.instant = instant->as_string();
+    message.temporal_unsupported = false;
+    message.temporal_retained = true;
+}
 
 struct Snapshot
 {
@@ -280,7 +322,8 @@ std::optional<std::vector<Message>> parse_file(
         record.id      = id;
         record.session = text(event, "sessionId");
         if (record.session.empty()) record.session = path_string(path.stem());
-        record.date   = local_date(text(event, "timestamp"));
+        const auto timestamp = text(event, "timestamp");
+        record.date   = local_date(timestamp);
         record.source = source;
         record.cwd    = text(event, "cwd");
         record.model  = text(*message, "model");
@@ -288,6 +331,12 @@ std::optional<std::vector<Message>> parse_file(
             count(values, "cache_read_input_tokens"), count(values, "cache_creation_input_tokens")};
         for (const auto& category : record.categories) {
             if (category) add(record.total, *category);
+        }
+        if (valid_message_instant(timestamp)) {
+            record.instant = timestamp;
+        }
+        else {
+            record.temporal_unsupported = true;
         }
         result.push_back(std::move(record));
     }
@@ -314,6 +363,10 @@ struct merged_message_t
     std::array<std::optional<std::uint64_t>, 4> categories;
     bool                                        breakdown_conflicted;
     bool                                        repository_conflicted;
+    std::optional<std::string>                   instant;
+    bool                                        temporal_conflicted;
+    bool                                        temporal_unsupported;
+    bool                                        temporal_retained;
 };
 
 std::vector<Message> reconcile_messages(
@@ -385,6 +438,9 @@ Message cached_message(const Json& value, bool native)
         if (!categories || !categories->is_object()) throw std::runtime_error("usage_cache_invalid");
         for (std::size_t index = 0; index < names.size(); ++index) {
             result.categories[index] = count(*categories, names[index]);
+        }
+        if (const auto* temporal = value.find("usage-temporal")) {
+            read_message_temporal(result, *temporal);
         }
         return result;
     }
@@ -483,7 +539,7 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
     return native ? std::string(expected_hash) : receipt;
 }
 
-Json cache_record(const Message& message)
+Json cache_accounting_record(const Message& message)
 {
     Json value = Json::object();
     value.set("id", Json(message.id));
@@ -501,6 +557,23 @@ Json cache_record(const Message& message)
         if (message.categories[index]) categories.set(std::string(names[index]), Json(*message.categories[index]));
     }
     value.set("categories", std::move(categories));
+    return value;
+}
+
+Json cache_record(const Message& message)
+{
+    auto value = cache_accounting_record(message);
+    if (message.temporal_carrier) {
+        value.set("usage-temporal", *message.temporal_carrier);
+    }
+    else
+    if (message.instant) {
+        Json carrier = Json::object();
+        carrier.set("version", Json(1));
+        carrier.set("parent_sha256_hex", Json(message_accounting_digest(message)));
+        carrier.set("instant", Json(*message.instant));
+        value.set("usage-temporal", std::move(carrier));
+    }
     return value;
 }
 
@@ -691,13 +764,26 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
         for (const auto& record : file.messages) {
             if (context.cancel_requested()) throw std::runtime_error("cancelled");
             const auto [previous, inserted] = merged.try_emplace(
-                record.id, merged_message_t{&record, record.categories, false, false});
+                record.id, merged_message_t{&record, record.categories, false, false,
+                    record.instant, false, record.temporal_unsupported, record.temporal_retained});
             if (inserted) {
                 order.push_back(&previous->second);
                 continue;
             }
             auto& existing = previous->second;
             if (existing.first->total != record.total) throw std::runtime_error("conflicting_message_usage");
+            if (!existing.temporal_conflicted) {
+                if (existing.instant && record.instant && existing.instant != record.instant) {
+                    existing.instant.reset();
+                    existing.temporal_conflicted = true;
+                }
+                else
+                if (!existing.instant && record.instant) {
+                    existing.instant = record.instant;
+                }
+            }
+            existing.temporal_unsupported |= record.temporal_unsupported;
+            existing.temporal_retained |= record.temporal_retained;
             if (!existing.breakdown_conflicted) {
                 const auto present = [](const auto& categories) {
                     return std::any_of(categories.begin(), categories.end(), [](const auto& value) { return value.has_value(); });
@@ -728,6 +814,28 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
         session.record.model = previous_model.empty() || previous_model == message.model ? message.model : "multiple";
         session.record.completed_date = std::max(session.record.completed_date, message.date);
         add(session.record.total_tokens, message.total);
+        session.temporal_retained |= entry->temporal_retained;
+        if (!session.temporal_capacity && entry->instant) {
+            if (message.total && !session.temporal_tokens.contains(*entry->instant) &&
+                (session.temporal_tokens.size() == addon::k_max_usage_temporal_portions ||
+                    entry->instant->size() > addon::k_max_usage_temporal_bytes - session.temporal_position_bytes))
+            {
+                session.temporal_tokens.clear();
+                session.temporal_capacity = true;
+            }
+            else
+            if (message.total) {
+                auto [position, inserted] = session.temporal_tokens.try_emplace(*entry->instant, 0);
+                if (inserted) session.temporal_position_bytes += entry->instant->size();
+                add(position->second, message.total);
+            }
+        }
+        else
+        if (!entry->instant) {
+            add(session.temporal_unavailable_tokens, message.total);
+            session.temporal_unsupported |= entry->temporal_unsupported || entry->temporal_conflicted;
+            session.temporal_missing |= !entry->temporal_unsupported && !entry->temporal_conflicted;
+        }
         ++session.message_count;
         for (std::size_t index = 0; index < entry->categories.size(); ++index) {
             if (entry->categories[index]) {
@@ -851,6 +959,36 @@ void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
         snapshot.touched_ms = now_ms();
         snapshot_id = addon::random_nonce_hex();
         if (version == 3) {
+            for (auto& session : snapshot.sessions) {
+                addon::Usage_temporal temporal;
+                temporal.parent = {session.record.record_id, session.record.total_tokens,
+                    snapshot_id, snapshot.scope.source_account_key};
+                temporal.unavailable_tokens = session.temporal_unavailable_tokens;
+                for (const auto& [instant, tokens] : session.temporal_tokens) {
+                    temporal.portions.push_back({"instant", instant, {}, {}, tokens});
+                }
+                if (session.temporal_capacity) {
+                    temporal.unavailable_tokens = session.record.total_tokens;
+                    temporal.coverage_reason = "capacity";
+                }
+                else
+                if (session.temporal_missing || session.temporal_unsupported) {
+                    temporal.coverage_reason = temporal.portions.empty() &&
+                        session.temporal_unsupported && !session.temporal_missing ? "unsupported" : "missing-evidence";
+                }
+                if (session.temporal_retained && input->cache_selection->accepted) {
+                    const auto& accepted = *input->cache_selection->accepted;
+                    temporal.retained_from = addon::Usage_temporal_retained_from{
+                        accepted.snapshot_id, accepted.manifest_sha256_hex};
+                }
+                if (!addon::decode_usage_temporal(addon::encode_usage_temporal(temporal), nullptr)) {
+                    temporal.portions.clear();
+                    temporal.unavailable_tokens = session.record.total_tokens;
+                    temporal.coverage_reason = "capacity";
+                    if (!addon::decode_usage_temporal(addon::encode_usage_temporal(temporal), nullptr)) continue;
+                }
+                session.record.temporal = std::move(temporal);
+            }
             stage = "sealing the candidate usage cache";
             // Surviving transcripts do not prove that all contributing messages remain.
             for (auto& session : snapshot.sessions) session.record.aggregate_evidence = "partial";
@@ -891,8 +1029,26 @@ void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
             page.account_context = input->context.account_context;
             page.profile_storage = input->context.profile_storage;
         }
-        const auto end = std::min(begin + addon::k_max_usage_page_records, snapshot.sessions.size());
-        for (auto index = begin; index < end; ++index) page.records.push_back(snapshot.sessions[index].record);
+        auto end = begin;
+        std::size_t encoded_records_bytes = 0;
+        for (; end < snapshot.sessions.size(); ++end) {
+            page.complete = end + 1 == snapshot.sessions.size();
+            if (page.complete) page.next_cursor.reset();
+            else page.next_cursor = std::to_string(end + 1);
+            const auto& record = snapshot.sessions[end].record;
+            if (addon::append_usage_page_record(page, record, encoded_records_bytes, version)) continue;
+            if (!page.records.empty()) break;
+            auto accounting = record;
+            if (accounting.temporal) {
+                accounting.temporal->portions.clear();
+                accounting.temporal->unavailable_tokens = accounting.total_tokens;
+                accounting.temporal->coverage_reason = "capacity";
+                if (addon::append_usage_page_record(page, accounting, encoded_records_bytes, version)) continue;
+                accounting.temporal.reset();
+            }
+            if (addon::append_usage_page_record(page, accounting, encoded_records_bytes, version)) continue;
+            throw std::runtime_error("usage_record_transport_limit_exceeded");
+        }
         page.complete = end == snapshot.sessions.size();
         if (!page.complete) page.next_cursor = std::to_string(end);
         else s_snapshots.erase(found);
@@ -958,6 +1114,7 @@ void handle_usage(addon::Invocation_context& context)
             {"usage_snapshot_capacity", "The provider is retaining too many unfinished usage snapshots."},
             {"usage_snapshot_unavailable", "The requested usage snapshot is no longer available."},
             {"usage_cursor_invalid", "The requested usage page is invalid."},
+            {"usage_record_transport_limit_exceeded", "An accounting record exceeds the supported transport size."},
         };
         for (const auto& [reason, explanation] : reasons) {
             if (std::string_view(error.what()) == reason) {

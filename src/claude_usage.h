@@ -4,6 +4,7 @@
 #include <logonomic_cli_addon/usage_scan.h>
 
 #include <array>
+#include <cstddef>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -20,6 +21,13 @@ struct Usage_session
     std::uint64_t                      message_count = 0;
     std::map<std::string, std::uint64_t> repository_tokens;
     std::uint64_t                      unattributed_tokens = 0;
+    std::map<std::string, std::uint64_t> temporal_tokens;
+    std::uint64_t                      temporal_unavailable_tokens = 0;
+    std::size_t                        temporal_position_bytes = 0;
+    bool                               temporal_capacity = false;
+    bool                               temporal_missing = false;
+    bool                               temporal_unsupported = false;
+    bool                               temporal_retained = false;
 };
 
 struct Usage_cache_input
