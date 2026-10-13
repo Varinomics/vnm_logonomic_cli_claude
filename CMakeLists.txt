@@ -59,7 +59,7 @@ endfunction()
 add_library(claude_provider STATIC
     src/claude_accounts.cpp src/claude_launcher.cpp src/claude_lifecycle.cpp
     src/claude_preparation.cpp src/claude_probes.cpp src/claude_sessions.cpp src/claude_usage.cpp
-    src/claude_usage_summary.cpp)
+    src/claude_usage_summary.cpp src/claude_wake.cpp)
 claude_target(claude_provider)
 target_include_directories(claude_provider PUBLIC src)
 target_link_libraries(claude_provider PUBLIC logonomic_cli_addon_sdk::sdk)
@@ -67,6 +67,7 @@ add_executable(claude_adapter src/adapter.cpp)
 target_link_libraries(claude_adapter PRIVATE claude_provider)
 claude_target(claude_adapter)
 add_executable(claude_helper src/claude_helper.cpp)
+target_link_libraries(claude_helper PRIVATE claude_provider)
 claude_target(claude_helper)
 add_executable(claude_launch_bridge src/claude_launch_bridge.cpp)
 claude_target(claude_launch_bridge)
@@ -196,6 +197,10 @@ if(BUILD_TESTING)
         "${CLAUDE_PACKAGE_DIRECTORY}")
     find_program(CLAUDE_NODE_EXECUTABLE node)
     if(CLAUDE_NODE_EXECUTABLE)
+        add_test(NAME claude_wake_transport_tests COMMAND "${CLAUDE_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_wake_transport_tests.cjs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/scripts/logonomic-wake.cjs")
+        set_tests_properties(claude_wake_transport_tests PROPERTIES TIMEOUT 30)
         add_test(NAME claude_hook_contract_tests COMMAND "${CLAUDE_NODE_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_hook_tests.mjs"
             "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/scripts/logonomic-hook-relay.cjs")

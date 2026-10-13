@@ -22,6 +22,35 @@ for hooks and resume; ordinary launch preparation reports its actual reduced
 lifecycle disposition when Node is unavailable. Hook responses contain only
 instructions returned by the authenticated host helper boundary.
 
+The optional `session-wake@1` capability can notify the same live interactive
+Claude session through the public [Mods API](https://code.claude.com/docs/en/plugins/mods/api).
+It requires Node, writable private profile storage, and a Claude installation
+that actually loads both packaged Mods. Installing the package or recognizing a
+Claude version does not establish readiness. Older installations, disabled Mods,
+missing session registration and unsupported launch forms leave wake unavailable.
+Ordinary mailbox delivery remains available independently.
+
+The admission Mod is part of `logonomic-claude-hooks`; the separate
+`logonomic-wake-dispatch` plugin declares it as a native dependency. The
+dispatcher submits only requests produced by the admission Mod. This separation
+lets Claude run the admission hook when the dispatcher calls `$.prompt.submit`;
+Claude skips a submitting plugin's own hooks. Disabling the dependency prevents
+the dispatcher from loading. Both use a private, per-launch file bridge bound to
+the authenticated native session ID and transition nonce. No terminal input,
+native inbox wire, resumed second process, or user-attributed prompt is used.
+
+Wake requires explicit live `crossSessionInbound: "accept"` in the user's,
+launcher's or managed policy settings. Stricter project/local `hold` or `refuse`
+still applies; missing or unrecognized policy leaves wake unavailable. The
+package never changes these settings. A busy turn, prompt draft, interrupted
+turn, or unknown pause state defers the request. The admission hook checks these
+conditions again at native submission. Reloading Mods requires a subsequent
+ordinary prompt or completed answer before wake becomes eligible again.
+Acceptance means Claude admitted a plugin-attributed notification; it does not
+mean the agent read or acknowledged the mailbox. A lost native result is reported
+as uncertain and retained against the notification ID to prevent automatic
+duplicate submission.
+
 The package recipe proves the Windows/Linux x86-64 compiler target during
 configuration. `cmake --install` exports a fresh artifact beneath its install-time
 prefix and preserves executable permissions. An existing per-package destination,

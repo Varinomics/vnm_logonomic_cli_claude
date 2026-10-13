@@ -6,6 +6,7 @@
 #include "claude_sessions.h"
 #include "claude_usage.h"
 #include "claude_usage_summary.h"
+#include "claude_wake.h"
 
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/capability_ids.h>
@@ -91,6 +92,8 @@ void invoke(addon::Invocation_context& context, const fs::path& package_root)
         else
         if (capability == "accounts") claude::handle_accounts(context);
         else
+        if (capability == addon::k_session_wake_capability_id) claude::handle_wake(context);
+        else
         if (capability == "legacy-state-import") claude::handle_history(context);
         else
         if (capability == "usage-scan") claude::handle_usage(context);
@@ -133,6 +136,7 @@ int main()
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"coordination-delivery", 1},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
+        {addon::k_session_wake_capability_id, addon::k_session_wake_version},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler([package_root](addon::Invocation_context& context) { invoke(context, package_root); });

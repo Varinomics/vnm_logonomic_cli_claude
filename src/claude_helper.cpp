@@ -1,4 +1,5 @@
 #include "claude_helper.h"
+#include "claude_wake.h"
 
 #include <logonomic_cli_addon/helper_client.h>
 #include <logonomic_cli_addon/ids.h>
@@ -190,7 +191,10 @@ int run_helper(int argc, char** argv)
     }
     // SessionStart must establish the new native identity before requesting
     // instructions; it is not the already-active prompt case above.
-    if (name == "SessionStart" && outcome.accepted && !emit_context()) return addon::k_helper_exit_transport_failure;
+    if (name == "SessionStart" && outcome.accepted) {
+        register_wake(*event, nonce);
+        if (!emit_context()) return addon::k_helper_exit_transport_failure;
+    }
     // Consumption releases the host's retained private response. A failed
     // acknowledgement does not undo an already committed delivery.
     (void)client.acknowledge_provider_event(key);

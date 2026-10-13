@@ -1,4 +1,5 @@
 #include "claude_preparation.h"
+#include "claude_wake.h"
 #include "claude_accounts.h"
 #include "claude_launcher.h"
 #include "claude_lifecycle.h"
@@ -149,20 +150,23 @@ void require_instruction(const std::string& instruction)
 // --system-prompt --append-system-prompt, stays a value.
 std::vector<std::string> claude_command(
     std::vector<std::string> command, const std::string& instruction,
-    const std::optional<std::string>& plugin, const std::vector<std::string>& trailing)
+    const std::vector<std::string>& plugins, const std::vector<std::string>& trailing)
 {
     const auto cli_index = *cli_argument_index(command);
     const auto next_option = [&command](std::size_t index) {
         return index + 1 + claude_option_value_words(command, index);
     };
-    if (plugin) {
-        std::optional<std::string> last;
+    for (const auto& plugin : plugins) {
+        bool present = false;
         for (std::size_t index = cli_index + 1; index < command.size(); index = next_option(index)) {
-            if (command[index] == "--plugin-dir" && index + 1 < command.size()) last = command[index + 1];
-            else
-            if (command[index].starts_with("--plugin-dir=")) last = command[index].substr(13);
+            if ((command[index] == "--plugin-dir" && index + 1 < command.size() && command[index + 1] == plugin) ||
+                (command[index].starts_with("--plugin-dir=") && command[index].substr(13) == plugin))
+            {
+                present = true;
+                break;
+            }
         }
-        if (!last || *last != *plugin) command.insert(command.end(), {"--plugin-dir", *plugin});
+        if (!present) command.insert(command.end(), {"--plugin-dir", plugin});
     }
     bool present = false;
     for (std::size_t index = cli_index + 1; index < command.size(); index = next_option(index)) {
@@ -334,7 +338,7 @@ bool powershell_literal(std::string_view argument)
 // byte.
 std::optional<std::vector<std::string>> initial_prompt_argv(
     const std::vector<std::string>& argv, const std::string& instruction,
-    const std::optional<std::string>& plugin, const addon::Initial_prompt_request& prompt, bool windows)
+    const std::vector<std::string>& plugins, const addon::Initial_prompt_request& prompt, bool windows)
 {
     require_instruction(instruction);
     // Claude itself, not a package runner that relaunches it through quoting of
@@ -351,7 +355,7 @@ std::optional<std::vector<std::string>> initial_prompt_argv(
     if (!directory || !verbatim_prompt(prompt.text)) {
         return std::nullopt;
     }
-    auto command = claude_command(std::move(*literal), instruction, plugin, {prompt.text});
+    auto command = claude_command(std::move(*literal), instruction, plugins, {prompt.text});
     // --add-dir takes every following word up to the next option, so it goes
     // directly behind the program, where an option always follows it.
     command.insert(command.begin() + 1, {"--add-dir", *directory});
@@ -411,12 +415,12 @@ bool canonical_resume_directory(const std::string& directory)
 
 std::optional<std::vector<std::string>> prepared_argv(
     const std::vector<std::string>& argv, const std::string& instruction,
-    const std::optional<std::string>& plugin, const std::vector<std::string>& trailing)
+    const std::vector<std::string>& plugins, const std::vector<std::string>& trailing)
 {
     require_instruction(instruction);
     auto command = literal_command(argv);
     if (!command) return std::nullopt;
-    return carried_argv(argv, claude_command(std::move(*command), instruction, plugin, trailing));
+    return carried_argv(argv, claude_command(std::move(*command), instruction, plugins, trailing));
 }
 
 void handle_preparation(addon::Invocation_context& context, const fs::path& package_root)
@@ -429,11 +433,17 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
             return;
         }
         const bool hooks = input->launch_environment && node_available(*input->launch_environment, input->working_directory);
-        const auto plugin = hooks ? std::optional(path_string(package_root / "assets/claude-hooks")) : std::nullopt;
+        std::vector<std::string> plugins;
+        if (hooks) {
+            plugins.push_back(path_string(package_root / "assets/claude-hooks"));
+            if (input->session_wake) {
+                plugins.push_back(path_string(package_root / "assets/claude-wake-dispatch"));
+            }
+        }
         const auto argv = input->initial_prompt
-            ? initial_prompt_argv(input->launcher_argv, input->title_instruction, plugin, *input->initial_prompt,
+            ? initial_prompt_argv(input->launcher_argv, input->title_instruction, plugins, *input->initial_prompt,
                   input->launch_environment->platform_id == "windows-x86_64")
-            : prepared_argv(input->launcher_argv, input->title_instruction, plugin, {});
+            : prepared_argv(input->launcher_argv, input->title_instruction, plugins, {});
         if (input->initial_prompt && !argv) {
             context.fail(addon::Result_status::UNAVAILABLE, addon::reason::k_initial_prompt_unavailable);
             return;
@@ -452,6 +462,7 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
                 result.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(launch)));
             }
         }
+        if (input->session_wake) prepare_wake(result, input->profile_storage, argv.has_value() && hooks);
         if (input->initial_prompt) {
             // The host holds a patch to the same bounds; one over them would
             // fail the launch after this package acknowledged the prompt.
@@ -483,8 +494,12 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
         context.fail(addon::Result_status::UNAVAILABLE, "exact_resume_unavailable");
         return;
     }
+    std::vector<std::string> plugins{path_string(package_root / "assets/claude-hooks")};
+    if (input->context.session_wake) {
+        plugins.push_back(path_string(package_root / "assets/claude-wake-dispatch"));
+    }
     const auto argv = prepared_argv(input->context.launcher_argv, input->title_instruction,
-        path_string(package_root / "assets/claude-hooks"), {"--resume", session});
+        plugins, {"--resume", session});
     if (!argv) {
         context.fail(addon::Result_status::UNAVAILABLE, "unsupported_launcher");
         return;
@@ -496,6 +511,7 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
     result.patch.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(input->context)));
     result.patch.profile_storage = input->context.profile_storage;
     result.patch.account_context = input->context.account_context;
+    if (input->context.session_wake) prepare_wake(result.patch, input->context.profile_storage, true);
     result.patch.set.emplace_back("CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS", "5000");
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(input->resume_record);
     context.succeed(addon::encode_resume_prepare_result(result, 2));

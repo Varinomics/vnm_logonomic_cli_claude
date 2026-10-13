@@ -128,10 +128,16 @@ struct Layout
             " before anything else and follow it; do not modify the project until the user confirms.";
     }
 
-    std::vector<std::string> expected_arguments() const
+    std::vector<std::string> expected_arguments(bool wake) const
     {
-        return {"--add-dir", utf8(brief.parent_path()), "--append-system-prompt", k_title_instruction,
-            "--plugin-dir", utf8(package_root / "assets/claude-hooks"), text()};
+        std::vector<std::string> arguments{
+            "--add-dir", utf8(brief.parent_path()), "--append-system-prompt", k_title_instruction,
+            "--plugin-dir", utf8(package_root / "assets/claude-hooks")};
+        if (wake) {
+            arguments.insert(arguments.end(), {"--plugin-dir", utf8(package_root / "assets/claude-wake-dispatch")});
+        }
+        arguments.push_back(text());
+        return arguments;
     }
 };
 
@@ -163,7 +169,8 @@ std::vector<std::string> prepare(
     const Layout&                   layout,
     const std::string&              runner,
     const std::string&              script,
-    const std::vector<std::string>& launcher_argv)
+    const std::vector<std::string>& launcher_argv,
+    bool                           wake)
 {
     addon::Prepare_request request;
     request.launcher          = {script, runner, ""};
@@ -180,6 +187,10 @@ std::vector<std::string> prepare(
     request.launch_environment = environment;
     request.launcher_argv      = launcher_argv;
     request.initial_prompt     = addon::Initial_prompt_request{layout.text(), utf8(layout.brief)};
+    if (wake) {
+        request.session_wake    = addon::Session_wake_offer{};
+        request.profile_storage = addon::Profile_storage_context{1, utf8(layout.root / "profile")};
+    }
 
     Context invocation;
     invocation.m_request.capability.capability_id = "launch-preparation";
@@ -193,6 +204,8 @@ std::vector<std::string> prepare(
     require(patch && addon::validate_launch_patch(*patch, {}, {}, &failure) &&
         addon::validate_initial_prompt_acknowledgment(request.initial_prompt, *patch, &failure),
         "host rejects the prepared patch: " + failure.reason_code + ": " + failure.detail);
+    require(!wake || (patch->session_wake && patch->session_wake->available),
+        "the wake-enabled initial prompt retains its negotiated bridge");
     return *patch->argv;
 }
 
@@ -443,12 +456,12 @@ struct Delivery_case
     std::size_t              shim_arguments = 0;   // leading recorded arguments a shim adds
 };
 
-void deliver(const Layout& layout, const Delivery_case& delivery)
+void deliver(const Layout& layout, const Delivery_case& delivery, bool wake)
 {
-    const auto argv = prepare(layout, delivery.runner, delivery.script, delivery.launcher_argv);
+    const auto argv = prepare(layout, delivery.runner, delivery.script, delivery.launcher_argv, wake);
     const auto capture = layout.root / "capture.jsonl";
     const auto record = run(argv, layout.root, delivery.path, capture);
-    auto expected = layout.expected_arguments();
+    auto expected = layout.expected_arguments(wake);
     std::vector<std::string> parses{"argv"};
 #ifdef _WIN32
     parses.push_back("command_line_argv");
@@ -462,7 +475,7 @@ void deliver(const Layout& layout, const Delivery_case& delivery)
         require(received == expected, delivery.name + ": Claude's " + parse + " differs\n  prepared: " +
             listing(argv) + "\n  received: " + listing(received) + "\n  expected: " + listing(expected));
     }
-    std::cout << "PASS " << delivery.name << '\n';
+    std::cout << "PASS " << delivery.name << (wake ? " with wake" : "") << '\n';
 }
 
 #ifdef _WIN32
@@ -526,7 +539,8 @@ void run_cases(const Layout& layout, const fs::path& fake_cli)
         std::cout << "SKIP pwsh launcher: pwsh.exe is not on PATH\n";
     }
     for (const auto& delivery : cases) {
-        deliver(layout, delivery);
+        deliver(layout, delivery, false);
+        deliver(layout, delivery, true);
     }
 }
 
@@ -546,7 +560,8 @@ void run_cases(const Layout& layout, const fs::path& fake_cli)
         {"sh launcher", "direct", "sh -c claude", {sh->string(), "-c", "claude"}, {native}},
     };
     for (const auto& delivery : cases) {
-        deliver(layout, delivery);
+        deliver(layout, delivery, false);
+        deliver(layout, delivery, true);
     }
 }
 

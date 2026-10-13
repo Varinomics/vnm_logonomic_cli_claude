@@ -6,6 +6,7 @@
 #include "claude_sessions.h"
 #include "claude_support.h"
 #include "claude_usage.h"
+#include "claude_wake.h"
 #include <logonomic_cli_addon/sha256.h>
 
 #include <logonomic_cli_addon/capability_ids.h>
@@ -18,10 +19,13 @@
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/probe_contracts.h>
 #include <logonomic_cli_addon/session_contracts.h>
+#include <logonomic_cli_addon/session_wake.h>
 #include <logonomic_cli_addon/sidecar.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -30,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -177,7 +182,7 @@ void launcher_contract()
     }
     const std::string session = "a375d05e-f6cf-4812-80f5-91b33d24c053";
     const auto resumed = claude::prepared_argv({"claude", "--system-prompt", "--append-system-prompt"},
-        "Logonomic instruction", std::string("C:/plugin root"), {"--resume", session});
+        "Logonomic instruction", {"C:/plugin root"}, {"--resume", session});
     const auto resumed_reading = claude_reading(*resumed);
     require(resumed_reading.operands.empty() &&
         resumed_reading.values("--system-prompt") == std::vector<std::string>{"--append-system-prompt"} &&
@@ -186,14 +191,20 @@ void launcher_contract()
         resumed_reading.values("--resume") == std::vector<std::string>{session},
         "a resume keeps an option value that reads like an option, and adds no prompt");
     const auto prepared = claude::prepared_argv({"claude", "--append-system-prompt", "User instruction"},
-        "Logonomic instruction", std::string("C:/plugin root"), {});
+        "Logonomic instruction", {"C:/plugin root"}, {});
     require(prepared && (*prepared)[2] == "User instruction Logonomic instruction", "preserve and append user instruction");
     require(prepared->at(prepared->size() - 2) == "--plugin-dir", "plugin flag appended");
+    const std::vector<std::string> plugins{"C:/plugin root", "C:/wake plugin"};
+    const auto both = claude::prepared_argv(*prepared, "Logonomic instruction", plugins, {});
+    require(both && claude_reading(*both).values("--plugin-dir") == plugins,
+        "preparation retains existing hooks and adds the negotiated wake plugin once");
+    require(claude::prepared_argv(*both, "Logonomic instruction", plugins, {}) == both,
+        "preparation does not duplicate either plugin directory");
     const auto shell = claude::prepared_argv({"powershell.exe", "-NoProfile", "-Command", "claude --model sonnet"},
-        "Owner's instruction", std::string("C:/Owner's plugin"), {});
+        "Owner's instruction", {"C:/Owner's plugin"}, {});
     require(shell && (*shell)[1] == "-NoProfile" && shell->back().find("Owner''s") != std::string::npos,
         "PowerShell prefix and apostrophes preserved");
-    require(!claude::prepared_argv({"bash", "-c", "claude; echo done"}, "Instruction", std::nullopt, {}),
+    require(!claude::prepared_argv({"bash", "-c", "claude; echo done"}, "Instruction", {}, {}),
         "control syntax is not rewritten");
     const std::string environment_prefix = "CLAUDE_CONFIG_DIR=";
     const std::string largest_path(addon::limits::k_max_environment_text_bytes - environment_prefix.size(), 'x');
@@ -779,6 +790,249 @@ void initial_prompt_contract()
         {
             require(acknowledged_argv(prepare("linux-x86_64", "direct", launcher, prompt), prompt).back() == prompt.text,
                 "a settings file, and an option value that reads like --agent, are the user's configuration");
+        }
+    }
+    catch (...) {
+        fs::remove_all(root);
+        throw;
+    }
+    fs::remove_all(root);
+}
+
+void wake_preparation_contract()
+{
+    const auto root = fs::temp_directory_path() / ("claude-wake-preparation-" + addon::random_nonce_hex());
+    fs::create_directories(root / "tools");
+    try {
+        addon::Prepare_request request;
+        request.launcher          = {"claude", "direct", ""};
+        request.launcher_argv     = {"claude"};
+        const auto directory_bytes = root.generic_u8string();
+        request.working_directory.assign(
+            reinterpret_cast<const char*>(directory_bytes.data()), directory_bytes.size());
+        request.title_instruction = "Set the session title.";
+        request.profile_storage   = addon::Profile_storage_context{1, claude::path_string(root / "profile")};
+        addon::Launch_environment environment;
+#ifdef _WIN32
+        environment.platform_id = "windows-x86_64";
+        const auto node = root / "tools/node.exe";
+#else
+        environment.platform_id = "linux-x86_64";
+        const auto node = root / "tools/node";
+#endif
+        std::ofstream(node).close();
+        environment.effective_environment = Json::object();
+        environment.effective_environment.set("PATH", Json(claude::path_string(root / "tools")));
+        environment.effective_environment.set("CLAUDE_CONFIG_DIR", Json(claude::path_string(root / "selected-profile")));
+        request.launch_environment = environment;
+        const auto prepare = [&]() {
+            Context invocation;
+            invocation.m_request.capability.capability_id = "launch-preparation";
+            invocation.m_request.operation = "prepare";
+            invocation.m_request.payload = addon::encode_prepare_request(request, 3);
+            claude::handle_preparation(invocation, root);
+            require(invocation.m_finished && invocation.m_status == addon::Result_status::SUCCESS,
+                "wake preparation preserves ordinary launch success");
+            const auto patch = addon::decode_launch_patch(invocation.m_payload, nullptr, 3);
+            require(patch.has_value(), "wake preparation produces a decodable launch patch");
+            return *patch;
+        };
+        const auto ordinary = prepare();
+        const std::string hooks = claude::path_string(root / "assets/claude-hooks");
+        const std::vector<std::string> plugins{hooks, claude::path_string(root / "assets/claude-wake-dispatch")};
+        require(!ordinary.session_wake && ordinary.argv &&
+            claude_reading(*ordinary.argv).values("--plugin-dir") == std::vector<std::string>{hooks},
+            "ordinary launches keep regular hooks without negotiating wake");
+
+        request.session_wake = addon::Session_wake_offer{};
+        const auto offered = prepare();
+        require(offered.session_wake && offered.session_wake->available && offered.argv &&
+            claude_reading(*offered.argv).values("--plugin-dir") == plugins,
+            "negotiated wake adds its native plugin alongside regular hooks");
+        const auto directory = addon::path_from_utf8(claude::text(offered.session_wake->binding, "directory"));
+        require(fs::is_directory(directory) && fs::canonical(directory) == directory &&
+            std::find(offered.set.begin(), offered.set.end(),
+                std::pair(std::string("VNM_CLAUDE_WAKE_DIRECTORY"), claude::path_string(directory))) != offered.set.end(),
+            "the wake binding and native plugin receive the same private directory");
+
+        addon::Resume_prepare_request resume;
+        resume.context.launcher          = request.launcher;
+        resume.context.launcher_argv     = request.launcher_argv;
+        resume.context.working_directory = request.working_directory;
+        resume.context.launch_environment = request.launch_environment;
+        resume.context.profile_storage   = request.profile_storage;
+        resume.context.session_wake      = request.session_wake;
+        resume.title_instruction = request.title_instruction;
+        resume.resume_record = claude::object(
+            R"({"provider_session_id":"a375d05e-f6cf-4812-80f5-91b33d24c053"})");
+        Context invocation;
+        invocation.m_request.capability.capability_id = "interactive-resume";
+        invocation.m_request.operation = "prepare_resume";
+        invocation.m_request.payload = addon::encode_resume_prepare_request(resume, 2);
+        claude::handle_preparation(invocation, root);
+        const auto resumed = addon::decode_resume_prepare_result(invocation.m_payload, nullptr, 2);
+        require(invocation.m_status == addon::Result_status::SUCCESS && resumed &&
+            resumed->patch.session_wake && resumed->patch.session_wake->available,
+            "resume negotiates wake through its launch context");
+        auto resumed_argv = resumed->process.argv;
+        resumed_argv.insert(resumed_argv.begin(), "claude");
+        const auto reading = claude_reading(resumed_argv);
+        require(reading.values("--plugin-dir") == plugins && reading.operands.empty() &&
+            reading.values("--resume") == std::vector<std::string>{"a375d05e-f6cf-4812-80f5-91b33d24c053"},
+            "wake resume retains both plugins and the exact session selector without a prompt");
+
+        request.profile_storage.reset();
+        require(!prepare().session_wake->available, "wake without profile storage is unavailable");
+        request.profile_storage = resume.context.profile_storage;
+        request.launcher_argv = {"echo", "claude"};
+        require(!prepare().session_wake->available, "an unsupported launcher cannot offer wake");
+        request.launcher_argv = {"claude"};
+        fs::remove(node);
+        const auto no_node = prepare();
+        require(!no_node.session_wake->available && no_node.argv &&
+            claude_reading(*no_node.argv).values("--plugin-dir").empty(),
+            "missing Node leaves launch available and wake unavailable");
+    }
+    catch (...) {
+        fs::remove_all(root);
+        throw;
+    }
+    fs::remove_all(root);
+}
+
+Context wake_invocation(const std::string& operation, Json payload)
+{
+    Context invocation;
+    invocation.m_request.capability.capability_id = "session-wake";
+    invocation.m_request.operation = operation;
+    invocation.m_request.payload = std::move(payload);
+    claude::handle_wake(invocation);
+    return invocation;
+}
+
+void wake_binding_contract()
+{
+    const auto root = fs::temp_directory_path() / ("claude-wake-binding-" + addon::random_nonce_hex());
+    fs::create_directories(root);
+    try {
+        addon::Session_wake_target target;
+        target.provider_session_id = "a375d05e-f6cf-4812-80f5-91b33d24c053";
+        target.working_directory   = claude::path_string(root);
+        target.launcher_argv       = {"claude"};
+        target.correlation.transition_nonce = addon::random_nonce_hex();
+#ifdef _WIN32
+        target.launch_environment.platform_id = "windows-x86_64";
+#else
+        target.launch_environment.platform_id = "linux-x86_64";
+#endif
+        target.launch_environment.effective_environment = Json::object();
+        target.binding.set("directory", Json(claude::path_string(fs::canonical(root))));
+        const auto notify = [&]() {
+            return addon::encode_session_wake_notify_request(
+                {target, "notification-a", "Read the pending inbox message."});
+        };
+        const auto unavailable = [&]() {
+            const auto inspected = wake_invocation("inspect", addon::encode_session_wake_inspect_request({target}));
+            const auto readiness = addon::decode_session_wake_readiness(inspected.m_payload, nullptr);
+            require(inspected.m_status == addon::Result_status::SUCCESS && readiness && !readiness->available,
+                "a wake bridge without exact registration is not ready");
+            const auto notified = wake_invocation("notify", notify());
+            const auto result = addon::decode_session_wake_notify_result(notified.m_payload, nullptr);
+            require(notified.m_status == addon::Result_status::SUCCESS && result &&
+                result->disposition == addon::Session_wake_disposition::UNAVAILABLE,
+                "a wake bridge without exact registration cannot submit");
+            for (const auto& entry : fs::directory_iterator(root)) {
+                require(entry.path().filename() == "registration.json",
+                    "an unbound wake cannot publish a native request");
+            }
+        };
+        unavailable();
+        const auto register_target = [&](const std::string& session, const std::string& nonce) {
+            Json registration = Json::object();
+            registration.set("provider_session_id", Json(session));
+            registration.set("transition_nonce", Json(nonce));
+            std::ofstream(root / "registration.json", std::ios::binary) << addon::serialize_json(registration);
+        };
+        register_target("another-session", target.correlation.transition_nonce);
+        unavailable();
+        register_target(target.provider_session_id, addon::random_nonce_hex());
+        unavailable();
+        register_target(target.provider_session_id, target.correlation.transition_nonce);
+        const auto valid_binding = target.binding;
+        target.binding = Json::object();
+        unavailable();
+        target.binding.set("directory", Json("relative/bridge"));
+        unavailable();
+        target.binding.set("directory", Json(claude::path_string(root / "missing")));
+        unavailable();
+        target.binding = valid_binding;
+
+        auto malformed = notify();
+        malformed.erase("instruction");
+        const auto refused = wake_invocation("notify", std::move(malformed));
+        require(refused.m_status == addon::Result_status::FAILED && !refused.m_reason.empty(),
+            "malformed wake requests fail before bridge submission");
+        const auto bad_inspect = wake_invocation("inspect", Json::object());
+        require(bad_inspect.m_status == addon::Result_status::FAILED,
+            "inspect requires the full session and correlation contract");
+
+        for (const std::string operation : {"inspect", "notify"}) {
+            std::optional<Json> received;
+            std::exception_ptr bridge_error;
+            std::jthread bridge([&](std::stop_token stop) {
+                try {
+                    while (!stop.stop_requested()) {
+                        for (const auto& entry : fs::directory_iterator(root)) {
+                            if (entry.path().extension() != ".request") continue;
+                            const auto pending = entry.path();
+                            auto claimed = pending;
+                            claimed.replace_extension(".claimed");
+                            fs::rename(pending, claimed);
+                            std::ifstream input(claimed, std::ios::binary);
+                            const std::string bytes{
+                                std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+                            received = addon::parse_json(bytes, addon::Json_parse_limits{}, nullptr);
+                            const auto response = operation == "inspect"
+                                ? addon::encode_session_wake_readiness({true, {}})
+                                : addon::encode_session_wake_notify_result(
+                                      {addon::Session_wake_disposition::ACCEPTED, {}, "native-receipt"});
+                            auto writing = pending;
+                            writing.replace_extension(".writing");
+                            std::ofstream(writing, std::ios::binary) << addon::serialize_json(response);
+                            auto destination = pending;
+                            destination.replace_extension(".response");
+                            fs::rename(writing, destination);
+                            return;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                }
+                catch (...) {
+                    bridge_error = std::current_exception();
+                }
+            });
+            const auto invocation = wake_invocation(operation, operation == "inspect"
+                ? addon::encode_session_wake_inspect_request({target}) : notify());
+            bridge.request_stop();
+            bridge.join();
+            if (bridge_error) {
+                std::rethrow_exception(bridge_error);
+            }
+            require(received && claude::text(*received, "operation") == operation,
+                "matching session identity and nonce reach the native bridge");
+            const auto* payload = received->find("payload");
+            require(payload && payload->find("session") &&
+                payload->find("session")->as_object().size() == 1 && !payload->find("binding"),
+                "native wake requests exclude launcher environment and private host binding");
+            if (operation == "inspect") {
+                const auto readiness = addon::decode_session_wake_readiness(invocation.m_payload, nullptr);
+                require(readiness && readiness->available, "native readiness is returned to the host");
+            }
+            else {
+                const auto result = addon::decode_session_wake_notify_result(invocation.m_payload, nullptr);
+                require(result && result->disposition == addon::Session_wake_disposition::ACCEPTED &&
+                    result->receipt == "native-receipt", "native acceptance and receipt are preserved");
+            }
         }
     }
     catch (...) {
@@ -2057,6 +2311,8 @@ int main(int argc, char** argv)
         launcher_discovery_scan_limit();
         launcher_directory_contract();
         initial_prompt_contract();
+        wake_preparation_contract();
+        wake_binding_contract();
         lifecycle_contract();
         declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
         structured_contract();

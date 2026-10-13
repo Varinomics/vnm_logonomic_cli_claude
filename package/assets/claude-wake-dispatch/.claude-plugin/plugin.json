@@ -1,0 +1,6 @@
+{
+  "name": "logonomic-wake-dispatch",
+  "version": "1.0.0",
+  "description": "Submits admitted Logonomic mailbox notifications",
+  "dependencies": ["logonomic-claude-hooks"]
+}
