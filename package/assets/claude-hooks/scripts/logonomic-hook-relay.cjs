@@ -11,6 +11,7 @@ const event_budgets = Object.freeze({
     SubagentStart: 12000,
     SubagentStop: 12000,
     Stop: 12000,
+    ModTurnComplete: 12000,
     StopFailure: 12000,
     PermissionRequest: 12000,
     PreToolUse: 12000,
@@ -28,7 +29,11 @@ function relay_hook(payload, options = {})
     const directory = environment.LOGONOMIC_PROVIDER_HELPERS_DIR || "";
     if (!path.isAbsolute(directory) || !environment.LOGONOMIC_SESSION_CAPABILITY) return Promise.resolve("");
     const executable = path.join(directory, process.platform === "win32" ? "claude_helper.exe" : "claude_helper");
-    const input = JSON.stringify(payload);
+    // Native ownership comes from the Mod's direct helper invocation. A Node
+    // launcher may interpose here, so neither its PID nor payload data owns it.
+    const owned_payload = { ...payload };
+    delete owned_payload.native_owner_pid;
+    const input = JSON.stringify(owned_payload);
     if (Buffer.byteLength(input) > max_input_bytes) return Promise.resolve("");
     return new Promise((resolve) => {
         let child;

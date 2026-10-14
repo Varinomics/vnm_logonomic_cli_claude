@@ -27,6 +27,13 @@ async function claim(value) {
 }
 
 async function run() {
+    const delayed = path.join(directory, 'd'.repeat(32));
+    const startup = main(['ready', delayed], JSON.stringify({ session_id: 'native-root' }));
+    assert.equal(fs.existsSync(delayed), false);
+    fs.mkdirSync(delayed);
+    assert.deepEqual(await startup, { completed: true });
+    await main(['close', delayed], '');
+    assert.equal(fs.existsSync(delayed), false);
     fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify(registration));
     assert.deepEqual(await main(['inspect-dispatch', directory], JSON.stringify({ session_id: 'native-root' })), { available: false });
     await main(['ready', directory], JSON.stringify({ session_id: 'native-root' }));
@@ -75,6 +82,7 @@ async function run() {
     fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ ...registration, provider_session_id: 'new-session' }));
     assert.deepEqual(await main(['activate', directory, changed.id], ''), { available: false });
     await assert.rejects(main(['guard-request', directory], ''));
+    fs.writeFileSync(path.join(directory, 'dispatch-ready.json.' + 'e'.repeat(32)), '{}');
     await main(['close', directory], '');
     assert.equal(fs.existsSync(directory), false);
     process.stdout.write('Claude wake transport: correlation, native handoff, replay, expiry and teardown passed.\n');

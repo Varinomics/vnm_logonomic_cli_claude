@@ -88,6 +88,21 @@ async function listen($) {
 }
 
 export function register(on) {
+    on('classic.SessionStart', async ($, event, next) => {
+        if (!event.agent_id) {
+            try {
+                const helper = await $.env.get('VNM_CLAUDE_WAKE_OWNER_HELPER');
+                if (helper) {
+                    // Native argv execution has no shell or PATH Node shim.
+                    // Anchor the CLI before next runs the classic relay, which
+                    // allocates storage only after the host accepts its start.
+                    await $.process.run([helper, 'wake-owner'], { timeoutMs: 5000 });
+                }
+            }
+            catch { /* An unavailable owner disables wake alone. */ }
+        }
+        return next(event);
+    });
     on('session.start', async ($, event, next) => {
         directory = await $.env.get('VNM_CLAUDE_WAKE_DIRECTORY');
         if (directory && event.isInteractive) {
@@ -111,12 +126,28 @@ export function register(on) {
         busy = true;
         return next(event);
     });
-    on('turn.complete', ($, event, next) => {
+    on('turn.complete', async ($, event, next) => {
+        const completed_id = native_id;
         if (!event.agentId) {
             busy = false;
             paused = event.reason !== 'answer';
         }
-        return next(event);
+        const result = await next(event);
+        if (!event.agentId && event.reason === 'answer' && active && native_id === completed_id &&
+            await $.session.id() === completed_id)
+        {
+            try {
+                // Classic Stop hooks precede this native completion. Their ACK
+                // may already have retried while we were still busy. Publish a
+                // fresh authenticated event only after native readiness changes.
+                await $.process.run(['node', `${$.plugin.root}/scripts/logonomic-hook-relay.cjs`], {
+                    stdin: JSON.stringify({ hook_event_name: 'ModTurnComplete', session_id: completed_id, reason: 'answer' }),
+                    timeoutMs: 13000,
+                });
+            }
+            catch { /* Notification failure must not change the completed turn. */ }
+        }
+        return result;
     });
     on('prompt.submit', async ($, event, next) => {
         if (event.origin.kind === 'composer' || event.origin.kind === 'bridge') paused = false;

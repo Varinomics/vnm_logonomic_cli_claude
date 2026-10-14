@@ -10,7 +10,7 @@ const environment = {
     LOGONOMIC_PROVIDER_HELPERS_DIR: path.resolve("helpers"),
     LOGONOMIC_SESSION_CAPABILITY: "bound-session",
 };
-function fake_spawn(response, exit_code = 0)
+function fake_spawn(response, exit_code = 0, event_name = "UserPromptSubmit", observe = () => {})
 {
     return (program, args, options) => {
         assert.equal(path.basename(program), process.platform === "win32" ? "claude_helper.exe" : "claude_helper");
@@ -20,7 +20,9 @@ function fake_spawn(response, exit_code = 0)
         child.stdin = new PassThrough();
         child.stdout = new PassThrough();
         child.stdin.once("data", (bytes) => {
-            assert.equal(JSON.parse(bytes).hook_event_name, "UserPromptSubmit");
+            const event = JSON.parse(bytes);
+            assert.equal(event.hook_event_name, event_name);
+            observe(event);
             queueMicrotask(() => {
                 child.stdout.emit("data", Buffer.from(response));
                 child.emit("close", exit_code);
@@ -36,4 +38,15 @@ assert.equal(await relay_hook(payload, { environment, spawn: fake_spawn(accepted
 assert.equal(await relay_hook(payload, { environment, spawn: fake_spawn('{"accepted":true}') }), "");
 assert.equal(await relay_hook(payload, { environment, spawn: fake_spawn("x".repeat(65537)) }), "");
 assert.equal(await relay_hook(payload, { environment: {}, spawn() { throw new Error("must not spawn"); } }), "");
+for (const event_name of ["SessionStart", "SessionEnd"]) {
+    assert.equal(await relay_hook({ hook_event_name: event_name, native_owner_pid: -1 }, {
+        environment, spawn: fake_spawn("", 0, event_name, event => assert.equal(event.native_owner_pid, undefined)),
+    }), "");
+}
+assert.equal(await relay_hook({ hook_event_name: "ModTurnComplete", session_id: "SessionCase", reason: "answer", native_owner_pid: -1 }, {
+    environment, spawn: fake_spawn("", 0, "ModTurnComplete", event => {
+        assert.equal(event.reason, "answer");
+        assert.equal(event.native_owner_pid, undefined);
+    }),
+}), "");
 console.log("Claude hook response contract checks passed.");

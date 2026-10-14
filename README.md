@@ -51,6 +51,17 @@ mean the agent read or acknowledged the mailbox. A lost native result is reporte
 as uncertain and retained against the notification ID to prevent automatic
 duplicate submission.
 
+Wake storage is allocated only after an authenticated native session start.
+The Mod anchors native process birth identity through a direct packaged helper
+before the classic SessionStart relay runs; Node launchers cannot become the
+owner. Without that native anchor, no wake directory is allocated. The ordinary
+SessionEnd hook removes its binding even when Mods are subsequently disabled;
+later preparation reclaims bindings whose recorded owners have exited.
+Unverifiable ownership is retained rather than expiring live sessions by age.
+After a native root answer completes, the Mod publishes an authenticated
+completion event so pending mail is rechecked after its busy state clears;
+the earlier classic Stop hook alone cannot establish that readiness.
+
 The package recipe proves the Windows/Linux x86-64 compiler target during
 configuration. `cmake --install` exports a fresh artifact beneath its install-time
 prefix and preserves executable permissions. An existing per-package destination,

@@ -123,6 +123,9 @@ std::optional<addon::Json_value> read_event(bool watch_parent)
 
 int run_helper(int argc, char** argv)
 {
+    if (argc == 2 && std::string_view(argv[1]) == "wake-owner") {
+        return anchor_wake_owner() ? 0 : addon::k_helper_exit_invalid_arguments;
+    }
 #if defined(_WIN32)
     if (_setmode(_fileno(stdin), _O_BINARY) == -1 ||
         _setmode(_fileno(stdout), _O_BINARY) == -1)
@@ -194,6 +197,9 @@ int run_helper(int argc, char** argv)
     if (name == "SessionStart" && outcome.accepted) {
         register_wake(*event, nonce);
         if (!emit_context()) return addon::k_helper_exit_transport_failure;
+    }
+    if (name == "SessionEnd" && outcome.accepted) {
+        unregister_wake(*event);
     }
     // Consumption releases the host's retained private response. A failed
     // acknowledgement does not undo an already committed delivery.

@@ -850,10 +850,24 @@ void wake_preparation_contract()
             claude_reading(*offered.argv).values("--plugin-dir") == plugins,
             "negotiated wake adds its native plugin alongside regular hooks");
         const auto directory = addon::path_from_utf8(claude::text(offered.session_wake->binding, "directory"));
-        require(fs::is_directory(directory) && fs::canonical(directory) == directory &&
+        require(!fs::exists(directory) && fs::canonical(directory.parent_path()) == directory.parent_path() &&
             std::find(offered.set.begin(), offered.set.end(),
                 std::pair(std::string("VNM_CLAUDE_WAKE_DIRECTORY"), claude::path_string(directory))) != offered.set.end(),
-            "the wake binding and native plugin receive the same private directory");
+            "preparation reserves the same private path for binding and native plugin without allocating it");
+#ifdef _WIN32
+        const auto owner_helper = root / "helpers/claude_helper.exe";
+#else
+        const auto owner_helper = root / "helpers/claude_helper";
+#endif
+        require(std::find(offered.set.begin(), offered.set.end(),
+            std::pair(std::string("VNM_CLAUDE_WAKE_OWNER_HELPER"), claude::path_string(fs::absolute(owner_helper)))) !=
+                offered.set.end(), "the Mod receives the absolute packaged helper without a PATH-resolved launcher");
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const auto delayed = prepare();
+            require(!fs::exists(addon::path_from_utf8(claude::text(delayed.session_wake->binding, "directory"))),
+                "a discarded or delayed preparation does not allocate a wake directory");
+        }
+        require(fs::is_empty(directory.parent_path()), "unused preparations leave no per-launch artifacts");
 
         addon::Resume_prepare_request resume;
         resume.context.launcher          = request.launcher;
@@ -1044,6 +1058,26 @@ void wake_binding_contract()
 
 void lifecycle_contract()
 {
+    {
+        addon::Classify_event_request request;
+        request.event.name = "ModTurnComplete";
+        request.event.body = claude::object(
+            R"({"hook_event_name":"ModTurnComplete","session_id":"native-session","reason":"answer"})");
+        const auto result = claude::classify_event(request);
+        require(result.classification == addon::Classification::EVENT && result.observations.size() == 1,
+            "a native Mod completion publishes a root lifecycle event");
+        const auto& observation = result.observations.front();
+        require(observation.phase_transition == addon::Phase_transition::AWAITING_INPUT &&
+            observation.phase_evidence == addon::Evidence::CONFIRMED && observation.provider_turn_id.empty() &&
+            observation.outcome_transition == addon::Outcome_transition::NONE &&
+            observation.attention_transition == addon::Attention_transition::NONE,
+            "Mod completion confirms readiness without inventing turn outcome or attention");
+        request.event.body.set("reason", Json("interrupted"));
+        require(claude::classify_event(request).observations.empty(), "interruption does not confirm Mod readiness");
+        request.event.body.set("reason", Json("answer"));
+        request.event.body.set("agent_id", Json("child"));
+        require(claude::classify_event(request).observations.empty(), "a child completion cannot confirm root readiness");
+    }
     for (const auto& [tool_name, kind] : std::vector<std::pair<std::string, std::string>>{
             {"ExitPlanMode", "permission"}, {"AskUserQuestion", "interactive_question"}})
     {

@@ -190,7 +190,9 @@ if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME claude_helper_tests COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_helper_tests.py"
-        "$<TARGET_FILE:claude_helper>" "$<TARGET_FILE:claude_fake_vnmctl>")
+        "$<TARGET_FILE:claude_helper>" "$<TARGET_FILE:claude_fake_vnmctl>"
+        "${CLAUDE_PACKAGE_DIRECTORY}/adapter/claude_adapter${CLAUDE_EXECUTABLE_SUFFIX}"
+        "${CLAUDE_PACKAGE_DIRECTORY}/assets/claude-hooks/scripts/logonomic-hook-relay.cjs")
     add_test(NAME claude_package_validation COMMAND logonomic_cli_addon_validate
         "${CLAUDE_PACKAGE_DIRECTORY}" --platform "${CLAUDE_PLATFORM}")
     add_test(NAME claude_package_conformance COMMAND logonomic_cli_addon_conformance

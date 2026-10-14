@@ -21,7 +21,10 @@ int main(int argc, char** argv)
     if (argc < 2 || capture.empty()) return 2;
     const std::string operation = argv[1];
     if (operation == "provider-event" && argc == 4 && std::string(argv[2]) == "acknowledge") {
-        std::ofstream(capture, std::ios::app) << "{\"operation\":\"acknowledge\"}\n";
+        auto record = addon::Json_value::object();
+        record.set("operation", addon::Json_value("acknowledge"));
+        record.set("idempotency_key", addon::Json_value(argv[3]));
+        std::ofstream(capture, std::ios::app) << addon::serialize_json(record) << '\n';
         return 0;
     }
     const std::string bytes{std::istreambuf_iterator<char>(std::cin), {}};

@@ -1,16 +1,176 @@
 """Exercise the actual helper and SDK wrapper transport, without real sessions."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
+
+
+def launch_options():
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
+def relay_through_launcher(relay, payload, environment=None):
+    process = subprocess.Popen([sys.executable, __file__, "--launcher", str(relay)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+        **launch_options())
+    stdout, stderr = process.communicate(json.dumps(payload).encode("utf-8"), timeout=25)
+    assert process.returncode == 0, stderr.decode("utf-8", errors="replace")
+    return process.pid, stdout
+
+
+def native_owner_fixture(helper, relay):
+    for line in sys.stdin:
+        event = json.loads(line)
+        if event["hook_event_name"] == "SessionStart":
+            result = subprocess.run([helper, "wake-owner"], capture_output=True, timeout=5, **launch_options())
+            assert result.returncode == 0, result.stderr
+        launcher_pid, _ = relay_through_launcher(relay, event)
+        print(json.dumps({"owner_pid": os.getpid(), "launcher_pid": launcher_pid}), flush=True)
+
+
+class Adapter:
+    def __init__(self, executable):
+        self.process = subprocess.Popen([str(executable)], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **launch_options())
+        self.serial = 0
+        self.send({"type": "hello", "core_protocol_generations": [1], "package_id": "logonomic.cli.claude",
+            "generation_digest": hashlib.sha256(executable.read_bytes()).hexdigest(),
+            "generation_nonce": uuid.uuid4().hex,
+            "limits": {"max_frame_bytes": 4194304, "max_json_depth": 32,
+                "max_in_flight_requests": 64, "max_progress_frames_per_request": 100000},
+            "host": {"product": "logonomic", "version": "1.0.0"}})
+        assert self.read()["type"] == "hello"
+        assert self.read()["type"] == "capabilities"
+
+    def send(self, frame):
+        self.process.stdin.write((json.dumps(frame) + "\n").encode("utf-8"))
+        self.process.stdin.flush()
+
+    def read(self):
+        frame = self.process.stdout.readline()
+        assert frame, "adapter closed before its response"
+        return json.loads(frame)
+
+    def prepare(self, profile):
+        self.serial += 1
+        request_id = "r" + str(self.serial)
+        self.send({"type": "invoke", "request_id": request_id, "capability_id": "launch-preparation",
+            "version": 3, "operation": "prepare", "deadline_ms": 5000, "payload": {
+                "launcher": {"script_body": "claude", "runner_key": "direct", "environment_text": ""},
+                "working_directory": str(profile.parent), "title_instruction": "Set the session title.",
+                "declared_assets": [], "profile_storage": {"version": 1, "root": str(profile)},
+                "launcher_argv": ["claude"], "session_wake": {"version": 1},
+                "launch_environment": {"platform": "windows-x86_64" if os.name == "nt" else "linux-x86_64",
+                    "effective_environment": {"PATH": os.environ["PATH"]}}}})
+        while True:
+            response = self.read()
+            if response["type"] == "result":
+                assert response["request_id"] == request_id and response["status"] == "success", response
+                assert response["payload"]["session_wake"]["available"], response
+                return response["payload"]["environment"]["set"]
+
+    def close(self):
+        self.send({"type": "shutdown", "grace_ms": 5000})
+        self.process.stdin.close()
+        assert self.process.wait(timeout=10) == 0
+
+
+def sweep_policy(adapter, profile, parent, pid, birth):
+    def marker(directory, native_live, registrar_live):
+        file = parent / (directory.name + f".{pid}.{birth}" + ("" if native_live else "0") +
+            f".{pid}.{birth}" + ("" if registrar_live else "0") + ".owner")
+        file.touch()
+        return file
+
+    live, publishing, dead, unowned, malformed, never_created = [parent / uuid.uuid4().hex for _ in range(6)]
+    for directory in (live, publishing, dead, unowned, malformed):
+        directory.mkdir()
+    live_marker = marker(live, True, False)
+    publishing_marker = marker(publishing, False, True)
+    dead_marker = marker(dead, False, False)
+    pending_marker = marker(never_created, False, False)
+    malformed_marker = parent / (malformed.name + ".invalid.owner")
+    malformed_marker.touch()
+    for name in ("registration.json", "active.json." + uuid.uuid4().hex,
+                 uuid.uuid4().hex + ".request", "a" * 64 + ".receipt." + uuid.uuid4().hex):
+        (dead / name).write_text("{}", encoding="utf-8")
+    adapter.prepare(profile)
+    assert live.is_dir() and live_marker.is_file(), "alive native ownership was swept"
+    assert publishing.is_dir() and publishing_marker.is_file(), "alive registrar no longer protects publication"
+    assert unowned.is_dir() and malformed.is_dir() and malformed_marker.is_file(), "unknown ownership was swept"
+    assert not dead.exists() and not dead_marker.exists() and not pending_marker.exists(), "dead ownership leaked"
+
+
+def wake_owner_contract(helper, executable, relay, environment, root):
+    adapter = Adapter(executable)
+    environment = {**environment, "LOGONOMIC_PROVIDER_HELPERS_DIR": str(executable.parent.parent / "helpers")}
+    profile = root / "profile"
+    start = {"hook_event_name": "SessionStart", "session_id": "outer-session", "source": "startup"}
+    try:
+        unanchored = adapter.prepare(profile)
+        wake = Path(unanchored["VNM_CLAUDE_WAKE_DIRECTORY"])
+        relay_through_launcher(relay, {**start, "native_owner_pid": os.getpid()}, {**environment, **unanchored})
+        assert not wake.exists() and not list(wake.parent.iterdir()), "disabled Mods allocated wake storage"
+
+        for crash in (False, True):
+            prepared = adapter.prepare(profile)
+            wake = Path(prepared["VNM_CLAUDE_WAKE_DIRECTORY"])
+            native_helper = Path(prepared["VNM_CLAUDE_WAKE_OWNER_HELPER"])
+            assert native_helper.is_absolute() and native_helper.samefile(executable.parent.parent / "helpers" / helper.name)
+            owner = subprocess.Popen([sys.executable, __file__, "--native-owner", str(native_helper), str(relay)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={**environment, **prepared}, text=True, **launch_options())
+
+            def event(payload):
+                owner.stdin.write(json.dumps(payload) + "\n")
+                owner.stdin.flush()
+                return json.loads(owner.stdout.readline())
+
+            try:
+                launched = event(start)
+                registration = json.loads((wake / "registration.json").read_text(encoding="utf-8"))
+                assert registration["owner_pid"] == owner.pid != launched["launcher_pid"], registration
+                assert owner.poll() is None
+                adapter.prepare(profile)
+                assert wake.is_dir(), "an exited intermediate launcher caused live-session cleanup"
+                if crash:
+                    owner.kill()
+                    owner.communicate(timeout=10)
+                    adapter.prepare(profile)
+                    assert not wake.exists() and not list(wake.parent.glob(wake.name + ".*.owner")), \
+                        "a dead native owner left its directory or owner markers"
+                else:
+                    sweep_policy(adapter, profile, wake.parent, owner.pid, registration["owner_birth"])
+                    event({**start, "session_id": "cleared-session", "source": "clear"})
+                    registration = json.loads((wake / "registration.json").read_text(encoding="utf-8"))
+                    assert registration["provider_session_id"] == "cleared-session" and registration["owner_pid"] == owner.pid
+                    end = {"hook_event_name": "SessionEnd", "session_id": "outer-session", "reason": "exit"}
+                    event(end)
+                    assert wake.is_dir(), "an old session end removed the replacement session"
+                    event({**end, "session_id": "cleared-session"})
+                    assert not wake.exists() and not list(wake.parent.glob(wake.name + ".*.owner")), \
+                        "SessionEnd through a new intermediate launcher failed to clean stable native ownership"
+                    owner.stdin.close()
+                    owner.stdin = None
+                    _, stderr = owner.communicate(timeout=10)
+                    assert owner.returncode == 0, stderr
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.communicate(timeout=10)
+    finally:
+        adapter.close()
 
 
 def main():
-    helper, wrapper = (Path(value).resolve() for value in sys.argv[1:3])
+    helper, wrapper, adapter, relay = (Path(value).resolve() for value in sys.argv[1:5])
     with tempfile.TemporaryDirectory(prefix="claude-helper-") as temporary:
         capture = Path(temporary) / "requests.jsonl"
         environment = {
@@ -76,6 +236,31 @@ def main():
         result, records, _ = run(start, CLAUDE_TEST_LIFECYCLE="refused")
         assert result.stdout == "" and all(item["operation"] != "request-title-instruction" for item in records)
 
+        completion = {"hook_event_name": "ModTurnComplete", "session_id": "new-session", "reason": "answer"}
+        result, records, _ = run(completion)
+        assert result.returncode == 0 and result.stdout == ""
+        assert [item["operation"] for item in records] == ["provider-event", "acknowledge"]
+        assert records[0]["request"]["event"]["body"]["reason"] == "answer"
+        assert "prompt_id" not in records[0]["request"]["event"]["body"]
+
+        wake_parent = Path(temporary).resolve() / "wake"
+        wake_parent.mkdir()
+        wake_directory = wake_parent / ("d" * 32)
+        anchor = subprocess.run([str(helper), "wake-owner"], capture_output=True, timeout=5,
+            env={**environment, "VNM_CLAUDE_WAKE_DIRECTORY": str(wake_directory)}, **launch_options())
+        assert anchor.returncode == 0 and not wake_directory.exists(), "native anchor allocated before host acceptance"
+        result, _, _ = run(start, VNM_CLAUDE_WAKE_DIRECTORY=str(wake_directory),
+                           CLAUDE_TEST_LIFECYCLE="refused")
+        assert not wake_directory.exists(), "refused native start allocated wake storage"
+        result, _, _ = run(start, VNM_CLAUDE_WAKE_DIRECTORY=str(wake_directory))
+        assert result.returncode == 0 and (wake_directory / "registration.json").is_file()
+        end = {"hook_event_name": "SessionEnd", "session_id": "other-session", "reason": "exit"}
+        run(end, VNM_CLAUDE_WAKE_DIRECTORY=str(wake_directory))
+        assert wake_directory.is_dir(), "unrelated session end removed a live binding"
+        run({**end, "session_id": "new-session"}, VNM_CLAUDE_WAKE_DIRECTORY=str(wake_directory))
+        assert not wake_directory.exists() and not list(wake_parent.iterdir())
+        wake_owner_contract(helper, adapter, relay, environment, Path(temporary).resolve())
+
         capture.write_text("", encoding="utf-8")
         process = subprocess.Popen([str(helper), "event", "--watch-parent"], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -100,4 +285,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1] == "--launcher":
+        result = subprocess.run([shutil.which("node"), sys.argv[2]], input=sys.stdin.buffer.read(),
+            capture_output=True, timeout=25, **launch_options())
+        sys.stdout.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        raise SystemExit(result.returncode)
+    if sys.argv[1] == "--native-owner":
+        native_owner_fixture(sys.argv[2], sys.argv[3])
+    else:
+        main()

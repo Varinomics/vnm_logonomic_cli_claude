@@ -462,7 +462,7 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
                 result.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(launch)));
             }
         }
-        if (input->session_wake) prepare_wake(result, input->profile_storage, argv.has_value() && hooks);
+        if (input->session_wake) prepare_wake(result, input->profile_storage, argv.has_value() && hooks, package_root);
         if (input->initial_prompt) {
             // The host holds a patch to the same bounds; one over them would
             // fail the launch after this package acknowledged the prompt.
@@ -511,7 +511,7 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
     result.patch.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(input->context)));
     result.patch.profile_storage = input->context.profile_storage;
     result.patch.account_context = input->context.account_context;
-    if (input->context.session_wake) prepare_wake(result.patch, input->context.profile_storage, true);
+    if (input->context.session_wake) prepare_wake(result.patch, input->context.profile_storage, true, package_root);
     result.patch.set.emplace_back("CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS", "5000");
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(input->resume_record);
     context.succeed(addon::encode_resume_prepare_result(result, 2));

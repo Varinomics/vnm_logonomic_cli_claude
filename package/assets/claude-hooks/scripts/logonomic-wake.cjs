@@ -49,7 +49,29 @@ function claim(directory, suffix) {
     return null;
 }
 
-async function listen(directory, suffix) {
+async function wait_for_directory(directory, deadline) {
+    if (fs.existsSync(directory)) return;
+    const parent = path.dirname(directory);
+    if (!/^[0-9a-f]{32}$/.test(path.basename(directory)) ||
+        path.normalize(fs.realpathSync(parent)) !== path.normalize(parent)) throw new Error('invalid_directory');
+    await new Promise((resolve, reject) => {
+        let done = false;
+        const finish = error => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            watcher.close();
+            if (error) reject(error); else resolve();
+        };
+        const scan = () => { if (fs.existsSync(directory)) finish(); };
+        const watcher = fs.watch(parent, scan);
+        const timer = setTimeout(() => finish(new Error('registration_unavailable')), Math.max(0, deadline - Date.now()));
+        watcher.on('error', finish);
+        scan();
+    });
+}
+
+async function listen(directory, suffix, timeout_ms) {
     const first = claim(directory, suffix);
     if (first) return first;
     return new Promise((resolve, reject) => {
@@ -69,7 +91,7 @@ async function listen(directory, suffix) {
             catch (error) { finish(null, error); }
         };
         const watcher = fs.watch(directory, scan);
-        const timer = setTimeout(() => finish(null), 20000);
+        const timer = setTimeout(() => finish(null), timeout_ms);
         watcher.on('error', error => finish(null, error));
         // Close the gap between the first scan and installing the watcher.
         scan();
@@ -117,10 +139,17 @@ function receipt_path(directory, notification_id) {
 
 async function main(argv, input) {
     const [operation, directory, id] = argv;
-    if (!path.isAbsolute(directory) || fs.lstatSync(directory).isSymbolicLink() ||
+    const deadline = Date.now() + 20000;
+    if (!path.isAbsolute(directory)) throw new Error('invalid_directory');
+    if (!fs.existsSync(directory) && (operation === 'listen' || operation === 'receive' || operation === 'ready')) {
+        // Preparation reserves only a path. The authenticated SessionStart
+        // helper creates it after the native process actually starts.
+        await wait_for_directory(directory, deadline);
+    }
+    if (fs.lstatSync(directory).isSymbolicLink() ||
         path.normalize(fs.realpathSync(directory)) !== path.normalize(directory)) throw new Error('invalid_directory');
     if (operation === 'listen' || operation === 'receive') {
-        return listen(directory, operation === 'listen' ? 'request' : 'submit');
+        return listen(directory, operation === 'listen' ? 'request' : 'submit', Math.max(0, deadline - Date.now()));
     }
     if (operation === 'ready') {
         atomic_json(path.join(directory, 'dispatch-ready.json'), {
@@ -144,9 +173,10 @@ async function main(argv, input) {
     }
     if (operation === 'close') {
         for (const name of fs.readdirSync(directory)) {
-            if (['registration.json', 'dispatch-ready.json', 'active.json'].includes(name) ||
-                /^[0-9a-f]{32}\.(request|claimed|response|writing|registration|submit|submitted|native-response)$/.test(name) ||
-                /^[0-9a-f]{64}\.receipt(\.[0-9a-f]{32})?$/.test(name)) remove(path.join(directory, name));
+            const base = name.replace(/\.[0-9a-f]{32}$/, '');
+            if (['registration.json', 'dispatch-ready.json', 'active.json'].includes(base) ||
+                /^[0-9a-f]{32}\.(request|claimed|response|writing|registration|submit|submitted|native-response)$/.test(base) ||
+                /^[0-9a-f]{64}\.receipt$/.test(base)) remove(path.join(directory, name));
         }
         try { fs.rmdirSync(directory); } catch { /* A watcher may still be closing. */ }
         return { completed: true };

@@ -57,9 +57,9 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
         throw std::runtime_error("invalid_provider_event");
     }
     addon::Classify_event_result result;
-    const std::array<std::string_view, 11> supported{
+    const std::array<std::string_view, 12> supported{
         "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "UserPromptSubmit", "Stop",
-        "StopFailure", "PermissionRequest", "PreToolUse", "PostToolUse", "PostToolUseFailure",
+        "StopFailure", "PermissionRequest", "PreToolUse", "PostToolUse", "PostToolUseFailure", "ModTurnComplete",
     };
     if (std::find(supported.begin(), supported.end(), name) == supported.end()) {
         return result;
@@ -99,6 +99,13 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
         observation.subagent_transition = name == "SubagentStart" ? addon::Subagent_transition::STARTED : addon::Subagent_transition::STOPPED;
     }
     else {
+        if (name == "ModTurnComplete") {
+            if (text(body, "reason") != "answer") return {};
+            observation.phase_transition = addon::Phase_transition::AWAITING_INPUT;
+            observation.phase_evidence = addon::Evidence::CONFIRMED;
+            result.observations.push_back(std::move(observation));
+            return result;
+        }
         if (body.find("prompt_id")) observation.provider_turn_id = metadata(body, "prompt_id");
         if (name == "UserPromptSubmit" || name == "Stop" || name == "StopFailure") {
             observation.phase_transition = name == "UserPromptSubmit" ? addon::Phase_transition::WORKING : addon::Phase_transition::AWAITING_INPUT;
