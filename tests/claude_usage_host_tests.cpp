@@ -504,7 +504,7 @@ void temporal_messages_and_retained_cache(const fs::path& package, const fs::pat
         record.temporal->portions[0].instant == first_instant && record.temporal->portions[0].total_tokens == 19 &&
         record.temporal->portions[1].instant == second_instant && record.temporal->portions[1].total_tokens == 12 &&
         record.completed_date >= "2026-10-09" && record.input.value == 19 && record.output.value == 9 &&
-        record.cache_read.value == 2 && record.cache_creation.value == 3 && !record.cost_microusd.applicable,
+        record.cache_read.value == 2 && record.cache_creation.value == 3,
         "earlier activity survives a later parent date, raw offset/fraction precision and original accounting partition");
     const auto original_lines = cache_lines(*observed.cache_candidate);
     check(fs::remove(source) && fs::remove(copy), "delete only isolated original transcripts");

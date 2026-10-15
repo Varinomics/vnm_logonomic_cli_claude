@@ -2008,7 +2008,6 @@ void usage_contract()
         addon::Contract_failure failure;
         require(addon::decode_usage_record(addon::encode_usage_record(sessions[0].record, 2), &failure, 2).has_value(),
             "native aggregate satisfies rich usage contract");
-        require(!sessions[0].record.cost_microusd.applicable, "no invented Claude monetary cost");
         auto native = claude::object(R"({"path":"placeholder","size":0,"modified_msecs":0,"records":[{"record_id":"retained-message","session_id":"SessionCase","completed_date":"2026-09-11","total_tokens":30,"source_path":"placeholder","recorded_cwd":"","model":"sonnet","capabilities":{"token_breakdown":{"version":1,"input_tokens":30}}}]})");
         const auto missing = claude::path_string(root / "projects/project/deleted.jsonl");
         native.set("path", addon::Json_value(missing));

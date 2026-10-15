@@ -75,7 +75,7 @@ owns atomic installation and updates.
 Account selection uses the host-admitted canonical profile path. Scans read
 finalized assistant messages under that profile's `projects` directory, deduplicate
 exact message IDs, retain partial token-category coverage, and attribute tokens
-to repositories from recorded working directories. No monetary cost is inferred.
+to repositories from recorded working directories.
 The first scan consumes a host-bound native file-cache seed when supplied and
 commits a package-owned per-file cache before returning results. The cache
 records each transcript's size and modification time; an incremental scan
