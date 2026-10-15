@@ -99,7 +99,7 @@ int requests = 0;
 enum class Reply { USAGE, ERROR, ROTATED_CREDENTIAL, LATE };
 Reply reply = Reply::USAGE;
 fs::path credential_path;
-std::optional<std::string> fetch(std::string_view token, claude::Quota_clock::time_point)
+std::optional<std::string> fetch(std::string_view token, claude::Quota_clock::time_point deadline)
 {
     ++requests;
     require(token == "fixture-token", "selected credential is used in memory");
@@ -108,7 +108,7 @@ std::optional<std::string> fetch(std::string_view token, claude::Quota_clock::ti
         std::ofstream file(credential_path);
         file << R"({"claudeAiOauth":{"accessToken":"rotated-fixture"}})";
     }
-    if (reply == Reply::LATE) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (reply == Reply::LATE) std::this_thread::sleep_until(deadline + std::chrono::milliseconds(20));
     return R"({"five_hour":{"utilization":10,"resets_at":null},"seven_day":{"utilization":25,"resets_at":null}})";
 }
 
@@ -132,7 +132,11 @@ void filesystem_contract()
 #else
         const auto program = root / "package/bin/claude";
         write(root / "package/package.json", R"({"name":"@anthropic-ai/claude-code","bin":{"claude":"bin/claude"}})");
+#ifdef __APPLE__
+        write(program, "\xcf\xfa\xed\xfe" "fixture");
+#else
         write(program, "\x7f" "ELFfixture");
+#endif
 #endif
         const auto mcp = root / "empty.json";
         write(mcp, R"({"mcpServers":{}})");
@@ -183,7 +187,7 @@ void filesystem_contract()
         write(credential_path, addon::serialize_json(credentials(claude::now_ms() + 3600000)));
         reply = Reply::LATE;
         require(!claude::direct_quota_output(program, arguments, environment, root / "work",
-            claude::Quota_clock::now() + std::chrono::milliseconds(5), fetch) && requests == 4,
+            claude::Quota_clock::now() + std::chrono::seconds(1), fetch) && requests == 4,
             "completion beyond the operation deadline cannot publish an observation");
         reply = Reply::USAGE;
         write(program, "#!/bin/sh\nexec other-claude \"$@\"\n");

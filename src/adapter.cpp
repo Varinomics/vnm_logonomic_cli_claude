@@ -15,6 +15,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #else
 #include <unistd.h>
 #endif
@@ -38,6 +40,13 @@ fs::path executable_path()
     const DWORD size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
     if (size == 0 || size >= buffer.size()) throw std::runtime_error("executable_path_unavailable");
     return fs::path(std::wstring(buffer.data(), size));
+#elif defined(__APPLE__)
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    if (size == 0 || size > 65536) throw std::runtime_error("executable_path_unavailable");
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) throw std::runtime_error("executable_path_unavailable");
+    return fs::canonical(addon::path_from_utf8(buffer.data()));
 #else
     std::vector<char> buffer(65536);
     const auto size = readlink("/proc/self/exe", buffer.data(), buffer.size());

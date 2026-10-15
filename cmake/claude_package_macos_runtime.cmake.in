@@ -1,0 +1,74 @@
+cmake_minimum_required(VERSION 3.25)
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_PLATFORM macos+macho)
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_TOOL otool)
+set(CMAKE_GET_RUNTIME_DEPENDENCIES_COMMAND /usr/bin/otool)
+set(index_arguments "${PACKAGE}"
+    --third-party assets/claude.svg notices/lobe_icons_mit.txt provenance/lobe_icons.json)
+set(executables
+    "$<TARGET_FILE:claude_adapter>"
+    "$<TARGET_FILE:claude_helper>"
+    "$<TARGET_FILE:claude_launch_bridge>")
+set(deploy_arguments --package "${PACKAGE}" --configuration "$<CONFIG>")
+if(NOT "@CMAKE_OSX_DEPLOYMENT_TARGET@" STREQUAL "")
+    list(APPEND deploy_arguments --minimum-macos "@CMAKE_OSX_DEPLOYMENT_TARGET@")
+endif()
+foreach(executable IN LISTS executables)
+    get_filename_component(name "${executable}" NAME)
+    if(executable STREQUAL "$<TARGET_FILE:claude_adapter>")
+        set(relative "adapter/${name}")
+    else()
+        set(relative "helpers/${name}")
+    endif()
+    list(APPEND deploy_arguments --input "${executable}" "${relative}" --executable "${relative}")
+endforeach()
+
+# Apple's system runtimes remain OS-owned. Every other resolved import must
+# travel as a regular indexed file and carry the selected library's notice.
+file(GET_RUNTIME_DEPENDENCIES EXECUTABLES ${executables}
+    PRE_EXCLUDE_REGEXES "^/System/Library/" "^/usr/lib/"
+    RESOLVED_DEPENDENCIES_VAR resolved UNRESOLVED_DEPENDENCIES_VAR unresolved
+    CONFLICTING_DEPENDENCIES_PREFIX conflicts)
+if(unresolved OR conflicts_FILENAMES)
+    message(FATAL_ERROR "Incomplete Claude runtime closure: ${unresolved}; ${conflicts_FILENAMES}")
+endif()
+set(notices "")
+set(provenance "Resolved runtime libraries for the selected macOS toolchain\n")
+file(MAKE_DIRECTORY "${PACKAGE}/helpers/runtime")
+foreach(runtime IN LISTS resolved)
+    get_filename_component(name "${runtime}" NAME)
+    file(REAL_PATH "${runtime}" original)
+    set(relative "helpers/runtime/${name}")
+    set(notice "@CLAUDE_RUNTIME_NOTICES_DIRECTORY@/${name}.txt")
+    if(NOT EXISTS "${notice}")
+        message(FATAL_ERROR "Missing notice for ${runtime}; set CLAUDE_RUNTIME_NOTICES_DIRECTORY with ${name}.txt")
+    endif()
+    file(READ "${notice}" license)
+    string(APPEND notices "\n--- ${name} ---\n${license}\n")
+    file(COPY_FILE "${original}" "${PACKAGE}/${relative}")
+    file(SHA256 "${original}" digest)
+    string(APPEND provenance "${relative} <- ${original} ${digest}\n")
+    list(APPEND deploy_arguments --input "${original}" "${relative}")
+    list(APPEND index_arguments --third-party "${relative}" notices/runtime.txt provenance/runtime.txt)
+endforeach()
+execute_process(COMMAND "@Python3_EXECUTABLE@" -B "@CLAUDE_MACOS_RUNTIME_DEPLOYER@"
+    ${deploy_arguments} COMMAND_ERROR_IS_FATAL ANY)
+
+foreach(relative adapter/claude_adapter helpers/claude_helper helpers/claude_launch_bridge)
+    file(GET_RUNTIME_DEPENDENCIES EXECUTABLES "${PACKAGE}/${relative}"
+        PRE_EXCLUDE_REGEXES "^/System/Library/" "^/usr/lib/"
+        RESOLVED_DEPENDENCIES_VAR staged UNRESOLVED_DEPENDENCIES_VAR unresolved
+        CONFLICTING_DEPENDENCIES_PREFIX conflicts)
+    if(unresolved OR conflicts_FILENAMES)
+        message(FATAL_ERROR "Incomplete staged Claude runtime closure: ${unresolved}; ${conflicts_FILENAMES}")
+    endif()
+    foreach(runtime IN LISTS staged)
+        file(REAL_PATH "${runtime}" original)
+        cmake_path(IS_PREFIX PACKAGE "${original}" NORMALIZE contained)
+        if(NOT contained OR IS_SYMLINK "${runtime}")
+            message(FATAL_ERROR "Staged Claude runtime escapes the package: ${runtime}")
+        endif()
+    endforeach()
+endforeach()
+file(WRITE "${PACKAGE}/notices/runtime.txt" "${notices}")
+file(WRITE "${PACKAGE}/provenance/runtime.txt" "${provenance}")
+execute_process(COMMAND "${INDEX}" ${index_arguments} COMMAND_ERROR_IS_FATAL ANY)
