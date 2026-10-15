@@ -94,6 +94,10 @@ configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon
 set(claude_index_command "$<TARGET_FILE:logonomic_cli_addon_index>" "${CLAUDE_PACKAGE_DIRECTORY}"
     --third-party assets/claude.svg notices/lobe_icons_mit.txt provenance/lobe_icons.json)
 set(claude_runtime_inputs "")
+if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CLAUDE_RUNTIME_NOTICES_DIRECTORY "" CACHE PATH
+        "Copyright/license files for external runtimes, named <library filename>.txt")
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # The bridge also owns native fallback. Its HTTP runtime must travel with
     # the package, so absence of a system libcurl cannot break ordinary launch.
@@ -102,14 +106,26 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
         target_link_options(${target} PRIVATE "LINKER:--disable-new-dtags")
     endforeach()
-    set(CLAUDE_RUNTIME_NOTICES_DIRECTORY "" CACHE PATH
-        "Copyright/license files for external runtimes, named <library filename>.txt")
     configure_file(cmake/claude_package_runtime.cmake.in generated/package-runtime.cmake @ONLY)
     set(claude_index_command "${CMAKE_COMMAND}"
         "-DPACKAGE=${CLAUDE_PACKAGE_DIRECTORY}" "-DINDEX=$<TARGET_FILE:logonomic_cli_addon_index>"
         -P "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime.cmake")
     list(APPEND claude_runtime_inputs "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime.cmake"
         "$<TARGET_FILE:CURL::libcurl>")
+elseif(APPLE)
+    find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
+    logonomic_cli_addon_macos_runtime_deployer(CLAUDE_MACOS_RUNTIME_DEPLOYER)
+    foreach(target claude_adapter claude_helper claude_launch_bridge)
+        target_link_options(${target} PRIVATE "LINKER:-headerpad_max_install_names")
+    endforeach()
+    configure_file(cmake/claude_package_macos_runtime.cmake.in generated/package-runtime.cmake.in @ONLY)
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime-$<CONFIG>.cmake"
+        INPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime.cmake.in")
+    set(claude_index_command "${CMAKE_COMMAND}"
+        "-DPACKAGE=${CLAUDE_PACKAGE_DIRECTORY}" "-DINDEX=$<TARGET_FILE:logonomic_cli_addon_index>"
+        -P "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime-$<CONFIG>.cmake")
+    list(APPEND claude_runtime_inputs "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime-$<CONFIG>.cmake"
+        "${CLAUDE_MACOS_RUNTIME_DEPLOYER}" "$<TARGET_FILE:CURL::libcurl>")
 endif()
 file(GLOB_RECURSE package_files CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/*"

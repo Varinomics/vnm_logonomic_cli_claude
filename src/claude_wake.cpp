@@ -11,6 +11,11 @@
 #else
 #include <signal.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 #include <algorithm>
@@ -79,6 +84,29 @@ Owner_status owner_status(std::int64_t pid)
     }
     CloseHandle(process);
     return result;
+#elif defined(__APPLE__)
+    proc_bsdinfo information{};
+    if (proc_pidinfo(static_cast<int>(pid), PROC_PIDTBSDINFO, 0, &information, sizeof(information)) !=
+        static_cast<int>(sizeof(information)))
+    {
+        return {kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH, {}};
+    }
+    if (information.pbi_status == SZOMB) return {true, {}};
+    if (information.pbi_pid != static_cast<std::uint32_t>(pid) || information.pbi_start_tvusec >= 1000000 ||
+        information.pbi_start_tvsec > (std::numeric_limits<std::uint64_t>::max() - 999999) / 1000000)
+    {
+        return {};
+    }
+    char boot_uuid[37]{};
+    std::size_t size = sizeof(boot_uuid);
+    if (sysctlbyname("kern.bootsessionuuid", boot_uuid, &size, nullptr, 0) != 0 ||
+        size != sizeof(boot_uuid) || boot_uuid[sizeof(boot_uuid) - 1] != '\0') return {};
+    std::string boot(boot_uuid);
+    std::transform(boot.begin(), boot.end(), boot.begin(), [](char ch) {
+        return ch >= 'A' && ch <= 'F' ? static_cast<char>(ch + 'a' - 'A') : ch;
+    });
+    const auto start = information.pbi_start_tvsec * 1000000 + information.pbi_start_tvusec;
+    return {false, boot + "-" + std::to_string(start), start};
 #else
     std::ifstream input("/proc/" + std::to_string(pid) + "/stat");
     std::string stat;

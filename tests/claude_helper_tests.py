@@ -67,7 +67,7 @@ class Adapter:
                 "working_directory": str(profile.parent), "title_instruction": "Set the session title.",
                 "declared_assets": [], "profile_storage": {"version": 1, "root": str(profile)},
                 "launcher_argv": ["claude"], "session_wake": {"version": 1},
-                "launch_environment": {"platform": "windows-x86_64" if os.name == "nt" else "linux-x86_64",
+                "launch_environment": {"platform": "windows-x86_64" if os.name == "nt" else ("macos-arm64" if sys.platform == "darwin" else "linux-x86_64"),
                     "effective_environment": {"PATH": os.environ["PATH"]}}}})
         while True:
             response = self.read()

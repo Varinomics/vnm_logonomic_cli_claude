@@ -180,7 +180,7 @@ std::vector<std::string> prepare(
 #ifdef _WIN32
     environment.platform_id = "windows-x86_64";
 #else
-    environment.platform_id = "linux-x86_64";
+    environment.platform_id = addon::host_platform_id();
 #endif
     environment.effective_environment = Json::object();
     environment.effective_environment.set("PATH", Json(utf8(layout.tools)));

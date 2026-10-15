@@ -246,7 +246,7 @@ void launcher_discovery_contract()
         const std::string platform = "windows-x86_64";
         const auto executable = bin / "claude.cmd";
 #else
-        const std::string platform = "linux-x86_64";
+        const std::string platform = addon::host_platform_id();
         const auto executable = bin / "claude";
 #endif
         std::ofstream(executable).close();
@@ -354,7 +354,7 @@ void launcher_discovery_candidate_limit()
         const std::string platform = "windows-x86_64";
         std::ofstream(bin / "claude.cmd").close();
 #else
-        const std::string platform = "linux-x86_64";
+        const std::string platform = addon::host_platform_id();
         std::ofstream(bin / "claude").close();
 #endif
         std::ofstream(selected / ".credentials.json") << "{}";
@@ -410,7 +410,7 @@ void launcher_discovery_scan_limit()
         const std::string platform = "windows-x86_64";
         std::ofstream(bin / "claude.cmd").close();
 #else
-        const std::string platform = "linux-x86_64";
+        const std::string platform = addon::host_platform_id();
         std::ofstream(bin / "claude").close();
 #endif
         std::ofstream(selected / ".credentials.json") << "{}";
@@ -467,7 +467,7 @@ void launcher_directory_contract()
         const auto node = root / "tools/node.exe";
         const auto program = root / "tools/claude.exe";
 #else
-        environment.platform_id = "linux-x86_64";
+        environment.platform_id = addon::host_platform_id();
         const auto node = root / "tools/node";
         const auto program = root / "tools/claude";
 #endif
@@ -817,7 +817,7 @@ void wake_preparation_contract()
         environment.platform_id = "windows-x86_64";
         const auto node = root / "tools/node.exe";
 #else
-        environment.platform_id = "linux-x86_64";
+        environment.platform_id = addon::host_platform_id();
         const auto node = root / "tools/node";
 #endif
         std::ofstream(node).close();
@@ -937,7 +937,7 @@ void wake_binding_contract()
 #ifdef _WIN32
         target.launch_environment.platform_id = "windows-x86_64";
 #else
-        target.launch_environment.platform_id = "linux-x86_64";
+        target.launch_environment.platform_id = addon::host_platform_id();
 #endif
         target.launch_environment.effective_environment = Json::object();
         target.binding.set("directory", Json(claude::path_string(fs::canonical(root))));
@@ -1287,7 +1287,7 @@ addon::Delegated_prepare_result delegated_fixture(addon::Structured_purpose purp
 #ifdef _WIN32
     environment.platform_id = "windows-x86_64";
 #else
-    environment.platform_id = "linux-x86_64";
+    environment.platform_id = addon::host_platform_id();
 #endif
     environment.effective_environment = Json::object();
     environment.effective_environment.set("CLAUDE_CONFIG_DIR", Json(request.context.working_directory));
@@ -1610,7 +1610,7 @@ addon::Delegated_prepare_request posture_request(addon::Structured_purpose purpo
 #ifdef _WIN32
     environment.platform_id = "windows-x86_64";
 #else
-    environment.platform_id = "linux-x86_64";
+    environment.platform_id = addon::host_platform_id();
 #endif
     environment.effective_environment = Json::object();
     environment.effective_environment.set("CLAUDE_CONFIG_DIR", Json(request.context.working_directory));
@@ -2287,7 +2287,7 @@ void account_name_contract()
     const std::string home     = "C:/Users/Jane Doe";
     const std::string home_env = "USERPROFILE";
 #else
-    const std::string platform = "linux-x86_64";
+    const std::string platform = addon::host_platform_id();
     const std::string home     = "/home/jane";
     const std::string home_env = "HOME";
 #endif

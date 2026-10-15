@@ -65,6 +65,9 @@ std::optional<Json> read_object(const fs::path& path, bool required = false)
 
 bool native_image(const fs::path& path)
 {
+#ifdef __APPLE__
+    return addon::native_image(path);
+#else
     std::ifstream input(path, std::ios::binary);
     std::array<unsigned char, 4> magic{};
     input.read(reinterpret_cast<char*>(magic.data()), magic.size());
@@ -72,6 +75,7 @@ bool native_image(const fs::path& path)
     return input && magic[0] == 'M' && magic[1] == 'Z';
 #else
     return input && magic == std::array<unsigned char, 4>{0x7f, 'E', 'L', 'F'};
+#endif
 #endif
 }
 
