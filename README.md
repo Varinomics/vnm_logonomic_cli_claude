@@ -1,7 +1,8 @@
 # Logonomic Claude CLI add-on
 
-Standalone C++20 Claude Code provider for Logonomic on Windows and Linux. The
-package links only the public Logonomic CLI add-on SDK. It owns launcher
+Standalone C++20 Claude Code provider for Logonomic on Windows, Linux and macOS.
+The package depends on the public Logonomic CLI add-on SDK and, outside
+Windows, libcurl for its quota helper. It owns launcher
 recognition, account profiles, launch preparation, Claude hooks, interactive
 resume, structured review and implementation sessions, authentication, quota,
 and transcript usage parsing.
@@ -11,6 +12,14 @@ The SDK dependency tracks the owned Logonomic `master` branch. Set
 to qualify unpublished coordinated SDK changes. Keep build directories outside
 this repository. Windows compilation follows the workspace queued-build and
 Visual Studio 2026 policy.
+
+Outside Windows, configuration requires the libcurl development files. The Linux
+and macOS packages carry libcurl and the rest of their non-system runtime closure
+inside the package, and each carried library needs a notice: Linux falls back
+to the distribution's `/usr/share/doc/<package>/copyright` for a dpkg-owned
+library, otherwise (and always on macOS) set `CLAUDE_RUNTIME_NOTICES_DIRECTORY`
+to a directory holding `<library filename>.txt` for each. Linux also needs
+`objdump`, and macOS assembly needs Python >=3.9.
 
 The package target produces an indexed package containing the adapter, attached
 process bridge, authenticated hook helper, capability declarations, and immutable
@@ -62,8 +71,8 @@ After a native root answer completes, the Mod publishes an authenticated
 completion event so pending mail is rechecked after its busy state clears;
 the earlier classic Stop hook alone cannot establish that readiness.
 
-The package recipe proves the Windows/Linux x86-64 compiler target during
-configuration. `cmake --install` exports a fresh artifact beneath its install-time
+The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
+during configuration. `cmake --install` exports a fresh artifact beneath its install-time
 prefix and preserves executable permissions. An existing per-package destination,
 including a dangling symlink, is refused. POSIX `DESTDIR` staging is supported;
 nonempty `DESTDIR` with a drive-letter prefix is refused. Export is not atomic:
