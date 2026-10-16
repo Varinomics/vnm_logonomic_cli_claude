@@ -91,7 +91,8 @@ logonomic_cli_addon_package_platform(CLAUDE_PLATFORM)
 set(CLAUDE_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 logonomic_cli_addon_package_directory(logonomic.cli.claude CLAUDE_PACKAGE_DIRECTORY)
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
-set(claude_index_command "$<TARGET_FILE:logonomic_cli_addon_index>" "${CLAUDE_PACKAGE_DIRECTORY}"
+logonomic_cli_addon_package_indexer(claude_package_indexer claude_index_dependencies)
+set(claude_index_command ${claude_package_indexer} "${CLAUDE_PACKAGE_DIRECTORY}"
     --third-party assets/claude.svg notices/lobe_icons_mit.txt provenance/lobe_icons.json)
 set(claude_runtime_inputs "")
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -122,7 +123,7 @@ elseif(APPLE)
     file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime-$<CONFIG>.cmake"
         INPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime.cmake.in")
     set(claude_index_command "${CMAKE_COMMAND}"
-        "-DPACKAGE=${CLAUDE_PACKAGE_DIRECTORY}" "-DINDEX=$<TARGET_FILE:logonomic_cli_addon_index>"
+        "-DPACKAGE=${CLAUDE_PACKAGE_DIRECTORY}"
         -P "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime-$<CONFIG>.cmake")
     list(APPEND claude_runtime_inputs "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime-$<CONFIG>.cmake"
         "${CLAUDE_MACOS_RUNTIME_DEPLOYER}" "$<TARGET_FILE:CURL::libcurl>")
@@ -161,7 +162,7 @@ add_custom_command(
     COMMAND ${claude_index_command}
     DEPENDS claude_adapter claude_helper claude_launch_bridge logonomic_cli_addon_index
         "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
-        ${package_files} ${claude_runtime_inputs}
+        ${package_files} ${claude_runtime_inputs} ${claude_index_dependencies}
     VERBATIM)
 add_custom_target(claude_package ALL DEPENDS "${CLAUDE_PACKAGE_DIRECTORY}/package.files.json")
 logonomic_cli_addon_install_package("${CLAUDE_PACKAGE_DIRECTORY}" logonomic.cli.claude TARGET claude_package)

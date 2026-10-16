@@ -71,4 +71,5 @@ foreach(relative adapter/claude_adapter helpers/claude_helper helpers/claude_lau
 endforeach()
 file(WRITE "${PACKAGE}/notices/runtime.txt" "${notices}")
 file(WRITE "${PACKAGE}/provenance/runtime.txt" "${provenance}")
-execute_process(COMMAND "${INDEX}" ${index_arguments} COMMAND_ERROR_IS_FATAL ANY)
+set(index_command [==[@claude_package_indexer@]==])
+execute_process(COMMAND ${index_command} ${index_arguments} COMMAND_ERROR_IS_FATAL ANY)
