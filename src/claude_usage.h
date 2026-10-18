@@ -37,6 +37,7 @@ struct Usage_cache_input
     bool cache_required = false;
     std::optional<std::filesystem::path> storage_file;
     std::optional<std::filesystem::path> selected_file;
+    std::optional<std::filesystem::path> selected_directory;
     // usage-scan's incremental mode: reuse a transcript's cached messages
     // while its size and modification time are unchanged. Repair and reset
     // parse every transcript.

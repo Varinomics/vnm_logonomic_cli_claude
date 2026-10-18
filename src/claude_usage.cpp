@@ -4,6 +4,7 @@
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/sha256.h>
+#include <logonomic_cli_addon/usage_incremental.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -152,6 +153,7 @@ struct Message
     std::optional<Json> temporal_carrier;
     bool temporal_unsupported = false;
     bool temporal_retained = false;
+    std::optional<std::string> owner_session;
 };
 
 Json cache_accounting_record(const Message& message);
@@ -200,6 +202,26 @@ struct Snapshot
     std::uint64_t touched_ms = 0;
     std::optional<addon::Usage_cache_reference> cache_candidate;
 };
+
+struct Indexed_source
+{
+    std::optional<file_fingerprint_t> fingerprint;
+    std::vector<std::pair<std::string, std::string>> messages;
+    std::set<std::string> directories;
+    std::map<std::string, std::string> owners;
+};
+
+using Repository_map = std::map<std::string, std::optional<std::string>>;
+
+struct Usage_index
+{
+    std::string seed_receipt;
+    std::map<std::string, Indexed_source> sources;
+    Repository_map repositories;
+};
+
+constexpr std::string_view k_index_format = "claude-message-pieces@1";
+constexpr const char* k_index_file = "index.jsonl";
 
 std::mutex s_snapshot_mutex;
 std::mutex s_cache_mutex;
@@ -373,9 +395,20 @@ std::vector<Message> reconcile_messages(
     const std::vector<Message>& retained, std::vector<Message> observed, addon::Invocation_context& context)
 {
     std::set<std::string> observed_ids;
-    for (const auto& message : observed) {
+    std::map<std::string, std::string> retained_owners;
+    for (const auto& message : retained) {
+        if (message.owner_session) {
+            retained_owners.emplace(message.id, *message.owner_session);
+        }
+    }
+    for (auto& message : observed) {
         if (context.cancel_requested()) throw std::runtime_error("cancelled");
-        observed_ids.insert(message.id);
+        if (observed_ids.insert(message.id).second) {
+            const auto owner = retained_owners.find(message.id);
+            if (owner != retained_owners.end()) {
+                message.owner_session = owner->second;
+            }
+        }
     }
     // A completed observation can correct its own message. Missing or unfinished
     // messages provide no evidence that previously completed usage disappeared.
@@ -434,6 +467,12 @@ Message cached_message(const Json& value, bool native)
         "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
     };
     if (!native) {
+        if (const auto* owner = value.find("owner_session")) {
+            if (!owner->is_string() || owner->as_string().empty()) {
+                throw std::runtime_error("usage_cache_invalid");
+            }
+            result.owner_session = owner->as_string();
+        }
         const auto* categories = value.find("categories");
         if (!categories || !categories->is_object()) throw std::runtime_error("usage_cache_invalid");
         for (std::size_t index = 0; index < names.size(); ++index) {
@@ -563,6 +602,9 @@ Json cache_accounting_record(const Message& message)
 Json cache_record(const Message& message)
 {
     auto value = cache_accounting_record(message);
+    if (message.owner_session) {
+        value.set("owner_session", Json(*message.owner_session));
+    }
     if (message.temporal_carrier) {
         value.set("usage-temporal", *message.temporal_carrier);
     }
@@ -653,6 +695,229 @@ void write_cache(const fs::path& path, const File_cache& cache, addon::Invocatio
     }
 }
 
+std::string source_piece(const std::string& source)
+{
+    return "source-" + addon::to_hex(addon::Sha256::digest(source)) + ".jsonl";
+}
+
+Indexed_source index_source(const Cached_file& source)
+{
+    Indexed_source indexed;
+    indexed.fingerprint = source.fingerprint;
+    for (const auto& message : source.messages) {
+        indexed.messages.emplace_back(message.id, message.session);
+        indexed.directories.insert(message.cwd);
+        if (message.owner_session && !indexed.owners.emplace(message.id, *message.owner_session).second) {
+            throw std::runtime_error("usage_cache_invalid");
+        }
+    }
+    return indexed;
+}
+
+Usage_index read_index(const fs::path& root, addon::Invocation_context& context)
+{
+    Line_reader stream(root / k_index_file);
+    if (!stream.is_open()) {
+        throw std::runtime_error("usage_cache_unavailable");
+    }
+    Usage_index result;
+    std::string_view line;
+    bool terminated = false;
+    bool header = false;
+    std::string previous_source;
+    while (stream.next(line, terminated)) {
+        if (context.cancel_requested()) {
+            throw std::runtime_error("cancelled");
+        }
+        if (!terminated) {
+            throw std::runtime_error("usage_cache_incomplete");
+        }
+        const auto value = usage_object(line);
+        if (!header) {
+            if (text(value, "format") != k_index_format) {
+                throw std::runtime_error("usage_cache_format_unsupported");
+            }
+            result.seed_receipt = text(value, "seed_sha256_hex");
+            header = true;
+            continue;
+        }
+        if (const auto* cwd = value.find("cwd")) {
+            const auto* path = value.find("repository");
+            if (!previous_source.empty() || !cwd->is_string() || !path ||
+                (!path->is_null() && !path->is_string()) ||
+                !result.repositories.emplace(cwd->as_string(), path->is_null() ?
+                    std::nullopt : std::optional<std::string>(path->as_string())).second)
+            {
+                throw std::runtime_error("usage_cache_invalid");
+            }
+            continue;
+        }
+        const auto source = required_text(value, "path");
+        const auto* messages = value.find("messages");
+        const bool continued = source == previous_source;
+        if (!addon::path_from_utf8(source).is_absolute() ||
+            cache_path(addon::path_from_utf8(source)) != source ||
+            !messages || !messages->is_array() || (!continued && result.sources.contains(source)))
+        {
+            throw std::runtime_error("usage_cache_invalid");
+        }
+        auto& indexed = result.sources[source];
+        const auto observed = cached_fingerprint(value);
+        if (continued && observed) {
+            throw std::runtime_error("usage_cache_invalid");
+        }
+        if (!continued) {
+            indexed.fingerprint = observed;
+        }
+        previous_source = source;
+        const auto* directories = value.find("directories");
+        const auto* owners = value.find("owners");
+        if (!directories || !directories->is_array() || !owners || !owners->is_array()) {
+            throw std::runtime_error("usage_cache_invalid");
+        }
+        for (const auto& cwd : directories->as_array()) {
+            if (!cwd.is_string() || !result.repositories.contains(cwd.as_string()) ||
+                !indexed.directories.insert(cwd.as_string()).second)
+            {
+                throw std::runtime_error("usage_cache_invalid");
+            }
+        }
+        for (const auto& owner : owners->as_array()) {
+            if (!owner.is_array() || owner.as_array().size() != 2 ||
+                !owner.as_array()[0].is_string() || owner.as_array()[0].as_string().empty() ||
+                !owner.as_array()[1].is_string() || owner.as_array()[1].as_string().empty() ||
+                !indexed.owners.emplace(owner.as_array()[0].as_string(), owner.as_array()[1].as_string()).second)
+            {
+                throw std::runtime_error("usage_cache_invalid");
+            }
+        }
+        for (const auto& message : messages->as_array()) {
+            if (context.cancel_requested()) {
+                throw std::runtime_error("cancelled");
+            }
+            if (!message.is_array() || message.as_array().size() != 2 ||
+                !message.as_array()[0].is_string() || message.as_array()[0].as_string().empty() ||
+                !message.as_array()[1].is_string() || message.as_array()[1].as_string().empty())
+            {
+                throw std::runtime_error("usage_cache_invalid");
+            }
+            indexed.messages.emplace_back(message.as_array()[0].as_string(), message.as_array()[1].as_string());
+        }
+    }
+    if (stream.failed() || !header) {
+        throw std::runtime_error("usage_cache_unavailable");
+    }
+    return result;
+}
+
+void write_index(const fs::path& root, const Usage_index& index, addon::Invocation_context& context)
+{
+    std::ofstream stream(root / k_index_file, std::ios::binary | std::ios::trunc);
+    Json header = Json::object();
+    header.set("format", Json(k_index_format));
+    header.set("seed_sha256_hex", Json(index.seed_receipt));
+    stream << addon::serialize_json(header) << '\n';
+    for (const auto& [cwd, path] : index.repositories) {
+        if (context.cancel_requested()) {
+            throw std::runtime_error("cancelled");
+        }
+        Json entry = Json::object();
+        entry.set("cwd", Json(cwd));
+        entry.set("repository", path ? Json(*path) : Json());
+        stream << addon::serialize_json(entry) << '\n';
+    }
+    for (const auto& [source, indexed] : index.sources) {
+        auto next_message = indexed.messages.begin();
+        auto next_directory = indexed.directories.begin();
+        auto next_owner = indexed.owners.begin();
+        bool first = true;
+        do {
+            if (context.cancel_requested()) {
+                throw std::runtime_error("cancelled");
+            }
+            Json value = Json::object();
+            value.set("path", Json(source));
+            if (first && indexed.fingerprint) {
+                value.set("size", Json(indexed.fingerprint->size));
+                value.set("modified", Json(indexed.fingerprint->modified));
+            }
+            std::size_t bytes = 0;
+            Json messages = Json::array();
+            for (; next_message != indexed.messages.end() && bytes < k_cache_line_bytes; ++next_message) {
+                if (context.cancel_requested()) {
+                    throw std::runtime_error("cancelled");
+                }
+                Json message = Json::array();
+                message.push_back(Json(next_message->first));
+                message.push_back(Json(next_message->second));
+                bytes += addon::serialize_json(message).size();
+                messages.push_back(std::move(message));
+            }
+            value.set("messages", std::move(messages));
+            Json directories = Json::array();
+            for (; next_directory != indexed.directories.end() && bytes < k_cache_line_bytes; ++next_directory) {
+                bytes += next_directory->size();
+                directories.push_back(Json(*next_directory));
+            }
+            value.set("directories", std::move(directories));
+            Json owners = Json::array();
+            for (; next_owner != indexed.owners.end() && bytes < k_cache_line_bytes; ++next_owner) {
+                Json owner = Json::array();
+                owner.push_back(Json(next_owner->first));
+                owner.push_back(Json(next_owner->second));
+                bytes += addon::serialize_json(owner).size();
+                owners.push_back(std::move(owner));
+            }
+            value.set("owners", std::move(owners));
+            stream << addon::serialize_json(value) << '\n';
+            first = false;
+        }
+        while (next_message != indexed.messages.end() || next_directory != indexed.directories.end() ||
+            next_owner != indexed.owners.end());
+    }
+    stream.close();
+    if (!stream) {
+        throw std::runtime_error("usage_cache_write_failed");
+    }
+}
+
+void check_index_inventory(const Usage_index& index, const addon::Usage_cache_manifest& manifest)
+{
+    std::set<std::string> expected{k_index_file};
+    for (const auto& [source, indexed] : index.sources) {
+        (void)indexed;
+        expected.insert(source_piece(source));
+    }
+    if (expected.size() != manifest.files.size()) {
+        throw std::runtime_error("usage_cache_invalid");
+    }
+    for (const auto& file : manifest.files) {
+        if (!expected.contains(file.path)) {
+            throw std::runtime_error("usage_cache_invalid");
+        }
+    }
+}
+
+void read_source_piece(
+    const fs::path& root, const std::string& source, const Usage_index& index,
+    File_cache& cache, addon::Invocation_context& context)
+{
+    File_cache piece;
+    const auto receipt = read_cache(root / source_piece(source), false, piece, context);
+    const auto found = piece.find(source);
+    if (piece.size() != 1 || found == piece.end() || receipt != index.seed_receipt) {
+        throw std::runtime_error("usage_cache_invalid");
+    }
+    const auto observed = index_source(found->second);
+    const auto& expected = index.sources.at(source);
+    if (observed.fingerprint != expected.fingerprint || observed.messages != expected.messages ||
+        observed.directories != expected.directories || observed.owners != expected.owners)
+    {
+        throw std::runtime_error("usage_cache_invalid");
+    }
+    cache.emplace(source, std::move(found->second));
+}
+
 void populate_amounts(Usage_session& session)
 {
     const std::array<addon::Usage_amount*, 4> amounts{
@@ -678,59 +943,12 @@ void populate_amounts(Usage_session& session)
     session.record.source_counter_semantics = "per_event_sum";
 }
 
-} // namespace
-
-std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation_context& context, const Usage_cache_input& cache_input)
+std::vector<Usage_session> aggregate_usage(
+    const File_cache& cache, addon::Invocation_context& context,
+    const std::set<std::string>* selected_ids = nullptr, const Repository_map* known_repositories = nullptr)
 {
-    std::lock_guard cache_lock(s_cache_mutex);
-    const auto projects = profile / "projects";
-    std::error_code filesystem_error;
-    if (!fs::is_directory(profile, filesystem_error) || filesystem_error) {
-        throw std::runtime_error("usage_projects_unavailable");
-    }
-    const bool projects_present = fs::exists(projects, filesystem_error);
-    if (filesystem_error) {
-        throw std::runtime_error("usage_projects_unavailable");
-    }
-    if (projects_present && !fs::is_directory(projects, filesystem_error)) {
-        throw std::runtime_error("usage_projects_unavailable");
-    }
-    if (filesystem_error) {
-        throw std::runtime_error("usage_projects_unavailable");
-    }
-    File_cache cache;
-    std::string receipt;
-    bool cache_loaded = false;
-    const auto& input_file = cache_input.selected_file ? cache_input.selected_file : cache_input.storage_file;
-    if (input_file && fs::is_regular_file(*input_file)) {
-        receipt = read_cache(*input_file, false, cache, context);
-        cache_loaded = true;
-        if (cache_input.native_seed && receipt != cache_input.seed_sha256_hex) {
-            File_cache incoming;
-            read_cache(*cache_input.native_seed, true, incoming, context, cache_input.seed_sha256_hex);
-            if (!incoming.empty()) throw std::runtime_error("usage_seed_receipt_mismatch");
-        }
-    }
-    else if (cache_input.native_seed) {
-        receipt = read_cache(*cache_input.native_seed, true, cache, context, cache_input.seed_sha256_hex);
-        cache_loaded = true;
-    }
-    // Required evidence describes history already retained by the host. A
-    // validated empty seed (or a header-only local cache) proves only framing
-    // and a receipt, not the message evidence needed to reconstruct that history.
-    const bool retained_messages = std::any_of(cache.begin(), cache.end(),
-        [](const auto& entry) { return !entry.second.messages.empty(); });
-    if (cache_input.cache_required && (!cache_loaded || !retained_messages)) {
-        throw std::runtime_error("usage_required_cache_unavailable");
-    }
-    std::vector<fs::path> files;
-    if (projects_present) for (const auto& entry : fs::recursive_directory_iterator(projects)) {
-        if (context.cancel_requested()) throw std::runtime_error("cancelled");
-        if (entry.is_regular_file() && entry.path().extension() == ".jsonl") files.push_back(entry.path());
-    }
-    std::sort(files.begin(), files.end());
     // Messages share a few working directories; probe each one once per scan.
-    std::map<std::string, std::optional<std::string>> repositories;
+    Repository_map repositories = known_repositories ? *known_repositories : Repository_map{};
     const auto repository_of = [&repositories](const std::string& cwd) -> const std::optional<std::string>& {
         auto found = repositories.find(cwd);
         if (found == repositories.end()) {
@@ -738,31 +956,21 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
         }
         return found->second;
     };
-    std::uint64_t processed = 0;
-    for (const auto& file : files) {
-        if (context.cancel_requested()) throw std::runtime_error("cancelled");
-        auto& cached = cache[cache_path(file)];
-        // Incremental scans keep the evidence of a transcript whose size and
-        // modification time still match the ones recorded when it was parsed.
-        // A transcript that changes while it is read also keeps its evidence
-        // and fingerprint, so the next scan reads it again.
-        if (!cache_input.incremental || cached.fingerprint != fingerprint(file)) {
-            file_fingerprint_t observed;
-            if (auto parsed = parse_file(file, context, observed)) {
-                cached.messages    = reconcile_messages(cached.messages, std::move(*parsed), context);
-                cached.fingerprint = observed;
-            }
-        }
-        context.report_progress(++processed, files.size());
-    }
     // The retained messages stay in the cache; deduplication keys on their IDs
     // and refers to each ID's first copy in the order the cache holds them.
     std::unordered_map<std::string_view, merged_message_t> merged;
+    std::map<std::string, const Message*> accepted_owners;
     std::vector<const merged_message_t*> order;
     for (const auto& [path, file] : cache) {
         (void)path;
         for (const auto& record : file.messages) {
             if (context.cancel_requested()) throw std::runtime_error("cancelled");
+            if (selected_ids && !selected_ids->contains(record.id)) {
+                continue;
+            }
+            if (record.owner_session && !accepted_owners.emplace(record.id, &record).second) {
+                throw std::runtime_error("usage_cache_invalid");
+            }
             const auto [previous, inserted] = merged.try_emplace(
                 record.id, merged_message_t{&record, record.categories, false, false,
                     record.instant, false, record.temporal_unsupported, record.temporal_retained});
@@ -801,14 +1009,18 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
             }
         }
     }
+    for (const auto& [id, owner] : accepted_owners) {
+        merged.at(id).first = owner;
+    }
     std::map<std::string, Usage_session> sessions;
     const std::optional<std::string> unattributed;
     for (const auto* entry : order) {
         if (context.cancel_requested()) throw std::runtime_error("cancelled");
         const auto& message = *entry->first;
-        auto& session = sessions[message.session];
-        session.record.record_id = message.session;
-        session.record.session_key = message.session;
+        const auto& owner_session = message.owner_session ? *message.owner_session : message.session;
+        auto& session = sessions[owner_session];
+        session.record.record_id = owner_session;
+        session.record.session_key = owner_session;
         session.record.source_path = message.source;
         const auto previous_model = session.record.model.value_or("");
         session.record.model = previous_model.empty() || previous_model == message.model ? message.model : "multiple";
@@ -854,11 +1066,549 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
         populate_amounts(session);
         result.push_back(std::move(session));
     }
+    return result;
+}
+
+std::vector<fs::path> transcript_files(const fs::path& profile, addon::Invocation_context& context)
+{
+    const auto projects = profile / "projects";
+    std::error_code filesystem_error;
+    if (!fs::is_directory(profile, filesystem_error) || filesystem_error) {
+        throw std::runtime_error("usage_projects_unavailable");
+    }
+    const bool projects_present = fs::exists(projects, filesystem_error);
+    if (filesystem_error) {
+        throw std::runtime_error("usage_projects_unavailable");
+    }
+    if (projects_present && !fs::is_directory(projects, filesystem_error)) {
+        throw std::runtime_error("usage_projects_unavailable");
+    }
+    if (filesystem_error) {
+        throw std::runtime_error("usage_projects_unavailable");
+    }
+    std::vector<fs::path> files;
+    if (projects_present) for (const auto& entry : fs::recursive_directory_iterator(projects)) {
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
+        if (entry.is_regular_file() && entry.path().extension() == ".jsonl") files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+} // namespace
+
+std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation_context& context, const Usage_cache_input& cache_input)
+{
+    std::lock_guard cache_lock(s_cache_mutex);
+    File_cache cache;
+    std::string receipt;
+    bool cache_loaded = false;
+    const auto& input_file = cache_input.selected_file ? cache_input.selected_file : cache_input.storage_file;
+    if (cache_input.selected_directory) {
+        const auto index = read_index(*cache_input.selected_directory, context);
+        receipt = index.seed_receipt;
+        for (const auto& [source, indexed] : index.sources) {
+            (void)indexed;
+            read_source_piece(*cache_input.selected_directory, source, index, cache, context);
+        }
+        cache_loaded = true;
+    }
+    else
+    if (input_file && fs::is_regular_file(*input_file)) {
+        receipt = read_cache(*input_file, false, cache, context);
+        cache_loaded = true;
+    }
+    else if (cache_input.native_seed) {
+        receipt = read_cache(*cache_input.native_seed, true, cache, context, cache_input.seed_sha256_hex);
+        cache_loaded = true;
+    }
+    if (cache_loaded && cache_input.native_seed && receipt != cache_input.seed_sha256_hex) {
+        File_cache incoming;
+        read_cache(*cache_input.native_seed, true, incoming, context, cache_input.seed_sha256_hex);
+        if (!incoming.empty()) {
+            throw std::runtime_error("usage_seed_receipt_mismatch");
+        }
+    }
+    // Required evidence describes history already retained by the host. A
+    // validated empty seed (or a header-only local cache) proves only framing
+    // and a receipt, not the message evidence needed to reconstruct that history.
+    const bool retained_messages = std::any_of(cache.begin(), cache.end(),
+        [](const auto& entry) { return !entry.second.messages.empty(); });
+    if (cache_input.cache_required && (!cache_loaded || !retained_messages)) {
+        throw std::runtime_error("usage_required_cache_unavailable");
+    }
+    const auto files = transcript_files(profile, context);
+    std::uint64_t processed = 0;
+    for (const auto& file : files) {
+        if (context.cancel_requested()) throw std::runtime_error("cancelled");
+        auto& cached = cache[cache_path(file)];
+        // Incremental scans keep the evidence of a transcript whose size and
+        // modification time still match the ones recorded when it was parsed.
+        // A transcript that changes while it is read also keeps its evidence
+        // and fingerprint, so the next scan reads it again.
+        if (!cache_input.incremental || cached.fingerprint != fingerprint(file)) {
+            file_fingerprint_t observed;
+            if (auto parsed = parse_file(file, context, observed)) {
+                cached.messages    = reconcile_messages(cached.messages, std::move(*parsed), context);
+                cached.fingerprint = observed;
+            }
+        }
+        context.report_progress(++processed, files.size());
+    }
+    auto result = aggregate_usage(cache, context);
     if (cache_input.storage_file) write_cache(*cache_input.storage_file, cache, context, receipt);
     return result;
 }
 
 namespace {
+
+void complete_records(
+    Snapshot& snapshot, const std::string& snapshot_id,
+    const std::optional<addon::Usage_cache_reference>& accepted_cache)
+{
+    for (auto& session : snapshot.sessions) {
+        addon::Usage_temporal temporal;
+        temporal.parent = {session.record.record_id, session.record.total_tokens,
+            snapshot_id, snapshot.scope.source_account_key};
+        temporal.unavailable_tokens = session.temporal_unavailable_tokens;
+        for (const auto& [instant, tokens] : session.temporal_tokens) {
+            temporal.portions.push_back({"instant", instant, {}, {}, tokens});
+        }
+        if (session.temporal_capacity) {
+            temporal.unavailable_tokens = session.record.total_tokens;
+            temporal.coverage_reason = "capacity";
+        }
+        else
+        if (session.temporal_missing || session.temporal_unsupported) {
+            temporal.coverage_reason = temporal.portions.empty() &&
+                session.temporal_unsupported && !session.temporal_missing ? "unsupported" : "missing-evidence";
+        }
+        if (session.temporal_retained && accepted_cache) {
+            const auto& accepted = *accepted_cache;
+            temporal.retained_from = addon::Usage_temporal_retained_from{
+                accepted.snapshot_id, accepted.manifest_sha256_hex};
+        }
+        if (!addon::decode_usage_temporal(addon::encode_usage_temporal(temporal), nullptr)) {
+            temporal.portions.clear();
+            temporal.unavailable_tokens = session.record.total_tokens;
+            temporal.coverage_reason = "capacity";
+            if (!addon::decode_usage_temporal(addon::encode_usage_temporal(temporal), nullptr)) continue;
+        }
+        session.record.temporal = std::move(temporal);
+    }
+    for (auto& session : snapshot.sessions) {
+        session.record.aggregate_evidence = "partial";
+    }
+}
+
+addon::Usage_scan_page snapshot_page(
+    const addon::Usage_scan_request& input, const std::string& profile_key,
+    const std::string& snapshot_id, std::size_t begin, std::uint16_t version,
+    std::size_t reserved_payload_bytes = 0)
+{
+    addon::Usage_scan_page page;
+    page.incomplete_historical_coverage = true;
+    {
+        std::lock_guard lock(s_snapshot_mutex);
+        const auto found = s_snapshots.find(snapshot_id);
+        if (found == s_snapshots.end() || found->second.profile != profile_key || begin > found->second.sessions.size()) {
+            throw std::runtime_error("usage_snapshot_unavailable");
+        }
+        auto& snapshot = found->second;
+        snapshot.touched_ms = now_ms();
+        page.snapshot_id = snapshot_id;
+        page.scope = snapshot.scope;
+        page.cache_candidate = snapshot.cache_candidate;
+        if (version == 3) {
+            page.account_context = input.context.account_context;
+            page.profile_storage = input.context.profile_storage;
+        }
+        auto end = begin;
+        std::size_t encoded_records_bytes = 0;
+        for (; end < snapshot.sessions.size(); ++end) {
+            page.complete = end + 1 == snapshot.sessions.size();
+            if (page.complete) page.next_cursor.reset();
+            else page.next_cursor = std::to_string(end + 1);
+            const auto& record = snapshot.sessions[end].record;
+            if (addon::append_usage_page_record(page, record, encoded_records_bytes, version, reserved_payload_bytes)) continue;
+            if (!page.records.empty()) break;
+            auto accounting = record;
+            if (accounting.temporal) {
+                accounting.temporal->portions.clear();
+                accounting.temporal->unavailable_tokens = accounting.total_tokens;
+                accounting.temporal->coverage_reason = "capacity";
+                if (addon::append_usage_page_record(page, accounting, encoded_records_bytes, version, reserved_payload_bytes)) continue;
+                accounting.temporal.reset();
+            }
+            if (addon::append_usage_page_record(page, accounting, encoded_records_bytes, version, reserved_payload_bytes)) continue;
+            throw std::runtime_error("usage_record_transport_limit_exceeded");
+        }
+        page.complete = end == snapshot.sessions.size();
+        if (!page.complete) page.next_cursor = std::to_string(end);
+        else s_snapshots.erase(found);
+    }
+    return page;
+}
+
+void validate_cache_namespace(const addon::Usage_scan_request& input, addon::Contract_failure& failure)
+{
+    const auto& selection = *input.cache_selection;
+    const auto& root = input.context.profile_storage->root;
+    if (!addon::validate_usage_cache_root(selection.candidate_root, root, &failure)) {
+        throw std::runtime_error(failure.reason_code);
+    }
+    const auto outside_mutable = [&](const std::string& selected) {
+        const auto mutable_path = addon::path_from_utf8(root) / "claude-message-cache-v1.jsonl";
+        for (auto path = addon::path_from_utf8(selected); path.has_relative_path(); path = path.parent_path()) {
+            std::error_code error;
+            if (fs::equivalent(path, mutable_path, error)) {
+                return false;
+            }
+        }
+        const auto relative = addon::path_from_utf8(selected).lexically_relative(addon::path_from_utf8(root));
+        auto name = addon::path_to_utf8(*relative.begin());
+#ifdef _WIN32
+        name = addon::ascii_lowercase(name);
+#endif
+        return name != "claude-message-cache-v1.jsonl" &&
+            !(name.starts_with("claude-cache-") && name.ends_with(".tmp"));
+    };
+    if (!outside_mutable(selection.candidate_root) ||
+        (selection.accepted && !outside_mutable(selection.accepted->root)))
+    {
+        throw std::runtime_error("usage_cache_namespace_conflict");
+    }
+}
+
+struct Message_owner
+{
+    std::string source;
+    std::string session;
+};
+
+using Message_owners = std::map<std::string, Message_owner>;
+
+Message_owners assign_index_owners(Usage_index& index)
+{
+    Message_owners owners;
+    for (const auto& [source, indexed] : index.sources) {
+        std::set<std::string> ids;
+        for (const auto& [id, session] : indexed.messages) {
+            (void)session;
+            ids.insert(id);
+        }
+        for (const auto& [id, session] : indexed.owners) {
+            if (!ids.contains(id) || !owners.emplace(id, Message_owner{source, session}).second) {
+                throw std::runtime_error("usage_cache_invalid");
+            }
+        }
+    }
+    for (auto& [source, indexed] : index.sources) {
+        for (const auto& [id, session] : indexed.messages) {
+            if (owners.try_emplace(id, Message_owner{source, session}).second) {
+                indexed.owners.emplace(id, session);
+            }
+        }
+    }
+    return owners;
+}
+
+void apply_message_owners(File_cache& cache, const Message_owners& owners)
+{
+    for (auto& [source, cached] : cache) {
+        std::set<std::string> owned;
+        for (auto& message : cached.messages) {
+            const auto& owner = owners.at(message.id);
+            message.owner_session = owner.source == source && owned.insert(message.id).second ?
+                std::optional<std::string>(owner.session) : std::nullopt;
+        }
+    }
+}
+
+std::map<std::string, std::string> message_owners(const Usage_index& index)
+{
+    std::map<std::string, std::string> owners;
+    for (const auto& [source, indexed] : index.sources) {
+        (void)source;
+        for (const auto& [id, session] : indexed.owners) {
+            if (!owners.emplace(id, session).second) {
+                throw std::runtime_error("usage_cache_invalid");
+            }
+        }
+    }
+    return owners;
+}
+
+Json comparison_record(addon::Usage_record record)
+{
+    if (record.temporal) {
+        record.temporal->retained_from.reset();
+    }
+    return addon::encode_usage_record(record, 3);
+}
+
+void handle_incremental_usage(addon::Invocation_context& context, const char*& stage)
+{
+    if (context.request().operation != "scan") {
+        context.reject_unknown_operation();
+        return;
+    }
+    addon::Contract_failure failure;
+    const auto input = addon::decode_usage_incremental_request(context.request().payload, &failure);
+    if (!input) {
+        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        return;
+    }
+    const auto& baseline = *input->cache_selection->accepted;
+    const auto& storage = input->context.profile_storage->root;
+    const auto& candidate = input->cache_selection->candidate_root;
+    const auto cancelled = [&context] { return context.cancel_requested(); };
+    addon::Usage_incremental_result result;
+    result.baseline = baseline;
+    result.account_context = input->context.account_context;
+    result.profile_storage = input->context.profile_storage;
+    stage = "selecting the Claude profile";
+    const auto profile = profile_for_context(input->context);
+    auto identity = *input;
+    identity.snapshot_id.reset();
+    identity.cursor.reset();
+    const auto profile_key = "incremental:" + addon::to_hex(addon::Sha256::digest(
+        addon::serialize_json_canonical(addon::encode_usage_incremental_request(identity))));
+    stage = "checking usage cache storage";
+    validate_cache_namespace(*input, failure);
+    std::string snapshot_id;
+    std::size_t begin = 0;
+    if (input->snapshot_id) {
+        snapshot_id = *input->snapshot_id;
+        const auto& cursor = *input->cursor;
+        const auto parsed = std::from_chars(cursor.data(), cursor.data() + cursor.size(), begin);
+        if (parsed.ec != std::errc{} || parsed.ptr != cursor.data() + cursor.size() ||
+            std::to_string(begin) != cursor || begin == 0)
+        {
+            throw std::runtime_error("usage_cursor_invalid");
+        }
+    }
+    else {
+        std::lock_guard cache_lock(s_cache_mutex);
+        if (!addon::validate_usage_cache_allocation(candidate, storage, &failure)) {
+            throw std::runtime_error(failure.reason_code);
+        }
+        const auto manifest = addon::validate_usage_cache_manifest(
+            baseline, storage, input->context.account_context, cancelled, &failure);
+        if (!manifest) {
+            throw std::runtime_error(failure.reason_code);
+        }
+        const auto selected_root = addon::usage_cache_io_path(addon::path_from_utf8(baseline.root));
+        const auto candidate_root = addon::usage_cache_io_path(addon::path_from_utf8(candidate));
+        Usage_index index;
+        File_cache retained;
+        const bool adoption = manifest->format != k_index_format;
+        stage = "verifying the saved usage cache";
+        if (adoption) {
+            if ((manifest->format != "claude-message-cache@1" && manifest->format != "claude-message-cache@2") ||
+                manifest->files.size() != 1 || manifest->files.front().path != "messages.jsonl")
+            {
+                throw std::runtime_error("usage_cache_format_unsupported");
+            }
+            if (!addon::validate_usage_cache_file(baseline, *manifest, "messages.jsonl", cancelled, &failure)) {
+                throw std::runtime_error(failure.reason_code);
+            }
+            index.seed_receipt = read_cache(selected_root / "messages.jsonl", false, retained, context);
+            for (const auto& [source, cached] : retained) {
+                index.sources.emplace(source, index_source(cached));
+                for (const auto& message : cached.messages) {
+                    if (!index.repositories.contains(message.cwd)) {
+                        index.repositories.emplace(message.cwd, repository(message.cwd));
+                    }
+                }
+            }
+            apply_message_owners(retained, assign_index_owners(index));
+        }
+        else {
+            if (!addon::validate_usage_cache_file(baseline, *manifest, k_index_file, cancelled, &failure)) {
+                throw std::runtime_error(failure.reason_code);
+            }
+            index = read_index(selected_root, context);
+            check_index_inventory(index, *manifest);
+        }
+        const auto load_source = [&](const std::string& source) {
+            if (retained.contains(source)) {
+                return;
+            }
+            if (!addon::validate_usage_cache_file(baseline, *manifest, source_piece(source), cancelled, &failure)) {
+                throw std::runtime_error(failure.reason_code);
+            }
+            read_source_piece(selected_root, source, index, retained, context);
+        };
+        stage = "reading usage history and saving its candidate cache";
+        File_cache updated;
+        std::set<std::string> changed_ids;
+        Usage_index next_index = index;
+        const auto files = transcript_files(profile, context);
+        std::uint64_t processed = 0;
+        for (const auto& file : files) {
+            if (cancelled()) {
+                throw std::runtime_error("cancelled");
+            }
+            const auto source = cache_path(file);
+            const auto previous = index.sources.find(source);
+            if (previous == index.sources.end() || previous->second.fingerprint != fingerprint(file)) {
+                file_fingerprint_t observed;
+                if (auto parsed = parse_file(file, context, observed)) {
+                    Cached_file fresh;
+                    fresh.fingerprint = observed;
+                    if (previous != index.sources.end()) {
+                        load_source(source);
+                        fresh.messages = reconcile_messages(retained.at(source).messages, std::move(*parsed), context);
+                        for (const auto& [id, session] : previous->second.messages) {
+                            (void)session;
+                            changed_ids.insert(id);
+                        }
+                    }
+                    else {
+                        fresh.messages = std::move(*parsed);
+                    }
+                    for (const auto& message : fresh.messages) {
+                        changed_ids.insert(message.id);
+                    }
+                    next_index.sources[source] = index_source(fresh);
+                    updated.emplace(source, std::move(fresh));
+                }
+            }
+            context.report_progress(++processed, files.size());
+        }
+        Repository_map current_repositories;
+        for (const auto& [source, indexed] : next_index.sources) {
+            (void)source;
+            for (const auto& cwd : indexed.directories) {
+                if (cancelled()) {
+                    throw std::runtime_error("cancelled");
+                }
+                if (!current_repositories.contains(cwd)) {
+                    current_repositories.emplace(cwd, repository(cwd));
+                }
+                const auto previous = index.repositories.find(cwd);
+                if (previous != index.repositories.end() && previous->second != current_repositories.at(cwd)) {
+                    for (const auto& [id, session] : indexed.messages) {
+                        (void)session;
+                        changed_ids.insert(id);
+                    }
+                }
+            }
+        }
+        next_index.repositories = std::move(current_repositories);
+        const auto owners = assign_index_owners(next_index);
+        apply_message_owners(updated, owners);
+        if (!adoption && updated.empty() && next_index.repositories == index.repositories) {
+            if (cancelled()) {
+                throw std::runtime_error("cancelled");
+            }
+            context.succeed(addon::encode_usage_incremental_result(result));
+            return;
+        }
+        Snapshot snapshot;
+        snapshot.profile = profile_key;
+        snapshot.scope.observed_at_ms = now_ms();
+        snapshot.scope.fresh_for_ms = 60000;
+        if (input->context.account_context) {
+            snapshot.scope.source_account_key = input->context.account_context->adapter_account_key;
+        }
+        snapshot_id = addon::random_nonce_hex();
+        if (adoption) {
+            for (const auto& [source, fresh] : updated) {
+                retained[source] = fresh;
+            }
+            // The monolithic format retained cwd, but not the resolved repository
+            // allocation. Publish its saved observations once during conversion.
+            snapshot.sessions = aggregate_usage(retained, context, nullptr, &next_index.repositories);
+            complete_records(snapshot, snapshot_id, baseline);
+        }
+        else
+        if (!changed_ids.empty()) {
+            const auto previous_owners = message_owners(index);
+            const auto next_owners = message_owners(next_index);
+            std::set<std::string> affected_sessions;
+            for (const auto& id : changed_ids) {
+                for (const auto* owners : {&previous_owners, &next_owners}) {
+                    const auto found = owners->find(id);
+                    if (found != owners->end()) {
+                        affected_sessions.insert(found->second);
+                    }
+                }
+            }
+            std::set<std::string> selected_ids;
+            for (const auto* owners : {&previous_owners, &next_owners}) {
+                for (const auto& [id, session] : *owners) {
+                    if (affected_sessions.contains(session)) {
+                        selected_ids.insert(id);
+                    }
+                }
+            }
+            // A changed message can affect the first copy in another transcript;
+            // all copies of every affected session's messages participate.
+            for (const auto& [source, indexed] : index.sources) {
+                if (std::any_of(indexed.messages.begin(), indexed.messages.end(),
+                    [&selected_ids](const auto& message) { return selected_ids.contains(message.first); }))
+                {
+                    load_source(source);
+                }
+            }
+            Snapshot previous;
+            previous.scope = snapshot.scope;
+            previous.sessions = aggregate_usage(retained, context, &selected_ids, &index.repositories);
+            complete_records(previous, snapshot_id, baseline);
+            for (const auto& [source, fresh] : updated) {
+                retained[source] = fresh;
+            }
+            snapshot.sessions = aggregate_usage(retained, context, &selected_ids, &next_index.repositories);
+            complete_records(snapshot, snapshot_id, baseline);
+            std::map<std::string, Json> previous_records;
+            for (const auto& session : previous.sessions) {
+                previous_records.emplace(session.record.record_id, comparison_record(session.record));
+            }
+            std::erase_if(snapshot.sessions, [&previous_records](const Usage_session& session) {
+                const auto found = previous_records.find(session.record.record_id);
+                return found != previous_records.end() && found->second == comparison_record(session.record);
+            });
+        }
+        for (const auto& [source, indexed] : next_index.sources) {
+            (void)indexed;
+            if (adoption || updated.contains(source)) {
+                File_cache piece;
+                const auto fresh = updated.find(source);
+                piece.emplace(source, fresh == updated.end() ? retained.at(source) : fresh->second);
+                write_cache(candidate_root / source_piece(source), piece, context, index.seed_receipt);
+            }
+            else
+            if (!addon::inherit_usage_cache_file(
+                baseline, *manifest, source_piece(source), candidate, storage, cancelled, &failure))
+            {
+                throw std::runtime_error(failure.reason_code);
+            }
+        }
+        write_index(candidate_root, next_index, context);
+        stage = "sealing the candidate usage cache";
+        snapshot.cache_candidate = addon::seal_usage_incremental_cache_candidate(
+            candidate, storage, input->context.account_context, snapshot_id,
+            std::string(k_index_format), baseline, cancelled, &failure);
+        if (!snapshot.cache_candidate) {
+            throw std::runtime_error(failure.reason_code);
+        }
+        snapshot.touched_ms = now_ms();
+        std::lock_guard lock(s_snapshot_mutex);
+        std::erase_if(s_snapshots, [](const auto& entry) { return now_ms() - entry.second.touched_ms > 600000; });
+        if (s_snapshots.size() >= 8) {
+            throw std::runtime_error("usage_snapshot_capacity");
+        }
+        s_snapshots.emplace(snapshot_id, std::move(snapshot));
+    }
+    stage = "returning the usage snapshot";
+    result.changes = addon::Usage_scan_page{};
+    const auto reserved_payload_bytes = addon::serialize_json(addon::encode_usage_incremental_result(result)).size() -
+        addon::serialize_json(addon::encode_usage_scan_result(*result.changes, 3)).size();
+    result.changes = snapshot_page(*input, profile_key, snapshot_id, begin, 3, reserved_payload_bytes);
+    context.succeed(addon::encode_usage_incremental_result(result));
+}
 
 void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
 {
@@ -883,32 +1633,7 @@ void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
         identity.cursor.reset();
         profile_key = addon::to_hex(addon::Sha256::digest(
             addon::serialize_json_canonical(addon::encode_usage_scan_request(identity, 3))));
-        const auto& selection = *input->cache_selection;
-        const auto& root = input->context.profile_storage->root;
-        if (!addon::validate_usage_cache_root(selection.candidate_root, root, &failure)) {
-            throw std::runtime_error(failure.reason_code);
-        }
-        const auto outside_mutable = [&](const std::string& selected) {
-            const auto mutable_path = addon::path_from_utf8(root) / "claude-message-cache-v1.jsonl";
-            for (auto path = addon::path_from_utf8(selected); path.has_relative_path(); path = path.parent_path()) {
-                std::error_code error;
-                if (fs::equivalent(path, mutable_path, error)) {
-                    return false;
-                }
-            }
-            const auto relative = addon::path_from_utf8(selected).lexically_relative(addon::path_from_utf8(root));
-            auto name = addon::path_to_utf8(*relative.begin());
-#ifdef _WIN32
-            name = addon::ascii_lowercase(name);
-#endif
-            return name != "claude-message-cache-v1.jsonl" &&
-                !(name.starts_with("claude-cache-") && name.ends_with(".tmp"));
-        };
-        if (!outside_mutable(selection.candidate_root) ||
-            (selection.accepted && !outside_mutable(selection.accepted->root)))
-        {
-            throw std::runtime_error("usage_cache_namespace_conflict");
-        }
+        validate_cache_namespace(*input, failure);
     }
     std::string snapshot_id;
     std::size_t begin = 0;
@@ -932,13 +1657,21 @@ void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
                     *selection.accepted, root, input->context.account_context,
                     [&context] { return context.cancel_requested(); }, &failure);
                 if (!manifest) throw std::runtime_error(failure.reason_code);
+                if (manifest->format == k_index_format) {
+                    const auto directory = addon::usage_cache_io_path(addon::path_from_utf8(selection.accepted->root));
+                    check_index_inventory(read_index(directory, context), *manifest);
+                    cache.selected_directory = directory;
+                }
+                else
                 if ((manifest->format != "claude-message-cache@1" && manifest->format != "claude-message-cache@2") ||
                     manifest->files.size() != 1 ||
                     manifest->files.front().path != "messages.jsonl")
                 {
                     throw std::runtime_error("usage_cache_format_unsupported");
                 }
-                cache.selected_file = addon::usage_cache_io_path(addon::path_from_utf8(selection.accepted->root)) / "messages.jsonl";
+                else {
+                    cache.selected_file = addon::usage_cache_io_path(addon::path_from_utf8(selection.accepted->root)) / "messages.jsonl";
+                }
             }
         }
         if (input->native_file_cache) {
@@ -959,39 +1692,8 @@ void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
         snapshot.touched_ms = now_ms();
         snapshot_id = addon::random_nonce_hex();
         if (version == 3) {
-            for (auto& session : snapshot.sessions) {
-                addon::Usage_temporal temporal;
-                temporal.parent = {session.record.record_id, session.record.total_tokens,
-                    snapshot_id, snapshot.scope.source_account_key};
-                temporal.unavailable_tokens = session.temporal_unavailable_tokens;
-                for (const auto& [instant, tokens] : session.temporal_tokens) {
-                    temporal.portions.push_back({"instant", instant, {}, {}, tokens});
-                }
-                if (session.temporal_capacity) {
-                    temporal.unavailable_tokens = session.record.total_tokens;
-                    temporal.coverage_reason = "capacity";
-                }
-                else
-                if (session.temporal_missing || session.temporal_unsupported) {
-                    temporal.coverage_reason = temporal.portions.empty() &&
-                        session.temporal_unsupported && !session.temporal_missing ? "unsupported" : "missing-evidence";
-                }
-                if (session.temporal_retained && input->cache_selection->accepted) {
-                    const auto& accepted = *input->cache_selection->accepted;
-                    temporal.retained_from = addon::Usage_temporal_retained_from{
-                        accepted.snapshot_id, accepted.manifest_sha256_hex};
-                }
-                if (!addon::decode_usage_temporal(addon::encode_usage_temporal(temporal), nullptr)) {
-                    temporal.portions.clear();
-                    temporal.unavailable_tokens = session.record.total_tokens;
-                    temporal.coverage_reason = "capacity";
-                    if (!addon::decode_usage_temporal(addon::encode_usage_temporal(temporal), nullptr)) continue;
-                }
-                session.record.temporal = std::move(temporal);
-            }
+            complete_records(snapshot, snapshot_id, input->cache_selection->accepted);
             stage = "sealing the candidate usage cache";
-            // Surviving transcripts do not prove that all contributing messages remain.
-            for (auto& session : snapshot.sessions) session.record.aggregate_evidence = "partial";
             snapshot.cache_candidate = addon::seal_usage_cache_candidate(
                 input->cache_selection->candidate_root, input->context.profile_storage->root,
                 input->context.account_context, snapshot_id, "claude-message-cache@2",
@@ -1012,47 +1714,7 @@ void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
         }
     }
     stage = "returning the usage snapshot";
-    addon::Usage_scan_page page;
-    page.incomplete_historical_coverage = true;
-    {
-        std::lock_guard lock(s_snapshot_mutex);
-        const auto found = s_snapshots.find(snapshot_id);
-        if (found == s_snapshots.end() || found->second.profile != profile_key || begin > found->second.sessions.size()) {
-            throw std::runtime_error("usage_snapshot_unavailable");
-        }
-        auto& snapshot = found->second;
-        snapshot.touched_ms = now_ms();
-        page.snapshot_id = snapshot_id;
-        page.scope = snapshot.scope;
-        page.cache_candidate = snapshot.cache_candidate;
-        if (version == 3) {
-            page.account_context = input->context.account_context;
-            page.profile_storage = input->context.profile_storage;
-        }
-        auto end = begin;
-        std::size_t encoded_records_bytes = 0;
-        for (; end < snapshot.sessions.size(); ++end) {
-            page.complete = end + 1 == snapshot.sessions.size();
-            if (page.complete) page.next_cursor.reset();
-            else page.next_cursor = std::to_string(end + 1);
-            const auto& record = snapshot.sessions[end].record;
-            if (addon::append_usage_page_record(page, record, encoded_records_bytes, version)) continue;
-            if (!page.records.empty()) break;
-            auto accounting = record;
-            if (accounting.temporal) {
-                accounting.temporal->portions.clear();
-                accounting.temporal->unavailable_tokens = accounting.total_tokens;
-                accounting.temporal->coverage_reason = "capacity";
-                if (addon::append_usage_page_record(page, accounting, encoded_records_bytes, version)) continue;
-                accounting.temporal.reset();
-            }
-            if (addon::append_usage_page_record(page, accounting, encoded_records_bytes, version)) continue;
-            throw std::runtime_error("usage_record_transport_limit_exceeded");
-        }
-        page.complete = end == snapshot.sessions.size();
-        if (!page.complete) page.next_cursor = std::to_string(end);
-        else s_snapshots.erase(found);
-    }
+    const auto page = snapshot_page(*input, profile_key, snapshot_id, begin, version);
     context.succeed(addon::encode_usage_scan_result(page, version));
 }
 
@@ -1073,7 +1735,12 @@ void handle_usage(addon::Invocation_context& context)
 {
     const char* stage = "preparing the usage scan";
     try {
-        handle_usage_scan(context, stage);
+        if (context.request().capability.capability_id == "usage-incremental") {
+            handle_incremental_usage(context, stage);
+        }
+        else {
+            handle_usage_scan(context, stage);
+        }
     }
     catch (const fs::filesystem_error& error) {
         fail_usage(context, stage, "claude_usage_filesystem_failed",

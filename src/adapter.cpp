@@ -95,7 +95,7 @@ void invoke(addon::Invocation_context& context, const fs::path& package_root)
         else
         if (capability == "legacy-state-import") claude::handle_history(context);
         else
-        if (capability == "usage-scan") claude::handle_usage(context);
+        if (capability == "usage-scan" || capability == "usage-incremental") claude::handle_usage(context);
         else
         if (capability == "usage-lifetime-summary") claude::handle_usage_summary(context);
         else
@@ -131,6 +131,7 @@ int main()
         {"usage-scan", 2}, {"usage-scan", 3}, {"legacy-state-import", 1}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {"usage-lifetime-summary", 1},
         {"usage-saved-daily-tokens", 1},
+        {"usage-incremental", 1},
         {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"coordination-delivery", 1},

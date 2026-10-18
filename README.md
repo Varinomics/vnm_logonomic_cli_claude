@@ -99,6 +99,16 @@ represented by their retained per-message evidence. Historical coverage
 remains explicitly incomplete because transcripts do not prove a complete
 lifetime history.
 
+Hosts may use `usage-incremental@1` with an accepted cache generation to receive
+only changed complete session observations. Unchanged scans inspect the saved
+source index and filesystem metadata without loading or exporting message
+accounting. The first conversion from a monolithic cache publishes its saved
+session observations once because that format did not retain resolved repository
+allocations; it does not reread unchanged transcripts. `usage-scan@3` continues
+to return complete snapshots, including from converted caches. Accepted message
+IDs keep their original source and session owner when another transcript copies
+them; all copies still contribute conflict evidence.
+
 Usage failures report the operation that failed and a safe explanation. Native
 profile paths, transcript contents and credentials are excluded from these
 diagnostics. Failed scans do not replace the host's accepted usage cache.
