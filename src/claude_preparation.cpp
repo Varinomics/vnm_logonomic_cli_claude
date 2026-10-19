@@ -131,7 +131,7 @@ std::optional<std::vector<std::string>> literal_command(const std::vector<std::s
     const auto index = shell_command_index(argv);
     if (!index) return std::nullopt;
     const auto shell = executable_name(argv.front());
-    auto parsed = shell == "cmd" ? std::optional(literal_argv(argv[*index]))
+    auto parsed = shell == "cmd" ? std::optional(addon::literal_argv(argv[*index]))
         : shell_words(argv[*index], shell == "powershell" || shell == "pwsh");
     if (!parsed || !cli_argument_index(*parsed)) return std::nullopt;
     return parsed;

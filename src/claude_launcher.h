@@ -19,7 +19,6 @@ struct Launcher_command
 };
 
 std::optional<Launcher_command> recognize_launcher(std::string_view script);
-std::vector<std::string> literal_argv(std::string_view script);
 std::optional<std::size_t> cli_argument_index(const std::vector<std::string>& argv);
 // The words that follow argv[index] as its value when Claude parses argv, for
 // the options an interactive launch may carry: one after an option that takes
