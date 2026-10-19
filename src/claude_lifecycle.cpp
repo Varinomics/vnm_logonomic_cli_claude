@@ -77,6 +77,7 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
     observation.provider_session_id = metadata(body, "session_id");
     result.classification = addon::Classification::EVENT;
     if (name == "SessionStart") {
+        if (text(body, "source") == "compact") return {};
         observation.session_source = metadata(body, "source");
         observation.session_transition = addon::Session_transition::STARTED;
         result.classification = addon::Classification::TRANSITION;

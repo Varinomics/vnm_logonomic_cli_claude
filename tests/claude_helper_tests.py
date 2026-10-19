@@ -254,6 +254,17 @@ def main():
         assert not wake_directory.exists(), "refused native start allocated wake storage"
         result, _, _ = run(start, VNM_CLAUDE_WAKE_DIRECTORY=str(wake_directory))
         assert result.returncode == 0 and (wake_directory / "registration.json").is_file()
+        registration = json.loads((wake_directory / "registration.json").read_text(encoding="utf-8"))
+        for _ in range(2):
+            result, records, _ = run({**start, "source": "compact"},
+                VNM_CLAUDE_WAKE_DIRECTORY=str(wake_directory))
+            assert result.returncode == 0, result.stderr
+            assert [item["operation"] for item in records] == ["provider-event", "request-title-instruction", "acknowledge"]
+            assert json.loads(result.stdout)["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+            current = json.loads((wake_directory / "registration.json").read_text(encoding="utf-8"))
+            assert current == registration, "compaction changed the accepted startup wake registration"
+            assert records[0]["request"]["transition_nonce"] != registration["transition_nonce"], \
+                "fixture must distinguish the compaction delivery nonce from the session transition"
         end = {"hook_event_name": "SessionEnd", "session_id": "other-session", "reason": "exit"}
         run(end, VNM_CLAUDE_WAKE_DIRECTORY=str(wake_directory))
         assert wake_directory.is_dir(), "unrelated session end removed a live binding"

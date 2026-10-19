@@ -1134,6 +1134,38 @@ void lifecycle_contract()
     require(start.classification == addon::Classification::TRANSITION && start.transition == addon::Transition_kind::RESUME,
         "native resume source selects resume transition");
     require(start.observations[0].resume_record.has_value(), "canonical Session UUID supplies exact resume record");
+    request.ledger.current_epoch = 1;
+    request.ledger.current_transition = addon::Ledger_transition{addon::Transition_kind::START,
+        "a375d05e-f6cf-4812-80f5-91b33d24c053", std::string(32, '1')};
+    request.event.body.set("source", Json("compact"));
+    for (const char nonce : {'2', '3'}) {
+        request.transition_nonce = std::string(32, nonce);
+        const auto compact = claude::classify_event(request);
+        require(compact.classification == addon::Classification::IGNORED && !compact.transition &&
+            compact.observations.empty(), "compaction preserves the current session transition and lifecycle facts");
+        addon::Contract_failure failure;
+        const auto decoded = addon::decode_classify_event_result(
+            addon::encode_classify_event_result(compact), &failure);
+        require(decoded && decoded->classification == addon::Classification::IGNORED &&
+            decoded->observations.empty(), "ignored compaction survives the lifecycle codec");
+        addon::Attention_classification_request attention;
+        attention.base = request;
+        const auto classified = claude::classify_attention(attention);
+        require(classified.base.classification == addon::Classification::IGNORED &&
+            classified.base.observations.empty() && !classified.attention_kind,
+            "compaction preserves the companion attention state");
+    }
+    for (const auto source : {"startup", "resume", "clear"}) {
+        request.event.body.set("source", Json(source));
+        const auto transition = claude::classify_event(request);
+        const auto expected = std::string_view(source) == "resume"
+            ? addon::Transition_kind::RESUME : addon::Transition_kind::START;
+        require(transition.classification == addon::Classification::TRANSITION && transition.transition == expected &&
+            transition.observations.size() == 1 &&
+            transition.observations.front().session_transition == addon::Session_transition::STARTED &&
+            transition.observations.front().resume_record.has_value(),
+            "startup, resume and clear retain their session transitions");
+    }
     request.event.name = "UserPromptSubmit";
     request.event.body = claude::object(R"({"hook_event_name":"UserPromptSubmit","session_id":"session","prompt_id":"turn"})");
     auto result = claude::classify_event(request);

@@ -1,4 +1,5 @@
 #include "claude_helper.h"
+#include "claude_support.h"
 #include "claude_wake.h"
 
 #include <logonomic_cli_addon/helper_client.h>
@@ -195,7 +196,8 @@ int run_helper(int argc, char** argv)
     // SessionStart must establish the new native identity before requesting
     // instructions; it is not the already-active prompt case above.
     if (name == "SessionStart" && outcome.accepted) {
-        register_wake(*event, nonce);
+        // Compaction carries context for the existing ledger transition.
+        if (text(*event, "source") != "compact") register_wake(*event, nonce);
         if (!emit_context()) return addon::k_helper_exit_transport_failure;
     }
     if (name == "SessionEnd" && outcome.accepted) {
