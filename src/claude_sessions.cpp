@@ -362,7 +362,9 @@ addon::Structured_inspect_result inspect_session(
     addon::Structured_purpose purpose, const addon::Structured_inspection& inspection)
 {
     try {
-        Json state = object(inspection.protocol_state);
+        auto parsed = addon::parse_exchange_protocol_state(inspection.protocol_state);
+        if (!parsed || !parsed->is_object()) return failed("invalid_structured_output");
+        Json state = std::move(*parsed);
         const auto* initialized_value = state.find("initialized");
         const auto pending_value = addon::decode_base64(text(state, "pending_base64"));
         const auto result_value  = addon::decode_base64(text(state, "result_base64"));
