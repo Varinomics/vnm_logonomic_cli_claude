@@ -238,7 +238,8 @@ if(BUILD_TESTING)
 endif()
 if(BUILD_TESTING)
     add_executable(claude_usage_cache_tests tests/claude_usage_cache_tests.cpp)
-    target_link_libraries(claude_usage_cache_tests PRIVATE claude_provider)
+    target_link_libraries(claude_usage_cache_tests PRIVATE
+        claude_provider logonomic_cli_addon_sdk::test_support)
     claude_target(claude_usage_cache_tests)
     add_dependencies(claude_usage_cache_tests claude_package)
     add_test(NAME claude_usage_cache_tests
