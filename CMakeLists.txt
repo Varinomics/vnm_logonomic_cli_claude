@@ -174,6 +174,8 @@ if(LOGONOMIC_CLI_ADDON_EMBEDDED)
 endif()
 
 include(CTest)
+option(LOGONOMIC_CLI_ADDON_LARGE_DATA_TESTS
+    "Register full-size usage history and capacity regressions" OFF)
 if(BUILD_TESTING)
     add_executable(claude_quota_direct_tests tests/claude_quota_direct_tests.cpp)
     claude_target(claude_quota_direct_tests)
@@ -245,6 +247,12 @@ if(BUILD_TESTING)
     add_test(NAME claude_usage_cache_tests
         COMMAND claude_usage_cache_tests "${CLAUDE_PACKAGE_DIRECTORY}")
     set_tests_properties(claude_usage_cache_tests PROPERTIES TIMEOUT 180 LABELS "usage;cache;packaged-adapter")
+    if(LOGONOMIC_CLI_ADDON_LARGE_DATA_TESTS)
+        add_test(NAME claude_usage_large_data_tests
+            COMMAND claude_usage_cache_tests "${CLAUDE_PACKAGE_DIRECTORY}" --large-data)
+        set_tests_properties(claude_usage_large_data_tests PROPERTIES
+            TIMEOUT 180 LABELS "usage;cache;large-data")
+    endif()
     add_executable(claude_usage_host_tests tests/claude_usage_host_tests.cpp)
     target_link_libraries(claude_usage_host_tests PRIVATE claude_provider)
     claude_target(claude_usage_host_tests)

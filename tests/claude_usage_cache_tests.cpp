@@ -1064,8 +1064,9 @@ void cancelled_scan_contract(const fs::path& fixture)
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) {
-        std::cerr << "expected built package directory\n";
+    const bool large_data = argc == 3 && std::string_view(argv[2]) == "--large-data";
+    if (argc != 2 && !large_data) {
+        std::cerr << "expected built package directory [--large-data]\n";
         return 1;
     }
     int failures = 0;
@@ -1079,11 +1080,14 @@ int main(int argc, char** argv)
             ++failures;
         }
     };
+    if (large_data) {
+        run("large history", large_history_contract);
+        run("many messages", many_messages_contract);
+        return failures == 0 ? 0 : 1;
+    }
     const auto package = addon::path_from_utf8(argv[1]);
     run("adapter cache", [&package](const fs::path& fixture) { adapter_cache_contract(package, fixture); });
     run("incremental cache", [&package](const fs::path& fixture) { incremental_cache_contract(package, fixture); });
-    run("large history", large_history_contract);
-    run("many messages", many_messages_contract);
     run("bounded cache lines", bounded_cache_lines_contract);
     run("live transcript", live_transcript_contract);
     run("cancelled scan", cancelled_scan_contract);
