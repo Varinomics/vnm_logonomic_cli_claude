@@ -70,9 +70,21 @@ async function run() {
     assert.deepEqual(await main(['reserve', directory, retry.id], ''), { reserved: true });
     await main(['reply', directory, retry.id], JSON.stringify({ disposition: 'deferred', reason: 'native_busy' }));
 
-    const uncertain = await claim(request('uncertain', 150));
-    await main(['reserve', directory, uncertain.id], '');
-    assert.deepEqual(await main(['submit', directory, uncertain.id], ''), { unknown: true });
+    // Filesystem notification and reservation must finish before expiry; their
+    // scheduling is not part of the native-result timeout contract.
+    const real_now = Date.now;
+    let now = real_now();
+    Date.now = () => now;
+    try {
+        const uncertain = await claim(request('uncertain', 150));
+        assert.deepEqual(await main(['reserve', directory, uncertain.id], ''), { reserved: true });
+        const submission = main(['submit', directory, uncertain.id], '');
+        now += 150;
+        assert.deepEqual(await submission, { unknown: true });
+    }
+    finally {
+        Date.now = real_now;
+    }
     const retried = await claim(request('uncertain'));
     assert.deepEqual(await main(['reserve', directory, retried.id], ''), {
         disposition: 'uncertain', reason: 'claude_wake_result_unknown',
