@@ -1,0 +1,7 @@
+{
+  "capability_id": "conversation-export",
+  "version": 1,
+  "payload": {
+    "environment_names": ["CLAUDE_CONFIG_DIR", "HOME", "USERPROFILE"]
+  }
+}
