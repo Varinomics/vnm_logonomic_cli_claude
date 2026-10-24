@@ -174,7 +174,7 @@ void handle_probes(addon::Invocation_context& context, const std::filesystem::pa
         result.inspection.protocol_state = "await_exit";
         result.profile_storage = input->context.profile_storage;
         result.account_context = input->context.account_context;
-        context.succeed(addon::encode_structured_prepare_result(result, 2));
+        context.succeed(addon::encode_structured_prepare_result(result));
         return;
     }
     if (context.request().operation != "inspect") {

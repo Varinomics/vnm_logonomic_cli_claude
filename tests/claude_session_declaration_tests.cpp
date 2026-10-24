@@ -37,7 +37,7 @@ addon::Purposes_declaration read_declaration(const fs::path& package, const std:
 
     // The host decodes the whole declaration before admitting either purpose.
     // Package envelope validation alone does not establish this contract.
-    const auto declaration = addon::decode_purposes_declaration(sidecar->payload, &failure, sidecar->version);
+    const auto declaration = addon::decode_purposes_declaration(sidecar->payload, &failure);
     require(declaration.has_value(), capability + ": " + failure.reason_code + ": " + failure.detail);
     for (const auto purpose : {addon::Structured_purpose::READ_ONLY_REVIEW, addon::Structured_purpose::IMPLEMENTATION}) {
         require(std::find(declaration->purposes.begin(), declaration->purposes.end(), purpose) !=

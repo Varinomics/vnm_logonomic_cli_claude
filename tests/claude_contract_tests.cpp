@@ -1342,10 +1342,10 @@ addon::Delegated_prepare_result delegated_fixture(addon::Structured_purpose purp
     Context invocation;
     invocation.m_request.capability.capability_id = "delegated-session";
     invocation.m_request.operation = "prepare";
-    invocation.m_request.payload = addon::encode_delegated_prepare_request(request, 3);
+    invocation.m_request.payload = addon::encode_delegated_prepare_request(request);
     claude::handle_sessions(invocation, fs::current_path());
     addon::Contract_failure failure;
-    const auto prepared = addon::decode_delegated_prepare_result(invocation.m_payload, &failure, 3);
+    const auto prepared = addon::decode_delegated_prepare_result(invocation.m_payload, &failure);
     require(prepared.has_value(), "delegated native preparation satisfies session@3 codec");
     require(prepared->acknowledgment.connection_version == addon::k_delegated_connection_version,
         "delegated preparation acknowledges the configured connection");
@@ -1367,7 +1367,7 @@ addon::Delegated_prepare_result delegated_fixture(addon::Structured_purpose purp
     disconnected.control.connection.reset();
     Context refused;
     refused.m_request = invocation.m_request;
-    refused.m_request.payload = addon::encode_delegated_prepare_request(disconnected, 3);
+    refused.m_request.payload = addon::encode_delegated_prepare_request(disconnected);
     claude::handle_sessions(refused, fs::current_path());
     require(refused.m_status == addon::Result_status::UNAVAILABLE &&
         refused.m_reason == "task_server_connection_unavailable", "missing connection refuses delegation locally");
@@ -1380,9 +1380,9 @@ addon::Delegated_prepare_result delegated_fixture(addon::Structured_purpose purp
     ordinary.context = request.context;
     ordinary.prompt = request.prompt;
     invocation.m_request.capability.capability_id = "structured-session";
-    invocation.m_request.payload = addon::encode_structured_prepare_request(ordinary, 3);
+    invocation.m_request.payload = addon::encode_structured_prepare_request(ordinary);
     claude::handle_sessions(invocation, fs::current_path());
-    const auto one_shot = addon::decode_structured_prepare_result(invocation.m_payload, &failure, 3);
+    const auto one_shot = addon::decode_structured_prepare_result(invocation.m_payload, &failure);
     require(one_shot && !one_shot->inspection.keep_stdin_open &&
         one_shot->process.stdin_payload == request.prompt,
         "ordinary sessions retain raw one-shot input under session@3");
@@ -1410,7 +1410,7 @@ addon::Structured_inspect_result inspect_readiness(
     auto result = claude::inspect_session(purpose, inspection);
     addon::Contract_failure failure;
     require(addon::decode_structured_inspect_result(
-        addon::encode_structured_inspect_result(result, 3), false, &failure, 3).has_value(),
+        addon::encode_structured_inspect_result(result), false, &failure).has_value(),
         "readiness output satisfies session@3 codec");
     return result;
 }
@@ -1667,7 +1667,7 @@ Context posture_prepare(const addon::Delegated_prepare_request& request, bool de
     invocation.m_request.operation = "prepare";
     if (delegated) {
         invocation.m_request.capability.capability_id = "delegated-session";
-        invocation.m_request.payload = addon::encode_delegated_prepare_request(request, 3);
+        invocation.m_request.payload = addon::encode_delegated_prepare_request(request);
     }
     else {
         addon::Structured_prepare_request structured;
@@ -1675,7 +1675,7 @@ Context posture_prepare(const addon::Delegated_prepare_request& request, bool de
         structured.context = request.context;
         structured.prompt  = request.prompt;
         invocation.m_request.capability.capability_id = "structured-session";
-        invocation.m_request.payload = addon::encode_structured_prepare_request(structured, 3);
+        invocation.m_request.payload = addon::encode_structured_prepare_request(structured);
     }
     claude::handle_sessions(invocation, fs::current_path());
     return invocation;
@@ -1687,8 +1687,8 @@ Claude_reading prepared_reading(const Context& invocation, bool delegated)
 {
     addon::Contract_failure failure;
     const auto process = delegated
-        ? addon::decode_delegated_prepare_result(invocation.m_payload, &failure, 3)->process
-        : addon::decode_structured_prepare_result(invocation.m_payload, &failure, 3)->process;
+        ? addon::decode_delegated_prepare_result(invocation.m_payload, &failure)->process
+        : addon::decode_structured_prepare_result(invocation.m_payload, &failure)->process;
     std::vector<std::string> argv{"claude"};
     argv.insert(argv.end(), process.argv.begin(), process.argv.end());
     return claude_reading(argv);
@@ -1976,7 +1976,7 @@ void probe_profile_contract()
             invocation.m_request.operation = "prepare";
             invocation.m_request.payload = addon::encode_probe_prepare_request(request, 2);
             claude::handle_probes(invocation, root);
-            const auto prepared = addon::decode_structured_prepare_result(invocation.m_payload, &failure, 2);
+            const auto prepared = addon::decode_structured_prepare_result(invocation.m_payload, &failure);
             require(prepared.has_value(), "quota preparation yields a process proposal");
             for (const auto& [name, value] : prepared->process.environment) {
                 if (name == "CLAUDE_CONFIG_DIR") return claude::account_key(addon::path_from_utf8(value));

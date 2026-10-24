@@ -556,12 +556,12 @@ void handle_sessions(addon::Invocation_context& invocation, const std::filesyste
     const auto& request = invocation.request();
     addon::Contract_failure failure;
     if (request.operation == "inspect" && request.capability.capability_id == "structured-session") {
-        const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure, 3);
+        const auto inspection = addon::decode_structured_inspect_request(request.payload, &failure);
         if (!inspection) {
             invocation.fail(addon::Result_status::FAILED, failure.reason_code);
             return;
         }
-        invocation.succeed(addon::encode_structured_inspect_result(inspect_session(inspection->purpose, inspection->inspection), 3));
+        invocation.succeed(addon::encode_structured_inspect_result(inspect_session(inspection->purpose, inspection->inspection)));
         return;
     }
     if (request.operation != "prepare") {
@@ -569,7 +569,7 @@ void handle_sessions(addon::Invocation_context& invocation, const std::filesyste
         return;
     }
     if (request.capability.capability_id == "structured-session") {
-        const auto input = addon::decode_structured_prepare_request(request.payload, &failure, 3);
+        const auto input = addon::decode_structured_prepare_request(request.payload, &failure);
         if (!input) {
             invocation.fail(addon::Result_status::FAILED, failure.reason_code);
             return;
@@ -577,10 +577,10 @@ void handle_sessions(addon::Invocation_context& invocation, const std::filesyste
         auto result = prepare(input->context, input->purpose, input->prompt,
             path_string(package_root / "assets/empty_mcp.json"), {}, {}, Json::array());
         result.process.assets.push_back("assets/empty_mcp.json");
-        invocation.succeed(addon::encode_structured_prepare_result(result, 3));
+        invocation.succeed(addon::encode_structured_prepare_result(result));
         return;
     }
-    const auto input = addon::decode_delegated_prepare_request(request.payload, &failure, 3);
+    const auto input = addon::decode_delegated_prepare_request(request.payload, &failure);
     if (!input) {
         invocation.fail(addon::Result_status::FAILED, failure.reason_code);
         return;
@@ -622,7 +622,7 @@ void handle_sessions(addon::Invocation_context& invocation, const std::filesyste
     result.inspection      = std::move(prepared.inspection);
     result.profile_storage = input->context.profile_storage;
     result.account_context = input->context.account_context;
-    invocation.succeed(addon::encode_delegated_prepare_result(result, 3));
+    invocation.succeed(addon::encode_delegated_prepare_result(result));
 }
 
 } // namespace claude

@@ -126,7 +126,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1}, {"managed-assets", 1},
         {"accounts", 2}, {"launch-preparation", 3}, {"interactive-resume", 2}, {"interactive-resume", 3},
         {"structured-session", 3}, {"delegated-session", 3}, {"auth-status", 2}, {"quota", 2},
-        {"usage-scan", 3}, {"lifecycle-events", 1}, {"helper-ingress", 2},
+        {"usage-scan", 3}, {"lifecycle-events", 2}, {"helper-ingress", 2},
         {"usage-lifetime-summary", 1},
         {"usage-saved-daily-tokens", 1},
         {"usage-incremental", 1},
