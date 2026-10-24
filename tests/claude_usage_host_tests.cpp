@@ -81,13 +81,6 @@ private:
     fs::path m_path;
 };
 
-// The host stores source paths in Qt's spelling, with forward slashes.
-std::string host_path(const fs::path& path)
-{
-    const auto bytes = path.generic_u8string();
-    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
-}
-
 fs::path source_path(const fs::path& profile, std::string_view session)
 {
     return profile / "projects" / "repo" / fs::path(std::string(session) + ".jsonl");
@@ -580,8 +573,9 @@ void accepted_history_survives_source_deletion(
     check(accepted_sessions.size() == 2 && total(accepted) == 100, "the scan accepts every current session");
     for (const auto& retained : {one, two}) {
         const auto& record = accepted_sessions.at(retained.session);
+        const auto expected_source = addon::path_to_utf8(source_path(profile, retained.session));
         check(record.total_tokens == retained.tokens &&
-            record.source_path == std::optional<std::string>(host_path(source_path(profile, retained.session))) &&
+            record.source_path == std::optional<std::string>(expected_source) &&
             record.source_counter_semantics == std::optional<std::string>("per_event_sum") &&
             record.aggregate_evidence == std::optional<std::string>("partial"),
             "an accepted session keeps its retained count and provenance: " + retained.session);
