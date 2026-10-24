@@ -4,10 +4,19 @@
   "payload": {
     "environment_names": [
       "CLAUDE_CONFIG_DIR",
+      "CLAUDE_CODE_PROJECT_DIR_NAME",
       "SystemRoot",
       "WINDIR",
       "TEMP",
-      "TMP"
+      "TMP",
+      "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
+      "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
+      "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
+      "USE_STAGING_OAUTH",
+      "USE_LOCAL_OAUTH",
+      "GIT_DIR",
+      "GIT_WORK_TREE",
+      "GIT_COMMON_DIR"
     ]
   }
 }

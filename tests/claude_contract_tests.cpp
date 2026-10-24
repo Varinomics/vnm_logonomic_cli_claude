@@ -511,6 +511,7 @@ void launcher_directory_contract()
             R"({"provider_session_id":"a375d05e-f6cf-4812-80f5-91b33d24c053"})");
         Context invocation;
         invocation.m_request.capability.capability_id = "interactive-resume";
+        invocation.m_request.capability.version = 2;
         invocation.m_request.operation = "prepare_resume";
         invocation.m_request.payload = addon::encode_resume_prepare_request(resume, 2);
         claude::handle_preparation(invocation, root);
@@ -880,6 +881,7 @@ void wake_preparation_contract()
             R"({"provider_session_id":"a375d05e-f6cf-4812-80f5-91b33d24c053"})");
         Context invocation;
         invocation.m_request.capability.capability_id = "interactive-resume";
+        invocation.m_request.capability.version = 2;
         invocation.m_request.operation = "prepare_resume";
         invocation.m_request.payload = addon::encode_resume_prepare_request(resume, 2);
         claude::handle_preparation(invocation, root);
