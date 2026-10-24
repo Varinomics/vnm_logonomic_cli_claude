@@ -810,29 +810,6 @@ void incremental_cache_contract(const fs::path& package, const fs::path& fixture
     accepted = *readopted.changes->cache_candidate;
     validate(accepted);
 
-    const auto native_seed = fixture / "incoming-seed.jsonl";
-    addon::Json_value native_message = addon::Json_value::object();
-    native_message.set("record_id", addon::Json_value("unrelated-seed-message"));
-    native_message.set("session_id", addon::Json_value("seed-session"));
-    native_message.set("completed_date", addon::Json_value("2026-09-12"));
-    native_message.set("source_path", addon::Json_value(addon::path_to_utf8(other)));
-    native_message.set("total_tokens", addon::Json_value(9));
-    addon::Json_value seed_records = addon::Json_value::array();
-    seed_records.push_back(std::move(native_message));
-    addon::Json_value seed_wrapper = addon::Json_value::object();
-    seed_wrapper.set("path", addon::Json_value(addon::path_to_utf8(other)));
-    seed_wrapper.set("records", std::move(seed_records));
-    const auto seed_bytes = addon::serialize_json(seed_wrapper) + '\n';
-    write(native_seed, seed_bytes);
-    select(accepted);
-    request.native_file_cache = addon::Usage_native_file_cache{
-        addon::path_to_utf8(native_seed), addon::to_hex(addon::Sha256::digest(seed_bytes)), account, true};
-    const auto seed_mismatch = invoke(false);
-    check(seed_mismatch.status == addon::Host_status::FAILED && seed_mismatch.reason_code == "usage_seed_receipt_mismatch",
-        "partitioned accepted cache applies the same nonempty native-seed receipt check as a monolithic cache");
-    request.native_file_cache.reset();
-    validate(accepted);
-
     write(source, record("main", "shared", 10) + record("main", "private", 2) + record("main", "appended", 3));
     select(accepted);
     auto changed = scan();

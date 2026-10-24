@@ -10,7 +10,6 @@
 #include <logonomic_cli_addon/sha256.h>
 
 #include <logonomic_cli_addon/capability_ids.h>
-#include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/ids.h>
@@ -2040,28 +2039,21 @@ void usage_contract()
         addon::Contract_failure failure;
         require(addon::decode_usage_record(addon::encode_usage_record(sessions[0].record, 2), &failure, 2).has_value(),
             "native aggregate satisfies rich usage contract");
-        auto native = claude::object(R"({"path":"placeholder","size":0,"modified_msecs":0,"records":[{"record_id":"retained-message","session_id":"SessionCase","completed_date":"2026-09-11","total_tokens":30,"source_path":"placeholder","recorded_cwd":"","model":"sonnet","capabilities":{"token_breakdown":{"version":1,"input_tokens":30}}}]})");
-        const auto missing = claude::path_string(root / "projects/project/deleted.jsonl");
-        native.set("path", addon::Json_value(missing));
-        native.find("records")->as_array()[0].set("source_path", addon::Json_value(missing));
-        const auto seed_bytes = addon::serialize_json(native) + "\n";
-        const auto seed_path = root / "native-seed.jsonl";
-        std::ofstream seed(seed_path, std::ios::binary);
-        seed << seed_bytes;
-        seed.close();
         claude::Usage_cache_input cache;
-        cache.native_seed = seed_path;
-        cache.seed_sha256_hex = addon::to_hex(addon::Sha256::digest(seed_bytes));
         cache.storage_file = root / "owned-cache.jsonl";
-        const auto imported = claude::scan_usage(root, context, cache);
-        require(imported.size() == 1 && imported[0].record.total_tokens == 67,
-            "native missing-file messages participate before same-session replacement");
+        {
+            std::ofstream retained_file(root / "projects/project/deleted.jsonl", std::ios::binary);
+            retained_file << R"({"type":"assistant","sessionId":"SessionCase","timestamp":"2026-09-11T12:00:00","message":{"id":"retained-message","model":"sonnet","stop_reason":"end_turn","usage":{"input_tokens":30}}})" << '\n';
+            retained_file.close();
+            require(bool(retained_file), "write current retained-message transcript");
+        }
+        const auto accepted = claude::scan_usage(root, context, cache);
+        require(accepted.size() == 1 && accepted[0].record.total_tokens == 67,
+            "current transcript messages establish accepted cache evidence");
         fs::remove_all(root / "projects");
-        cache.native_seed.reset();
-        cache.cache_required = true;
         const auto retained = claude::scan_usage(root, context, cache);
         require(retained.size() == 1 && retained[0].record.total_tokens == 67,
-            "owned cache preserves imported and deleted projects-subtree evidence");
+            "owned cache preserves accepted evidence after deletion of the projects subtree");
         const auto new_profile = root / "new-profile";
         fs::create_directory(new_profile);
         require(claude::scan_usage(new_profile, context).empty(),
@@ -2076,11 +2068,6 @@ void usage_contract()
         require(projects_path_refused,
             "existing non-directory projects path rejects retained cache evidence");
         fs::remove(root / "projects");
-        fs::remove(*cache.storage_file);
-        bool refused = false;
-        try { (void)claude::scan_usage(root, context, cache); }
-        catch (const std::exception&) { refused = true; }
-        require(refused, "required historical cache loss blocks replacement");
     }
     catch (...) {
         fs::remove_all(root);
@@ -2096,62 +2083,12 @@ void empty_usage_cache_contract()
     try {
         Context context;
         claude::Usage_cache_input cache;
-        cache.native_seed = root / "native-seed.jsonl";
-        cache.seed_sha256_hex = addon::to_hex(addon::Sha256::digest(""));
         cache.storage_file = root / "owned-cache.jsonl";
-        cache.cache_required = true;
-        std::ofstream seed(*cache.native_seed, std::ios::binary);
-        seed.close();
-        require(bool(seed), "empty native seed fixture written");
-        const auto require_missing_evidence = [&] {
-            bool refused = false;
-            try { (void)claude::scan_usage(root, context, cache); }
-            catch (const std::runtime_error& error) {
-                refused = std::string_view(error.what()) == "usage_required_cache_unavailable";
-            }
-            require(refused, "required history needs actual retained message evidence");
-        };
-        require_missing_evidence();
-        require(!fs::exists(*cache.storage_file), "refused empty seed must not publish an owned cache");
-
-        // Fresh empty history remains legal when the host requires no retained evidence.
-        cache.cache_required = false;
         require(claude::scan_usage(root, context, cache).empty(),
-            "optional empty native seed supports fresh empty history");
-        require(fs::is_regular_file(*cache.storage_file), "optional scan persisted its empty cache");
-        std::ifstream before(*cache.storage_file, std::ios::binary);
-        require(bool(before), "existing cache opens before refusal");
-        const std::string accepted_before((std::istreambuf_iterator<char>(before)), std::istreambuf_iterator<char>());
-        before.close();
-        fs::remove(*cache.native_seed);
-        cache.native_seed.reset();
-        cache.cache_required = true;
-        require_missing_evidence();
-        std::ifstream after(*cache.storage_file, std::ios::binary);
-        require(bool(after), "existing cache opens after refusal");
-        const std::string accepted_after((std::istreambuf_iterator<char>(after)), std::istreambuf_iterator<char>());
-        after.close();
-        require(accepted_before == accepted_after, "refusal preserves the existing cache bytes");
-        cache.cache_required = false;
+            "fresh empty history is valid");
+        require(fs::is_regular_file(*cache.storage_file), "scan persists its empty cache");
         require(claude::scan_usage(root, context, cache).empty(),
-            "optional header-only cache remains valid on reload");
-        fs::remove(*cache.storage_file);
-        cache.cache_required = true;
-        require_missing_evidence();
-
-        // A nonempty wrapper with no records is still not historical evidence.
-        cache.native_seed = root / "native-seed.jsonl";
-        auto wrapper = addon::Json_value::object();
-        wrapper.set("path", addon::Json_value(claude::path_string(root / "missing.jsonl")));
-        wrapper.set("records", addon::Json_value::array());
-        const auto wrapped = addon::serialize_json(wrapper) + "\n";
-        cache.seed_sha256_hex = addon::to_hex(addon::Sha256::digest(wrapped));
-        std::ofstream wrapper_file(*cache.native_seed, std::ios::binary);
-        wrapper_file << wrapped;
-        wrapper_file.close();
-        require(bool(wrapper_file), "zero-record native wrapper fixture written");
-        require_missing_evidence();
-        require(!fs::exists(*cache.storage_file), "zero-record refusal must not publish a cache");
+            "a current header-only cache remains valid on reload");
     }
     catch (...) {
         fs::remove_all(root);
@@ -2162,118 +2099,87 @@ void empty_usage_cache_contract()
 
 void retained_message_contract()
 {
-    for (const bool native_seed : {false, true}) {
-        const auto root = fs::temp_directory_path() / ("claude-retained-" + addon::random_nonce_hex());
-        const auto source = root / "projects/project/session.jsonl";
-        fs::create_directories(source.parent_path());
-        fs::create_directory(root / ".git");
-        try {
-            const auto message = [
-                    &root
-                ](
-                    const char* id,
-                    std::uint64_t tokens)
-                {
-                    auto row = claude::object(R"({"type":"assistant","sessionId":"SessionCase","timestamp":"2026-09-12T12:00:00","message":{"stop_reason":"end_turn","usage":{}}})");
-                    row.set("cwd", Json(claude::path_string(root)));
-                    row.find("message")->set("id", Json(id));
-                    row.find("message")->find("usage")->set("input_tokens", Json(tokens));
-                    return row;
-                };
-            const auto write_rows = [
-                    &source
-                ](
-                    const std::vector<Json>& rows,
-                    std::string_view tail)
-                {
-                    std::ofstream stream(source, std::ios::binary | std::ios::trunc);
-                    for (const auto& row : rows) {
-                        stream << addon::serialize_json(row) << '\n';
-                    }
-                    stream << tail;
-                    stream.close();
-                    require(bool(stream), "transcript fixture written");
-                };
-            Context context;
-            claude::Usage_cache_input cache;
-            cache.storage_file = root / "owned-cache.jsonl";
-            const auto first  = message("message-A", 25);
-            const auto second = message("message-B", 12);
-            if (native_seed) {
-                Json records = Json::array();
-                for (const auto& row : {first, second}) {
-                    auto record = claude::object(R"({"session_id":"SessionCase","completed_date":"2026-09-12"})");
-                    record.set("record_id", *row.find("message")->find("id"));
-                    record.set("total_tokens", *row.find("message")->find("usage")->find("input_tokens"));
-                    record.set("source_path", Json(claude::path_string(source)));
-                    record.set("recorded_cwd", Json(claude::path_string(root)));
-                    records.push_back(std::move(record));
+    const auto root = fs::temp_directory_path() / ("claude-retained-" + addon::random_nonce_hex());
+    const auto source = root / "projects/project/session.jsonl";
+    fs::create_directories(source.parent_path());
+    fs::create_directory(root / ".git");
+    try {
+        const auto message = [
+                &root
+            ](
+                const char* id,
+                std::uint64_t tokens)
+            {
+                auto row = claude::object(R"({"type":"assistant","sessionId":"SessionCase","timestamp":"2026-09-12T12:00:00","message":{"stop_reason":"end_turn","usage":{}}})");
+                row.set("cwd", Json(claude::path_string(root)));
+                row.find("message")->set("id", Json(id));
+                row.find("message")->find("usage")->set("input_tokens", Json(tokens));
+                return row;
+            };
+        const auto write_rows = [
+                &source
+            ](
+                const std::vector<Json>& rows,
+                std::string_view tail)
+            {
+                std::ofstream stream(source, std::ios::binary | std::ios::trunc);
+                for (const auto& row : rows) {
+                    stream << addon::serialize_json(row) << '\n';
                 }
-                Json wrapper = Json::object();
-                wrapper.set("path", Json(claude::path_string(source)));
-                wrapper.set("records", std::move(records));
-                const auto bytes = addon::serialize_json(wrapper) + "\n";
-                cache.native_seed = root / "native-seed.jsonl";
-                cache.seed_sha256_hex = addon::to_hex(addon::Sha256::digest(bytes));
-                cache.cache_required = true;
-                std::ofstream seed(*cache.native_seed, std::ios::binary);
-                seed << bytes;
-                seed.close();
-                require(bool(seed), "native seed fixture written");
-            }
-            else {
-                write_rows({first, second}, {});
-                require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 37,
-                    "completed messages establish package retained evidence");
-            }
+                stream << tail;
+                stream.close();
+                require(bool(stream), "transcript fixture written");
+            };
+        Context context;
+        claude::Usage_cache_input cache;
+        cache.storage_file = root / "owned-cache.jsonl";
+        const auto first  = message("message-A", 25);
+        const auto second = message("message-B", 12);
+        write_rows({first, second}, {});
+        require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 37,
+            "completed messages establish package retained evidence");
 
-            // usage-scan@2 requires retained message identities even when the
-            // surviving source ends before the previously completed message.
-            write_rows({first}, "{unfinished");
-            auto sessions = claude::scan_usage(root, context, cache);
-            require(sessions.size() == 1 && sessions[0].record.total_tokens == 37,
-                "partial surviving source preserves both retained completed messages");
-            addon::Contract_failure failure;
-            const auto decoded = addon::decode_usage_record(
-                addon::encode_usage_record(sessions[0].record, 2), &failure, 2);
-            require(decoded && decoded->repository_usage && decoded->repository_usage->allocations.size() == 1 &&
-                decoded->repository_usage->allocations[0].total_tokens == 37,
-                "single real repository allocation satisfies usage-scan@2 codec");
-            if (cache.native_seed) {
-                fs::remove(*cache.native_seed);
-                cache.native_seed.reset();
-            }
-            cache.cache_required = true;
-            auto unfinished = message("message-B", 2);
-            unfinished.find("message")->set("stop_reason", Json());
-            write_rows({first, unfinished}, {});
-            require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 37,
-                "in-progress lower message cannot replace completed evidence after cache reload");
-            write_rows({message("message-A", 5)}, {});
-            require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 17,
-                "completed same-ID correction replaces its own value and retains absent message");
-            write_rows({message("message-B", 3), message("message-C", 4)}, {});
-            require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 12,
-                "completed corrections and new message IDs reconcile without a monotonic total");
-            write_rows({message("message-B", 3), message("message-B", 6)}, {});
-            bool conflicting_usage = false;
-            try {
-                (void)claude::scan_usage(root, context, cache);
-            }
-            catch (const std::runtime_error& error) {
-                conflicting_usage = std::string_view(error.what()) == "conflicting_message_usage";
-            }
-            require(conflicting_usage, "fresh duplicate message IDs retain conflicting usage rejection");
-            fs::remove(source);
-            require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 12,
-                "corrected message evidence survives source deletion and cache reload");
+        // usage-scan@2 requires retained message identities even when the
+        // surviving source ends before the previously completed message.
+        write_rows({first}, "{unfinished");
+        auto sessions = claude::scan_usage(root, context, cache);
+        require(sessions.size() == 1 && sessions[0].record.total_tokens == 37,
+            "partial surviving source preserves both retained completed messages");
+        addon::Contract_failure failure;
+        const auto decoded = addon::decode_usage_record(
+            addon::encode_usage_record(sessions[0].record, 2), &failure, 2);
+        require(decoded && decoded->repository_usage && decoded->repository_usage->allocations.size() == 1 &&
+            decoded->repository_usage->allocations[0].total_tokens == 37,
+            "single real repository allocation satisfies usage-scan@2 codec");
+        auto unfinished = message("message-B", 2);
+        unfinished.find("message")->set("stop_reason", Json());
+        write_rows({first, unfinished}, {});
+        require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 37,
+            "in-progress lower message cannot replace completed evidence after cache reload");
+        write_rows({message("message-A", 5)}, {});
+        require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 17,
+            "completed same-ID correction replaces its own value and retains absent message");
+        write_rows({message("message-B", 3), message("message-C", 4)}, {});
+        require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 12,
+            "completed corrections and new message IDs reconcile without a monotonic total");
+        write_rows({message("message-B", 3), message("message-B", 6)}, {});
+        bool conflicting_usage = false;
+        try {
+            (void)claude::scan_usage(root, context, cache);
         }
-        catch (...) {
-            fs::remove_all(root);
-            throw;
+        catch (const std::runtime_error& error) {
+            conflicting_usage = std::string_view(error.what()) == "conflicting_message_usage";
         }
-        fs::remove_all(root);
+        require(conflicting_usage, "fresh duplicate message IDs retain conflicting usage rejection");
+        fs::remove(source);
+        require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 12,
+            "corrected message evidence survives source deletion and cache reload");
     }
+    catch (...) {
+        fs::remove_all(root);
+        throw;
+    }
+    fs::remove_all(root);
 }
 
 void quota_reset_label_contract()

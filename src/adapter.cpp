@@ -93,8 +93,6 @@ void invoke(addon::Invocation_context& context, const fs::path& package_root)
         else
         if (capability == addon::k_session_wake_capability_id) claude::handle_wake(context);
         else
-        if (capability == "legacy-state-import") claude::handle_history(context);
-        else
         if (capability == "usage-scan" || capability == "usage-incremental") claude::handle_usage(context);
         else
         if (capability == "usage-lifetime-summary") claude::handle_usage_summary(context);
@@ -128,7 +126,7 @@ int main()
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1}, {"managed-assets", 1},
         {"accounts", 2}, {"launch-preparation", 3}, {"interactive-resume", 2},
         {"structured-session", 3}, {"delegated-session", 3}, {"auth-status", 2}, {"quota", 2},
-        {"usage-scan", 2}, {"usage-scan", 3}, {"legacy-state-import", 1}, {"lifecycle-events", 1}, {"helper-ingress", 2},
+        {"usage-scan", 2}, {"usage-scan", 3}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {"usage-lifetime-summary", 1},
         {"usage-saved-daily-tokens", 1},
         {"usage-incremental", 1},

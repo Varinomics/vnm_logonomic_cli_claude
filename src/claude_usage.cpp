@@ -369,8 +369,8 @@ std::optional<std::vector<Message>> parse_file(
 
 struct Cached_file
 {
-    // Absent for evidence adopted from a native seed, which is parsed again
-    // whenever its transcript is present.
+    // A record without a saved fingerprint is parsed again whenever its
+    // transcript is present.
     std::optional<file_fingerprint_t> fingerprint;
     std::vector<Message>              messages;
 };
@@ -448,73 +448,37 @@ std::string required_text(const Json& value, std::string_view field)
     return result;
 }
 
-Message cached_message(const Json& value, bool native)
+Message cached_message(const Json& value)
 {
     Message result;
-    result.id = required_text(value, native ? "record_id" : "id");
-    result.session = required_text(value, native ? "session_id" : "session");
-    result.date = required_text(value, native ? "completed_date" : "date");
+    result.id = required_text(value, "id");
+    result.session = required_text(value, "session");
+    result.date = required_text(value, "date");
     if (result.date.size() != 10 || local_date(result.date + "T12:00:00") != result.date) {
         throw std::runtime_error("usage_cache_invalid");
     }
-    result.source = required_text(value, native ? "source_path" : "source");
-    result.cwd = text(value, native ? "recorded_cwd" : "cwd");
+    result.source = required_text(value, "source");
+    result.cwd = text(value, "cwd");
     result.model = text(value, "model");
-    const auto total = count(value, native ? "total_tokens" : "total");
+    const auto total = count(value, "total");
     if (!total) throw std::runtime_error("usage_cache_invalid");
     result.total = *total;
     const std::array<std::string_view, 4> names{
         "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
     };
-    if (!native) {
-        if (const auto* owner = value.find("owner_session")) {
-            if (!owner->is_string() || owner->as_string().empty()) {
-                throw std::runtime_error("usage_cache_invalid");
-            }
-            result.owner_session = owner->as_string();
-        }
-        const auto* categories = value.find("categories");
-        if (!categories || !categories->is_object()) throw std::runtime_error("usage_cache_invalid");
-        for (std::size_t index = 0; index < names.size(); ++index) {
-            result.categories[index] = count(*categories, names[index]);
-        }
-        if (const auto* temporal = value.find("usage-temporal")) {
-            read_message_temporal(result, *temporal);
-        }
-        return result;
-    }
-    const auto* capabilities = value.find("capabilities");
-    if (capabilities && capabilities->is_object()) {
-        if (const auto* identity = capabilities->find("usage-record-identity")) {
-            if (count(*identity, "version") != 1) throw std::runtime_error("usage_cache_invalid");
-            result.session = required_text(*identity, "legacy_session_key");
-        }
-    }
-    const auto* breakdown = capabilities && capabilities->is_object() ? capabilities->find("token_breakdown") : nullptr;
-    if (!breakdown) return result;
-    const auto version = count(*breakdown, "version");
-    if (version != 1 && version != 2) throw std::runtime_error("usage_cache_invalid");
-    for (std::size_t index = 0; index < names.size(); ++index) {
-        if (version == 1) {
-            result.categories[index] = count(*breakdown, names[index]);
-            continue;
-        }
-        const auto* field = breakdown->find(names[index]);
-        if (!field || !field->is_object()) throw std::runtime_error("usage_cache_invalid");
-        const auto covered = count(*field, "covered_records");
-        const auto represented = count(*field, "total_records");
-        const auto known = count(*field, "known_tokens");
-        const auto support = text(*field, "support");
-        if (!covered || !represented || *covered > 1 || *represented != 1 || flag(*field, "overflow") ||
-            (support != "supported" && support != "unknown"))
-        {
+    if (const auto* owner = value.find("owner_session")) {
+        if (!owner->is_string() || owner->as_string().empty()) {
             throw std::runtime_error("usage_cache_invalid");
         }
-        if (*covered == 1) {
-            if (!known) throw std::runtime_error("usage_cache_invalid");
-            result.categories[index] = known;
-        }
-        else if (known.value_or(0) != 0) throw std::runtime_error("usage_cache_invalid");
+        result.owner_session = owner->as_string();
+    }
+    const auto* categories = value.find("categories");
+    if (!categories || !categories->is_object()) throw std::runtime_error("usage_cache_invalid");
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        result.categories[index] = count(*categories, names[index]);
+    }
+    if (const auto* temporal = value.find("usage-temporal")) {
+        read_message_temporal(result, *temporal);
     }
     return result;
 }
@@ -530,21 +494,18 @@ std::optional<file_fingerprint_t> cached_fingerprint(const Json& wrapper)
     return file_fingerprint_t{size->as_integer(), modified->as_integer()};
 }
 
-std::string read_cache(const fs::path& path, bool native, File_cache& cache, addon::Invocation_context& context, std::string_view expected_hash = {})
+std::string read_cache(const fs::path& path, File_cache& cache, addon::Invocation_context& context)
 {
     Line_reader stream(path);
     if (!stream.is_open()) throw std::runtime_error("usage_cache_unavailable");
-    addon::Sha256 digest;
     std::string receipt;
-    bool header_seen = native;
+    bool header_seen = false;
     std::string previous_source;
     std::string_view line;
     bool terminated = false;
     while (stream.next(line, terminated)) {
         if (context.cancel_requested()) throw std::runtime_error("cancelled");
         if (!terminated) throw std::runtime_error("usage_cache_incomplete");
-        digest.update(line);
-        digest.update("\n");
         const auto wrapper = usage_object(line);
         if (!header_seen) {
             const auto format = text(wrapper, "format");
@@ -558,8 +519,8 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
         const auto source = cache_path(addon::path_from_utf8(raw_source));
         const auto* records = wrapper.find("records");
         // Only the first of a transcript's consecutive lines carries its fingerprint.
-        const bool continued = !native && source == previous_source;
-        const auto fingerprint = native ? std::nullopt : cached_fingerprint(wrapper);
+        const bool continued = source == previous_source;
+        const auto fingerprint = cached_fingerprint(wrapper);
         if (!records || !records->is_array() || (continued ? fingerprint.has_value() : cache.contains(source))) {
             throw std::runtime_error("usage_cache_invalid");
         }
@@ -568,14 +529,11 @@ std::string read_cache(const fs::path& path, bool native, File_cache& cache, add
         if (!continued) destination.fingerprint = fingerprint;
         for (const auto& record : records->as_array()) {
             if (context.cancel_requested()) throw std::runtime_error("cancelled");
-            destination.messages.push_back(cached_message(record, native));
+            destination.messages.push_back(cached_message(record));
         }
     }
     if (stream.failed() || !header_seen) throw std::runtime_error("usage_cache_unavailable");
-    if (native && (expected_hash.empty() || addon::to_hex(digest.finish()) != expected_hash)) {
-        throw std::runtime_error("usage_seed_digest_mismatch");
-    }
-    return native ? std::string(expected_hash) : receipt;
+    return receipt;
 }
 
 Json cache_accounting_record(const Message& message)
@@ -680,8 +638,8 @@ void write_cache(const fs::path& path, const File_cache& cache, addon::Invocatio
             throw std::runtime_error("usage_cache_write_failed");
         }
 #else
-        // The host removes the native seed after success: both its adopted
-        // contents and the replacement directory entry must survive power loss.
+        // Both the cache contents and the replacement directory entry must
+        // survive power loss.
         sync_cache_path(temporary, 0);
         if (context.cancel_requested()) throw std::runtime_error("cancelled");
         fs::rename(temporary, path);
@@ -903,7 +861,7 @@ void read_source_piece(
     File_cache& cache, addon::Invocation_context& context)
 {
     File_cache piece;
-    const auto receipt = read_cache(root / source_piece(source), false, piece, context);
+    const auto receipt = read_cache(root / source_piece(source), piece, context);
     const auto found = piece.find(source);
     if (piece.size() != 1 || found == piece.end() || receipt != index.seed_receipt) {
         throw std::runtime_error("usage_cache_invalid");
@@ -1102,7 +1060,6 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
     std::lock_guard cache_lock(s_cache_mutex);
     File_cache cache;
     std::string receipt;
-    bool cache_loaded = false;
     const auto& input_file = cache_input.selected_file ? cache_input.selected_file : cache_input.storage_file;
     if (cache_input.selected_directory) {
         const auto index = read_index(*cache_input.selected_directory, context);
@@ -1111,31 +1068,10 @@ std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation
             (void)indexed;
             read_source_piece(*cache_input.selected_directory, source, index, cache, context);
         }
-        cache_loaded = true;
     }
     else
     if (input_file && fs::is_regular_file(*input_file)) {
-        receipt = read_cache(*input_file, false, cache, context);
-        cache_loaded = true;
-    }
-    else if (cache_input.native_seed) {
-        receipt = read_cache(*cache_input.native_seed, true, cache, context, cache_input.seed_sha256_hex);
-        cache_loaded = true;
-    }
-    if (cache_loaded && cache_input.native_seed && receipt != cache_input.seed_sha256_hex) {
-        File_cache incoming;
-        read_cache(*cache_input.native_seed, true, incoming, context, cache_input.seed_sha256_hex);
-        if (!incoming.empty()) {
-            throw std::runtime_error("usage_seed_receipt_mismatch");
-        }
-    }
-    // Required evidence describes history already retained by the host. A
-    // validated empty seed (or a header-only local cache) proves only framing
-    // and a receipt, not the message evidence needed to reconstruct that history.
-    const bool retained_messages = std::any_of(cache.begin(), cache.end(),
-        [](const auto& entry) { return !entry.second.messages.empty(); });
-    if (cache_input.cache_required && (!cache_loaded || !retained_messages)) {
-        throw std::runtime_error("usage_required_cache_unavailable");
+        receipt = read_cache(*input_file, cache, context);
     }
     const auto files = transcript_files(profile, context);
     std::uint64_t processed = 0;
@@ -1413,7 +1349,7 @@ void handle_incremental_usage(addon::Invocation_context& context, const char*& s
             if (!addon::validate_usage_cache_file(baseline, *manifest, "messages.jsonl", cancelled, &failure)) {
                 throw std::runtime_error(failure.reason_code);
             }
-            index.seed_receipt = read_cache(selected_root / "messages.jsonl", false, retained, context);
+            index.seed_receipt = read_cache(selected_root / "messages.jsonl", retained, context);
             for (const auto& [source, cached] : retained) {
                 index.sources.emplace(source, index_source(cached));
                 for (const auto& message : cached.messages) {
@@ -1674,16 +1610,6 @@ void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
                 }
             }
         }
-        if (input->native_file_cache) {
-            if (!input->context.account_context || input->native_file_cache->source_account_key !=
-                    input->context.account_context->adapter_account_key)
-            {
-                throw std::runtime_error("usage_seed_account_mismatch");
-            }
-            cache.native_seed = addon::path_from_utf8(input->native_file_cache->path);
-            cache.seed_sha256_hex = input->native_file_cache->sha256_hex;
-            cache.cache_required = input->native_file_cache->cache_required;
-        }
         stage = "reading usage history and saving its candidate cache";
         snapshot.sessions = scan_usage(profile, context, cache);
         snapshot.scope.observed_at_ms = now_ms();
@@ -1772,10 +1698,6 @@ void handle_usage(addon::Invocation_context& context)
             {"usage_cache_format_unsupported", "The saved usage cache format is unsupported."},
             {"usage_cache_write_failed", "The candidate usage cache could not be written."},
             {"usage_cache_namespace_conflict", "The candidate cache conflicts with another cache location."},
-            {"usage_seed_digest_mismatch", "The imported history could not be verified."},
-            {"usage_seed_receipt_mismatch", "The imported history does not match the saved cache receipt."},
-            {"usage_seed_account_mismatch", "The imported history belongs to a different account."},
-            {"usage_required_cache_unavailable", "The saved message history required for this scan is unavailable."},
             {"conflicting_message_usage", "Copies of the same message disagree about its token count."},
             {"profile_storage_unavailable", "The provider's usage cache storage is unavailable."},
             {"usage_snapshot_capacity", "The provider is retaining too many unfinished usage snapshots."},

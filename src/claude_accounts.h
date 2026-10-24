@@ -16,6 +16,5 @@ std::filesystem::path profile_for_context(const logonomic::cli_addon::Session_la
 void apply_account(const logonomic::cli_addon::Session_launch_context& context,
     logonomic::cli_addon::Process_proposal& process);
 void handle_accounts(logonomic::cli_addon::Invocation_context& context);
-void handle_history(logonomic::cli_addon::Invocation_context& context);
 
 } // namespace claude

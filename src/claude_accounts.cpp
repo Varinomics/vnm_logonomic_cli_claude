@@ -1,10 +1,8 @@
 #include "claude_accounts.h"
 #include "claude_launcher.h"
-#include "claude_lifecycle.h"
 #include "claude_support.h"
 
 #include <logonomic_cli_addon/launcher_utilities.h>
-#include <logonomic_cli_addon/legacy_state_import.h>
 #include <logonomic_cli_addon/sha256.h>
 
 #ifdef _WIN32
@@ -23,7 +21,6 @@ namespace {
 
 namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
-using Json = addon::Json_value;
 
 fs::path normalize(const fs::path& profile)
 {
@@ -152,66 +149,6 @@ void handle_accounts(addon::Invocation_context& context)
         }
     }
     context.succeed(addon::encode_accounts(accounts));
-}
-
-void handle_history(addon::Invocation_context& context)
-{
-    addon::Contract_failure failure;
-    const auto input = addon::decode_import_record_request(context.request().payload, &failure);
-    if (!input) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code);
-        return;
-    }
-    addon::Legacy_import_result result;
-    if (input->kind == addon::k_legacy_resume_record_kind) {
-        const auto record = addon::decode_legacy_resume_record(input->record, &failure);
-        if (!record) {
-            context.fail(addon::Result_status::FAILED, failure.reason_code);
-            return;
-        }
-        if (record->provider_id == "claude" && canonical_session_id(record->provider_session_id)) {
-            Json converted = Json::object();
-            converted.set("provider_session_id", Json(record->provider_session_id));
-            result = *addon::Legacy_import_result::from_conversion(addon::encode_legacy_resume_conversion(converted));
-        }
-    }
-    else
-    if (input->kind == addon::k_legacy_account_record_kind) {
-        const auto record = addon::decode_legacy_account_record(input->record, &failure);
-        if (!record) {
-            context.fail(addon::Result_status::FAILED, failure.reason_code);
-            return;
-        }
-        if (record->provider_id == "claude" && record->profile_path) {
-            const auto profile = normalize(addon::path_from_utf8(*record->profile_path));
-            Json converted = Json::object();
-            converted.set("adapter_account_key", Json(account_key(profile)));
-            result = *addon::Legacy_import_result::from_conversion(std::move(converted));
-        }
-    }
-    else
-    if (input->kind == addon::k_legacy_usage_records_kind) {
-        const auto record = addon::decode_legacy_usage_records(input->record, &failure);
-        if (!record) {
-            context.fail(addon::Result_status::FAILED, failure.reason_code);
-            return;
-        }
-        if (record->provider_id == "claude") {
-            // Claude's native store is keyed by exact provider Session id. The
-            // scanner retains that aggregation boundary and imports no counters.
-            auto converted = record->records;
-            for (auto& identity : converted) {
-                if (identity.session_key) identity.record_id = *identity.session_key;
-                if (identity.record_id.empty()) throw std::runtime_error("invalid_usage_identity");
-            }
-            result = *addon::Legacy_import_result::from_conversion(addon::encode_legacy_usage_conversion(converted));
-        }
-    }
-    else {
-        context.fail(addon::Result_status::UNAVAILABLE, "unknown_record_kind");
-        return;
-    }
-    context.succeed(addon::encode_import_record_result(result));
 }
 
 } // namespace claude
