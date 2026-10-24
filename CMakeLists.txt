@@ -63,6 +63,7 @@ if(WIN32)
 endif()
 
 add_library(claude_provider STATIC
+    src/claude_conversation.cpp
     src/claude_accounts.cpp src/claude_launcher.cpp src/claude_lifecycle.cpp
     src/claude_preparation.cpp src/claude_probes.cpp src/claude_resume.cpp src/claude_sessions.cpp src/claude_usage.cpp
     src/claude_usage_summary.cpp src/claude_wake.cpp)
@@ -190,6 +191,11 @@ if(BUILD_TESTING)
     add_dependencies(claude_resume_tests claude_package)
     add_test(NAME claude_resume_tests COMMAND claude_resume_tests "${CLAUDE_PACKAGE_DIRECTORY}")
     set_tests_properties(claude_resume_tests PROPERTIES TIMEOUT 60 LABELS "resume;packaged-adapter")
+    add_executable(claude_conversation_tests tests/claude_conversation_tests.cpp)
+    target_link_libraries(claude_conversation_tests PRIVATE claude_provider)
+    claude_target(claude_conversation_tests)
+    add_test(NAME claude_conversation_tests COMMAND claude_conversation_tests)
+    set_tests_properties(claude_conversation_tests PROPERTIES TIMEOUT 30)
     add_executable(claude_quota_direct_tests tests/claude_quota_direct_tests.cpp)
     claude_target(claude_quota_direct_tests)
     target_link_libraries(claude_quota_direct_tests PRIVATE claude_quota_direct claude_provider)
