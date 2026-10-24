@@ -126,7 +126,7 @@ int main()
     options.adapter_version = "1.0.0";
     options.capabilities = {
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1}, {"managed-assets", 1},
-        {"accounts", 2}, {"launch-preparation", 3}, {"interactive-resume", 2},
+        {"accounts", 2}, {"launch-preparation", 3}, {"interactive-resume", 2}, {"interactive-resume", 3},
         {"structured-session", 3}, {"delegated-session", 3}, {"auth-status", 2}, {"quota", 2},
         {"usage-scan", 2}, {"usage-scan", 3}, {"legacy-state-import", 1}, {"lifecycle-events", 1}, {"helper-ingress", 2},
         {"usage-lifetime-summary", 1},

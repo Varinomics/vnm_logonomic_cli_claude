@@ -3,8 +3,10 @@
 #include "claude_accounts.h"
 #include "claude_launcher.h"
 #include "claude_lifecycle.h"
+#include "claude_resume.h"
 #include "claude_support.h"
 
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
@@ -386,6 +388,20 @@ std::optional<std::vector<std::string>> initial_prompt_argv(
     return carried_argv(argv, std::move(command));
 }
 
+std::optional<std::vector<std::string>> exact_resume_command(
+    const addon::Session_launch_context& launch, const addon::Json_value& record)
+{
+    auto literal = literal_command(launch.launcher_argv);
+    if (!record.is_object() || record.as_object().size() != 1 ||
+        !canonical_session_id(text(record, "provider_session_id")) ||
+        !literal || !interactive_resume_arguments(*literal) || !launch.launch_environment ||
+        !canonical_resume_directory(launch.working_directory))
+    {
+        return std::nullopt;
+    }
+    return literal;
+}
+
 } // namespace
 
 bool node_available(const addon::Launch_environment& launch, const std::string& working_directory)
@@ -476,7 +492,31 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
         context.succeed(addon::encode_launch_patch(result, 3));
         return;
     }
-    if (context.request().capability.capability_id != "interactive-resume" || context.request().operation != "prepare_resume") {
+    if (context.request().capability.capability_id == "interactive-resume" &&
+        context.request().capability.version == addon::k_interactive_resume_inspection_version &&
+        context.request().operation == addon::k_inspect_resume_operation)
+    {
+        const auto input = addon::decode_resume_inspect_request(context.request().payload, &failure);
+        if (!input) {
+            context.fail(addon::Result_status::FAILED, failure.reason_code);
+            return;
+        }
+        addon::Resume_inspect_result result;
+        result.request_digest_hex = addon::resume_inspect_request_digest_hex(*input);
+        if (const auto command = exact_resume_command(input->context, input->resume_record)) {
+            result.availability = saved_conversation_availability(
+                input->context, text(input->resume_record, "provider_session_id"), *command, context);
+        }
+        if (context.cancel_requested()) {
+            context.fail(addon::Result_status::CANCELLED, "cancelled");
+            return;
+        }
+        context.succeed(addon::encode_resume_inspect_result(result));
+        return;
+    }
+    if (context.request().capability.capability_id != "interactive-resume" ||
+        context.request().capability.version != 2 || context.request().operation != "prepare_resume")
+    {
         context.reject_unknown_operation();
         return;
     }
@@ -486,12 +526,20 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
         return;
     }
     const auto session = text(input->resume_record, "provider_session_id");
-    const auto literal = literal_command(input->context.launcher_argv);
-    if (!input->resume_record.is_object() || input->resume_record.as_object().size() != 1 || !canonical_session_id(session) ||
-        !literal || !interactive_resume_arguments(*literal) || !input->context.launch_environment ||
-        !node_available(*input->context.launch_environment, input->context.working_directory) || !canonical_resume_directory(input->context.working_directory))
+    const auto command = exact_resume_command(input->context, input->resume_record);
+    if (!command ||
+        !node_available(*input->context.launch_environment, input->context.working_directory))
     {
         context.fail(addon::Result_status::UNAVAILABLE, "exact_resume_unavailable");
+        return;
+    }
+    const auto availability = saved_conversation_availability(input->context, session, *command, context);
+    if (context.cancel_requested()) {
+        context.fail(addon::Result_status::CANCELLED, "cancelled");
+        return;
+    }
+    if (availability == addon::Resume_availability::ABSENT) {
+        context.fail(addon::Result_status::UNAVAILABLE, "conversation_absent");
         return;
     }
     std::vector<std::string> plugins{path_string(package_root / "assets/claude-hooks")};
