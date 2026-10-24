@@ -181,23 +181,6 @@ public:
         return *outcome;
     }
 
-    addon::Usage_scan_page legacy_scan()
-    {
-        auto request = m_request;
-        request.cache_selection.reset();
-        request.snapshot_id.reset();
-        request.cursor.reset();
-        const auto id = m_host.invoke({"usage-scan", 2}, "scan",
-            addon::encode_usage_scan_request(request, 2), 30000);
-        const auto outcome = m_host.wait_outcome(id, 31000);
-        check(outcome && outcome->status == addon::Host_status::SUCCESS,
-            "legacy packaged usage scan succeeds: " + (outcome ? outcome->reason_code : "missing-outcome"));
-        addon::Contract_failure failure;
-        const auto page = addon::decode_usage_scan_result(outcome->payload, &failure, 2);
-        check(page && page->complete, "legacy packaged usage page decodes: " + failure.detail);
-        return *page;
-    }
-
     // Every page of one snapshot, as the host reads them before staging.
     addon::Usage_scan_page scan()
     {
@@ -359,8 +342,6 @@ void check_temporal_parent(const addon::Usage_scan_page& page, const addon::Usag
         represented += portion.total_tokens;
     }
     check(represented == record.total_tokens, "temporal portions and unavailable remainder conserve H");
-    check(!addon::encode_usage_record(record, 2).find("capabilities"),
-        "usage-scan@2 retains its accounting grammar without temporal evidence");
 }
 
 void temporal_messages_and_retained_cache(const fs::path& package, const fs::path& fixture)
@@ -569,16 +550,12 @@ void optional_parent_grammar_contract(const fs::path& package, const fs::path& f
     event->set("sessionId", addon::Json_value(session_id));
     write(source_path(profile, "conversation"), addon::serialize_json(*event) + '\n');
     Packaged_host host(package, fixture, profile);
-    const auto legacy = host.legacy_scan();
-    check(legacy.records.size() == 1 && legacy.records.front().record_id == session_id &&
-        legacy.records.front().session_key == session_id && total(legacy) == 17,
-        "usage2 preserves the admitted nonNUL control-character parent ID and exact H");
     host.select("optional-parent", std::nullopt);
     const auto current = host.scan();
     check(current.records.size() == 1 && current.records.front().record_id == session_id &&
         current.records.front().session_key == session_id && total(current) == 17 &&
         !current.records.front().temporal && host.sealed(*current.cache_candidate),
-        "usage3 omits invalid optional parent proof and preserves the same accounting ID, H and sealed cache");
+        "current usage omits invalid optional parent proof and preserves the accounting ID, H and sealed cache");
     host.finish();
 }
 

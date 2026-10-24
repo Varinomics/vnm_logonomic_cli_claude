@@ -1,5 +1,13 @@
 {
   "capability_id": "usage-scan",
   "version": 3,
-  "payload": {}
+  "payload": {
+    "environment_names": [
+      "CLAUDE_CONFIG_DIR",
+      "SystemRoot",
+      "WINDIR",
+      "TEMP",
+      "TMP"
+    ]
+  }
 }

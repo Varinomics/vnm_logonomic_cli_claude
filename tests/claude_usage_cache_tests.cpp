@@ -328,15 +328,13 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
             [] { return false; }, &failure).has_value(), "sealed candidate remains intact: " + failure.detail);
     };
 
-    check(test::usage_token_total(test::usage_scan_pages(host, request, 2)) == 2700,
-        "v2 retains its existing namespace and telemetry");
     for (const auto& path : sources) {
         check(fs::remove(path), "remove fixture source");
     }
     select("empty-selection", std::nullopt);
     const auto empty = test::usage_scan_pages(host, request, 3);
     check(empty.records.empty() && empty.cache_candidate,
-        "absent host selection never bootstraps from mutable provider cache");
+        "a fresh selection with absent source history contains no records");
     validate(*empty.cache_candidate);
 
     sources = write_sources(profile, 10);
@@ -424,11 +422,6 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
     check(test::usage_scan_outcome(host, invalid_reset, 3).status != addon::Host_status::SUCCESS,
         "reset cannot import a retained selection");
 
-    auto old_request = first_request;
-    old_request.cache_selection.reset();
-    check(test::usage_token_total(test::usage_scan_pages(host, old_request, 2)) == 2700,
-        "v3 scans and reset leave v2 cache untouched");
-
     select("occupied", first.cache_candidate);
     write(addon::usage_cache_io_path(addon::path_from_utf8(request.cache_selection->candidate_root) / "foreign"),
         "occupied");
@@ -438,15 +431,6 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
         occupied.message.find("checking usage cache storage") != std::string::npos,
         "provider refuses a nonempty host allocation");
     validate(*first.cache_candidate);
-
-    const auto mutable_path = storage / "claude-message-cache-v1.jsonl";
-    const auto conflicting = mutable_path / "host-candidate";
-    if (!fs::exists(mutable_path) || fs::is_directory(mutable_path)) {
-        fs::create_directories(conflicting);
-    }
-    request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(conflicting)};
-    check(test::usage_scan_outcome(host, request, 3).status != addon::Host_status::SUCCESS,
-        "host candidates cannot enter the provider mutable namespace");
 
     select("wrong-account", first.cache_candidate);
     auto wrong_account = request;
@@ -459,16 +443,6 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
     check(test::usage_scan_outcome(host, wrong_account, 3).status != addon::Host_status::SUCCESS,
         "selected cache cannot cross native profile and account ownership");
     validate(*first.cache_candidate);
-
-    auto temporary_conflict = storage / "claude-cache-host.tmp";
-    while (temporary_conflict.native().size() < 291) {
-        temporary_conflict /= "retained-account-cache-allocation-component";
-    }
-    check(fs::create_directories(addon::usage_cache_io_path(temporary_conflict)),
-        "allocate long descendant of the root-owned mutable temporary namespace");
-    request.cache_selection = addon::Usage_cache_selection{std::nullopt, addon::path_to_utf8(temporary_conflict)};
-    check(test::usage_scan_outcome(host, request, 3).status != addon::Host_status::SUCCESS,
-        "host allocation cannot alias the mutable temporary-file namespace");
 
     select("corrupt-input", first.cache_candidate);
     write(addon::usage_cache_io_path(addon::path_from_utf8(first.cache_candidate->root) / "unlisted"), "unexpected");
@@ -856,6 +830,7 @@ void bounded_cache_lines_contract(const fs::path& fixture)
     write(transcript, bytes);
     claude::Usage_cache_input cache;
     cache.storage_file = fixture / "chunked-cache.jsonl";
+    cache.selected_file = cache.storage_file;
     cache.incremental  = true;
     Scan_context context;
     const auto expect_exact = [&](const char* message) {
@@ -892,6 +867,7 @@ void live_transcript_contract(const fs::path& fixture)
     write(steady, assistant_record("steady", "steady-1", 100) + assistant_record("steady", "steady-2", 200));
     claude::Usage_cache_input cache;
     cache.storage_file = fixture / "owned-cache.jsonl";
+    cache.selected_file = cache.storage_file;
     cache.incremental  = true;
     const auto session_total = [](const std::vector<claude::Usage_session>& sessions, std::string_view session) {
         std::uint64_t sum = 0;
@@ -930,6 +906,7 @@ void cancelled_scan_contract(const fs::path& fixture)
     }
     claude::Usage_cache_input cache;
     cache.storage_file = fixture / "cancelled-cache.jsonl";
+    cache.selected_file = cache.storage_file;
     cache.incremental  = true;
     const auto cache_bytes = [&] {
         std::ifstream input(*cache.storage_file, std::ios::binary);
@@ -970,6 +947,7 @@ void cancelled_scan_contract(const fs::path& fixture)
     write(profile / "projects/cancelled/cancelled-0.jsonl", changed);
     auto reference = cache;
     reference.storage_file = fixture / "reference/cancelled-cache.jsonl";
+    reference.selected_file = reference.storage_file;
     fs::create_directories(reference.storage_file->parent_path());
     fs::copy_file(*cache.storage_file, *reference.storage_file);
     check(total(claude::scan_usage(profile, quiet, reference)) == 20, "the changed transcript adds its message");

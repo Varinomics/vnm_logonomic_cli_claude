@@ -2036,11 +2036,9 @@ void usage_contract()
             sessions[0].record.cache_read.coverage->covered_records == 1 &&
             sessions[0].record.cache_read.coverage->total_records == 2,
             "partial category remains known with incomplete coverage");
-        addon::Contract_failure failure;
-        require(addon::decode_usage_record(addon::encode_usage_record(sessions[0].record, 2), &failure, 2).has_value(),
-            "native aggregate satisfies rich usage contract");
         claude::Usage_cache_input cache;
         cache.storage_file = root / "owned-cache.jsonl";
+        cache.selected_file = cache.storage_file;
         {
             std::ofstream retained_file(root / "projects/project/deleted.jsonl", std::ios::binary);
             retained_file << R"({"type":"assistant","sessionId":"SessionCase","timestamp":"2026-09-11T12:00:00","message":{"id":"retained-message","model":"sonnet","stop_reason":"end_turn","usage":{"input_tokens":30}}})" << '\n';
@@ -2084,6 +2082,7 @@ void empty_usage_cache_contract()
         Context context;
         claude::Usage_cache_input cache;
         cache.storage_file = root / "owned-cache.jsonl";
+        cache.selected_file = cache.storage_file;
         require(claude::scan_usage(root, context, cache).empty(),
             "fresh empty history is valid");
         require(fs::is_regular_file(*cache.storage_file), "scan persists its empty cache");
@@ -2133,24 +2132,23 @@ void retained_message_contract()
         Context context;
         claude::Usage_cache_input cache;
         cache.storage_file = root / "owned-cache.jsonl";
+        cache.selected_file = cache.storage_file;
         const auto first  = message("message-A", 25);
         const auto second = message("message-B", 12);
         write_rows({first, second}, {});
         require(claude::scan_usage(root, context, cache)[0].record.total_tokens == 37,
             "completed messages establish package retained evidence");
 
-        // usage-scan@2 requires retained message identities even when the
-        // surviving source ends before the previously completed message.
+        // Retained message identities survive a source that ends before
+        // the previously completed message.
         write_rows({first}, "{unfinished");
         auto sessions = claude::scan_usage(root, context, cache);
         require(sessions.size() == 1 && sessions[0].record.total_tokens == 37,
             "partial surviving source preserves both retained completed messages");
-        addon::Contract_failure failure;
-        const auto decoded = addon::decode_usage_record(
-            addon::encode_usage_record(sessions[0].record, 2), &failure, 2);
-        require(decoded && decoded->repository_usage && decoded->repository_usage->allocations.size() == 1 &&
-            decoded->repository_usage->allocations[0].total_tokens == 37,
-            "single real repository allocation satisfies usage-scan@2 codec");
+        const auto& repositories = sessions[0].record.repository_usage;
+        require(repositories && repositories->allocations.size() == 1 &&
+            repositories->allocations[0].total_tokens == 37,
+            "retained completed messages preserve their single real repository allocation");
         auto unfinished = message("message-B", 2);
         unfinished.find("message")->set("stop_reason", Json());
         write_rows({first, unfinished}, {});

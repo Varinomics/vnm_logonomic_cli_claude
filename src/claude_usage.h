@@ -32,6 +32,7 @@ struct Usage_session
 
 struct Usage_cache_input
 {
+    // The candidate output is independent of the explicitly selected input.
     std::optional<std::filesystem::path> storage_file;
     std::optional<std::filesystem::path> selected_file;
     std::optional<std::filesystem::path> selected_directory;
