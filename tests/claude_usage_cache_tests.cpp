@@ -274,42 +274,6 @@ std::vector<fs::path> write_sources(const fs::path& profile, unsigned tokens)
     return {path};
 }
 
-// Rewrites a cache in the format that kept each transcript on one line.
-void write_single_line_cache(const fs::path& path)
-{
-    std::ifstream input(path, std::ios::binary);
-    std::string line;
-    std::string output;
-    std::optional<addon::Json_value> pending;
-    const auto flush = [&] {
-        if (pending) output += addon::serialize_json(*pending) + '\n';
-        pending.reset();
-    };
-    addon::Json_parse_limits limits;
-    limits.max_bytes = limits.max_string_bytes = 64 * 1024 * 1024;
-    while (std::getline(input, line)) {
-        auto value = addon::parse_json(line, limits, nullptr);
-        check(value && value->is_object(), "cache line parses");
-        if (const auto* format = value->find("format")) {
-            check(format->is_string(), "cache header names its format");
-            value->set("format", addon::Json_value("claude-message-cache-v1"));
-            output += addon::serialize_json(*value) + '\n';
-            continue;
-        }
-        if (pending && *pending->find("path") == *value->find("path")) {
-            for (const auto& record : value->find("records")->as_array()) {
-                pending->find("records")->push_back(record);
-            }
-            continue;
-        }
-        flush();
-        pending = std::move(value);
-    }
-    flush();
-    input.close();
-    write(path, output);
-}
-
 void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
 {
     const auto profile = fixture / "native-profile";
@@ -558,24 +522,6 @@ void adapter_cache_contract(const fs::path& package, const fs::path& fixture)
     check(session_total(next, "growing") == 100,
         "an appended transcript adds exactly its new records, once each");
     validate(*next.cache_candidate);
-
-    // A candidate in the format that kept each transcript on one line
-    // upgrades with the same totals.
-    const auto single_line_root = addon::path_from_utf8(next.cache_candidate->root).parent_path() / "single-line-format";
-    check(fs::create_directories(addon::usage_cache_io_path(single_line_root)), "allocate single-line fixture");
-    const auto single_line_file = addon::usage_cache_io_path(single_line_root) / "messages.jsonl";
-    check(fs::copy_file(addon::usage_cache_io_path(addon::path_from_utf8(next.cache_candidate->root)) / "messages.jsonl",
-        single_line_file), "copy accepted messages into the fixture");
-    write_single_line_cache(single_line_file);
-    const auto single_line = addon::seal_usage_cache_candidate(addon::path_to_utf8(single_line_root), *allocated,
-        request.context.account_context, next.cache_candidate->snapshot_id, "claude-message-cache@1",
-        [] { return false; }, &failure);
-    check(single_line.has_value(), "seal single-line fixture");
-    select("single-line-upgrade", single_line);
-    const auto upgraded = test::usage_scan_pages(host, request, 3);
-    check(session_total(upgraded, "steady") == 600 && session_total(upgraded, "growing") == 100,
-        "a single-line candidate upgrades with exact totals");
-    validate(*upgraded.cache_candidate);
 
     select("incremental-repair", next.cache_candidate);
     request.mode = "repair";
@@ -932,11 +878,9 @@ void bounded_cache_lines_contract(const fs::path& fixture)
     fs::remove(transcript);
     expect_exact("the persisted cache alone keeps the exact totals");
 
-    write_single_line_cache(*cache.storage_file);
-    expect_exact("a single-line cache upgrades with exact totals");
-    const auto upgraded = cache_lines();
-    check(upgraded.size() > 2 && upgraded.front().find("claude-message-cache-v2") != std::string::npos,
-        "the upgraded cache is rewritten in bounded lines");
+    const auto reloaded = cache_lines();
+    check(reloaded.size() > 2 && reloaded.front().find("claude-message-cache-v2") != std::string::npos,
+        "the reloaded current cache preserves bounded lines");
 }
 
 void live_transcript_contract(const fs::path& fixture)

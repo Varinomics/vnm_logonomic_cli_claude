@@ -49,8 +49,7 @@ constexpr std::size_t k_read_bytes = 1024 * 1024;
 // serialized bytes, far below the record bound, so it stays readable however
 // many messages one transcript accumulates.
 constexpr std::size_t k_cache_line_bytes = 1024 * 1024;
-// claude-message-cache-v1 kept each transcript on one line; v2 continues a
-// transcript on consecutive lines. Both are read.
+// A transcript continues on consecutive bounded cache lines.
 constexpr std::string_view k_cache_format = "claude-message-cache-v2";
 
 Json usage_object(std::string_view bytes)
@@ -509,7 +508,7 @@ std::string read_cache(const fs::path& path, File_cache& cache, addon::Invocatio
         const auto wrapper = usage_object(line);
         if (!header_seen) {
             const auto format = text(wrapper, "format");
-            if (format != k_cache_format && format != "claude-message-cache-v1") throw std::runtime_error("usage_cache_invalid");
+            if (format != k_cache_format) throw std::runtime_error("usage_cache_invalid");
             receipt = text(wrapper, "seed_sha256_hex");
             header_seen = true;
             continue;
@@ -1341,7 +1340,7 @@ void handle_incremental_usage(addon::Invocation_context& context, const char*& s
         const bool adoption = manifest->format != k_index_format;
         stage = "verifying the saved usage cache";
         if (adoption) {
-            if ((manifest->format != "claude-message-cache@1" && manifest->format != "claude-message-cache@2") ||
+            if (manifest->format != "claude-message-cache@2" ||
                 manifest->files.size() != 1 || manifest->files.front().path != "messages.jsonl")
             {
                 throw std::runtime_error("usage_cache_format_unsupported");
@@ -1599,7 +1598,7 @@ void handle_usage_scan(addon::Invocation_context& context, const char*& stage)
                     cache.selected_directory = directory;
                 }
                 else
-                if ((manifest->format != "claude-message-cache@1" && manifest->format != "claude-message-cache@2") ||
+                if (manifest->format != "claude-message-cache@2" ||
                     manifest->files.size() != 1 ||
                     manifest->files.front().path != "messages.jsonl")
                 {
