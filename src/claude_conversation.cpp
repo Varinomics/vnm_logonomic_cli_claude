@@ -309,6 +309,9 @@ bool content_blocks(const Json& content, std::vector<Block>& blocks, Kind kind,
             if (!value.is_string()) {
                 return fail(failure, "conversation_content_invalid", "A Claude text block is incomplete.");
             }
+            if (type == "thinking" && value.as_string().empty()) {
+                continue;
+            }
             blocks.push_back({kind, value.as_string(), type == "thinking" ? "Thinking" : std::string(label),
                 compact_visible && type != "thinking"});
         }
@@ -331,9 +334,13 @@ bool content_blocks(const Json& content, std::vector<Block>& blocks, Kind kind,
         }
         else
         if (type == "tool_result") {
-            const auto& result = json::member(part, "content");
-            if (!result.is_null() && !content_blocks(result, blocks, Kind::TOOL_RESULT,
-                    json::text(part, "tool_use_id"), false, failure))
+            const auto call = json::text(part, "tool_use_id");
+            if (call.empty()) {
+                return fail(failure, "conversation_content_invalid", "A Claude tool result has no call identity.");
+            }
+            const auto* result = part.find("content");
+            if (result && !content_blocks(*result, blocks, Kind::TOOL_RESULT,
+                    call, false, failure))
             {
                 return false;
             }
@@ -453,8 +460,11 @@ std::optional<addon::Conversation_export_result> export_conversation(
         if (flag(row, "isCompactSummary")) {
             message.role = "Compacted conversation summary";
             message.content.push_back({Kind::TEXT,
-                "Claude retained a summary of earlier messages. This export includes that summary and the "
-                "following conversation; original messages before compaction are not reconstructed.", {}, false});
+                request.compact
+                    ? "Claude retained a summary of earlier messages; original messages before compaction "
+                      "are not reconstructed."
+                    : "Claude retained a summary of earlier messages. This export includes that summary and the "
+                      "following conversation; original messages before compaction are not reconstructed.", {}, true});
         }
         else {
             message.role = json::text(row, "type");
@@ -466,8 +476,11 @@ std::optional<addon::Conversation_export_result> export_conversation(
         }
         const bool compact_visible = !flag(row, "isCompactSummary") && message.phase != Phase::COMMENTARY;
         if (!content_blocks(json::member(json::member(row, "message"), "content"), message.content,
-                Kind::TEXT, {}, compact_visible, failure) || !writer.append(message, failure))
+                Kind::TEXT, {}, compact_visible, failure))
         {
+            return {};
+        }
+        if (!message.content.empty() && !writer.append(message, failure)) {
             return {};
         }
     }

@@ -51,10 +51,11 @@ bool compact_projection(const fs::path& root, const fs::path& source,
 {
     const std::string body =
         R"({"type":"user","uuid":"prompt","parentUuid":null,"sessionId":"session-a","message":{"role":"user","content":"Visible prompt"}})" "\n"
-        R"({"type":"assistant","uuid":"call","parentUuid":"prompt","sessionId":"session-a","message":{"id":"call-response","role":"assistant","stop_reason":"tool_use","content":[{"type":"text","text":"Intermediate progress"},{"type":"thinking","thinking":"Reasoning detail"},{"type":"tool_use","id":"search-a","name":"ToolSearch","input":{"query":"Read"}}]}})" "\n"
+        R"({"type":"assistant","uuid":"call","parentUuid":"prompt","sessionId":"session-a","message":{"id":"call-response","role":"assistant","stop_reason":"tool_use","content":[{"type":"text","text":"Intermediate progress"},{"type":"thinking","thinking":"","signature":"opaque-empty-verification"},{"type":"thinking","thinking":"Reasoning detail"},{"type":"tool_use","id":"search-a","name":"ToolSearch","input":{"query":"Read"}}]}})" "\n"
         R"({"type":"user","uuid":"result","parentUuid":"call","sessionId":"session-a","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"search-a","content":[{"type":"text","text":"Tool result text"},{"type":"tool_reference","tool_name":"Read"}]}]}})" "\n"
         R"({"type":"assistant","uuid":"encrypted","parentUuid":"result","sessionId":"session-a","message":{"id":"redacted-response","role":"assistant","content":[{"type":"redacted_thinking","data":"ciphertext-one"}]}})" "\n"
-        R"({"type":"assistant","uuid":"final","parentUuid":"encrypted","sessionId":"session-a","message":{"id":"final-response","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Visible final reply"}]}})" "\n";
+        R"({"type":"assistant","uuid":"empty-thought","parentUuid":"encrypted","sessionId":"session-a","message":{"id":"empty-response","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"opaque-verification"}]}})" "\n"
+        R"({"type":"assistant","uuid":"final","parentUuid":"empty-thought","sessionId":"session-a","message":{"id":"final-response","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Visible final reply"}]}})" "\n";
     write(source, body);
     bool ok = true;
     for (const auto format : {addon::Conversation_export_format::MARKDOWN, addon::Conversation_export_format::TEXT,
@@ -84,6 +85,8 @@ bool compact_projection(const fs::path& root, const fs::path& source,
             }
             ok &= check(text.find("ciphertext-one") == std::string::npos,
                 "redacted content exports its placeholder rather than encrypted bytes");
+            ok &= check(occurrences(text, "Thinking") == (compact ? 0 : 1),
+                "empty thinking adds no heading or empty message beside retained reasoning");
             if (format == addon::Conversation_export_format::CONVERSATION) {
                 ok &= check(text.find("::: assistant final\nVisible final reply") != std::string::npos,
                     "the native final phase reaches the conversation format");
@@ -156,6 +159,94 @@ bool advisor_results(const fs::path& root, const fs::path& source,
         failure.reason_code == "conversation_content_invalid", "incomplete advisor guidance fails explicitly");
     ok &= check(fs::is_empty(addon::path_from_utf8(request.output_directory)),
         "malformed advisor content leaves no completed or partial output");
+    return ok;
+}
+
+bool empty_projection(const fs::path& root, const fs::path& source,
+    addon::Conversation_export_request request)
+{
+    // Anthropic ToolResultBlockParam permits omitted content and an empty
+    // iterable. ThinkingBlock.signature is opaque verification, not ciphertext.
+    bool ok = true;
+    for (const bool omitted : {true, false}) {
+        write(source,
+            R"({"type":"user","uuid":"prompt","parentUuid":null,"sessionId":"session-a","message":{"role":"user","content":"Inspect the empty file"}})" "\n"
+            R"({"type":"assistant","uuid":"call","parentUuid":"prompt","sessionId":"session-a","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"read-empty","name":"Read","input":{"file_path":"empty.txt"}}]}})" "\n" +
+            std::string(omitted
+                ? R"({"type":"user","uuid":"result","parentUuid":"call","sessionId":"session-a","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-empty"}]}})" "\n"
+                : R"({"type":"user","uuid":"result","parentUuid":"call","sessionId":"session-a","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-empty","content":[]}]}})" "\n") +
+            R"({"type":"assistant","uuid":"empty-thought","parentUuid":"result","sessionId":"session-a","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"opaque-verification"}]}})" "\n"
+            R"({"type":"assistant","uuid":"thought","parentUuid":"empty-thought","sessionId":"session-a","message":{"role":"assistant","content":[{"type":"thinking","thinking":"The file has no bytes","signature":"other-verification"}]}})" "\n"
+            R"({"type":"assistant","uuid":"answer","parentUuid":"thought","sessionId":"session-a","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"","signature":"final-verification"},{"type":"text","text":"The file is empty"}]}})" "\n");
+        for (const auto format : {addon::Conversation_export_format::MARKDOWN, addon::Conversation_export_format::TEXT,
+                 addon::Conversation_export_format::CONVERSATION})
+        {
+            for (const bool compact : {false, true}) {
+                request.format = format;
+                request.compact = compact;
+                request.output_directory = addon::path_to_utf8(root / (omitted ? "empty-omitted" : "empty-array") /
+                    (compact ? "compact" : "full") / addon::conversation_export_format_name(format));
+                fs::create_directories(addon::path_from_utf8(request.output_directory));
+                addon::Contract_failure failure;
+                const auto result = claude::export_conversation(request, {}, &failure);
+                ok &= check(result.has_value(), "empty native content exports: " + failure.reason_code + " " + failure.detail);
+                if (!result) {
+                    continue;
+                }
+                const auto text = read(addon::path_from_utf8(request.output_directory) / result->file_name);
+                ok &= check(result->message_count == (compact ? 2 : 4),
+                    "empty projections do not add messages or abort the conversation");
+                ok &= check(occurrences(text, "Thinking") == (compact ? 0 : 1) &&
+                    (text.find("The file has no bytes") == std::string::npos) == compact,
+                    "only nonempty reasoning contributes a Thinking block");
+                ok &= check(text.find("[Encrypted message]") == std::string::npos &&
+                    text.find("verification") == std::string::npos,
+                    "an ordinary thinking signature does not imply encrypted content");
+                ok &= check(occurrences(text, "Inspect the empty file") == 1 &&
+                    occurrences(text, "The file is empty") == 1,
+                    "discussion before and after empty provider rows is retained once");
+            }
+        }
+    }
+    return ok;
+}
+
+bool malformed_empty_results(const fs::path& root, const fs::path& source,
+    addon::Conversation_export_request request)
+{
+    // ToolResultBlockParam requires a string tool_use_id and permits absent,
+    // string or iterable content. An empty projection cannot bypass that schema.
+    bool ok = true;
+    std::size_t variant = 0;
+    for (const auto* result : {
+             R"({"type":"tool_result"})",
+             R"({"type":"tool_result","tool_use_id":17,"content":[]})",
+             R"({"type":"tool_result","tool_use_id":"read-empty","content":null})"})
+    {
+        const auto directory = "invalid-empty-result-" + std::to_string(variant++);
+        write(source,
+            R"({"type":"user","uuid":"prompt","parentUuid":null,"sessionId":"session-a","message":{"role":"user","content":"Read the file"}})" "\n" +
+            std::string(R"({"type":"user","uuid":"result","parentUuid":"prompt","sessionId":"session-a","message":{"role":"user","content":[)") +
+            result + "]}}\n" +
+            R"({"type":"assistant","uuid":"answer","parentUuid":"result","sessionId":"session-a","message":{"role":"assistant","content":"The file is empty"}})" "\n");
+        for (const auto format : {addon::Conversation_export_format::MARKDOWN, addon::Conversation_export_format::TEXT,
+                 addon::Conversation_export_format::CONVERSATION})
+        {
+            for (const bool compact : {false, true}) {
+                request.format = format;
+                request.compact = compact;
+                request.output_directory = addon::path_to_utf8(root / directory /
+                    (compact ? "compact" : "full") / addon::conversation_export_format_name(format));
+                fs::create_directories(addon::path_from_utf8(request.output_directory));
+                addon::Contract_failure failure;
+                ok &= check(!claude::export_conversation(request, {}, &failure) &&
+                    failure.reason_code == "conversation_content_invalid",
+                    "empty tool results retain native identity and content validation");
+                ok &= check(fs::is_empty(addon::path_from_utf8(request.output_directory)),
+                    "a malformed empty tool result publishes no partial or completed conversation");
+            }
+        }
+    }
     return ok;
 }
 
@@ -244,24 +335,42 @@ int main()
             }
         }
     }
-    request.output_directory = addon::path_to_utf8(root / "compacted");
-    fs::create_directories(addon::path_from_utf8(request.output_directory));
     write(source, body +
         R"({"type":"system","subtype":"compact_boundary","uuid":"boundary","parentUuid":null,"logicalParentUuid":"answer","sessionId":"session-a"})" "\n"
         R"({"type":"user","uuid":"summary","parentUuid":"boundary","sessionId":"session-a","isCompactSummary":true,"message":{"role":"user","content":"Retained compact summary"}})" "\n"
         R"({"type":"assistant","uuid":"continued","parentUuid":"summary","sessionId":"session-a","message":{"id":"after-compact","role":"assistant","content":[{"type":"text","text":"After compaction"}]}})" "\n");
     addon::Contract_failure failure;
-    const auto summary = claude::export_conversation(request, {}, &failure);
-    ok &= check(summary && summary->message_count == 2, "compacted branch follows native parent chain");
-    if (summary) {
-        const auto text = read(addon::path_from_utf8(request.output_directory) / summary->file_name);
-        ok &= check(text.find("Compacted conversation summary") != std::string::npos &&
-            text.find("Inherited user prompt") == std::string::npos, "summary identified without duplicated logical ancestry");
-        ok &= check(text.find("original messages before compaction are not reconstructed") != std::string::npos,
-            "export explicitly explains that pre-compaction originals are unavailable in its retained branch");
+    for (const auto format : {addon::Conversation_export_format::MARKDOWN, addon::Conversation_export_format::TEXT,
+             addon::Conversation_export_format::CONVERSATION})
+    {
+        for (const bool compact : {false, true}) {
+            request.format = format;
+            request.compact = compact;
+            request.output_directory = addon::path_to_utf8(root / "compacted" / (compact ? "compact" : "full") /
+                addon::conversation_export_format_name(format));
+            fs::create_directories(addon::path_from_utf8(request.output_directory));
+            const auto summary = claude::export_conversation(request, {}, &failure);
+            ok &= check(summary && summary->message_count == 2, "compacted branch follows native parent chain");
+            if (summary) {
+                const auto text = read(addon::path_from_utf8(request.output_directory) / summary->file_name);
+                ok &= check(text.find("Compacted conversation summary") != std::string::npos &&
+                    text.find("Inherited user prompt") == std::string::npos,
+                    "summary identified without duplicated logical ancestry");
+                ok &= check(text.find("original messages before compaction are not reconstructed") != std::string::npos,
+                    "both projections explain that pre-compaction originals are not reconstructed");
+                ok &= check((text.find("Retained compact summary") == std::string::npos) == compact &&
+                    text.find("After compaction") != std::string::npos,
+                    "compact omits summary text while retaining the following conversation");
+                ok &= check((text.find("This export includes that summary") == std::string::npos) == compact,
+                    "the compact notice does not claim to include the omitted summary body");
+            }
+        }
     }
+    request.compact = false;
     ok &= compact_projection(root, source, request);
     ok &= advisor_results(root, source, request);
+    ok &= empty_projection(root, source, request);
+    ok &= malformed_empty_results(root, source, request);
     request.output_directory = addon::path_to_utf8(root / "failures");
     fs::create_directories(addon::path_from_utf8(request.output_directory));
     write(source, R"({"type":"user","uuid":"a","parentUuid":"missing","sessionId":"session-a","message":{"role":"user","content":"orphan"}})" "\n");

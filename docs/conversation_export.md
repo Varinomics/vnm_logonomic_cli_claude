@@ -30,8 +30,10 @@ provider follows `parentUuid`, matching the official SDK, and does not join
 parent or cycle is an explicit failure rather than an apparently complete
 export.
 
-Text, thinking text, tool arguments/results and image/document references are
-retained. Tool-discovery references retain their native `tool_reference` JSON,
+Text, nonempty thinking text, tool arguments/results and image/document references
+are retained. Native rows that contribute no export blocks are skipped, including
+tool results with omitted content or an empty content array.
+Tool-discovery references retain their native `tool_reference` JSON,
 including `tool_name`, in the containing result's original position. Each encrypted
 `redacted_thinking` block remains as `[Encrypted message]` in its original position,
 in both full and compact extraction. Native advisor results retain plaintext
@@ -43,8 +45,9 @@ into the conversation text. Unsupported content blocks fail explicitly.
 Compact extraction keeps user content and final assistant replies. Native
 `stop_reason: end_turn` identifies a final reply; `tool_use` and `pause_turn`
 identify continuing responses whose text is omitted in compact mode. Thinking,
-tool calls/results, tool-discovery references and compact-summary records are
-also omitted. Attachments belonging to retained user or assistant content remain.
+tool calls/results, tool-discovery references and compact-summary bodies are
+also omitted. The existing notice that pre-compaction originals are not reconstructed
+remains visible. Attachments belonging to retained user or assistant content remain.
 Missing or other stop reasons stay unclassified and their assistant text is
 retained conservatively. No classification depends on message wording. Unchecking
 Compact re-extracts the full retained discussion from the unchanged native source.
@@ -65,6 +68,8 @@ The branch and content-block semantics follow Anthropic's public Agent SDK:
 - [Tool-search reference blocks](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool#custom-tool-search-implementation)
 - [Native response stop reasons](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)
 - [Encrypted redacted thinking](https://platform.claude.com/docs/en/about-claude/models/extended-thinking-models#redacted-thinking-blocks)
+- [Optional tool-result content](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/types/tool_result_block_param.py)
+- [Thinking text and opaque verification signatures](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/types/thinking_block.py)
 - [Claude Code advisor](https://code.claude.com/docs/en/advisor)
 - [Advisor result variants](https://platform.claude.com/docs/en/agents-and-tools/tool-use/advisor-tool#result-variants)
 
