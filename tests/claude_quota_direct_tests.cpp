@@ -1,4 +1,5 @@
 #include "claude_quota_direct.h"
+#include "claude_native_context_fixture.h"
 #include "claude_probes.h"
 #include "claude_support.h"
 
@@ -8,10 +9,8 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
-#ifndef _WIN32
-#include <sys/utsname.h>
-#endif
 
 namespace {
 
@@ -112,7 +111,7 @@ std::optional<std::string> fetch(std::string_view token, claude::Quota_clock::ti
     return R"({"five_hour":{"utilization":10,"resets_at":null},"seven_day":{"utilization":25,"resets_at":null}})";
 }
 
-void filesystem_contract()
+void filesystem_contract(bool exercise_filesystem)
 {
     const auto root = fs::temp_directory_path() / ("claude-quota-" + addon::random_nonce_hex());
     fs::create_directories(root / "profile");
@@ -152,17 +151,16 @@ void filesystem_contract()
             return claude::direct_quota_output(program, arguments, environment, root / "work",
                 claude::Quota_clock::now() + std::chrono::seconds(30), fetch);
         };
-#ifndef _WIN32
-        utsname kernel{};
-        require(uname(&kernel) == 0, "kernel policy context is observable");
-        std::string release = kernel.release;
-        for (auto& byte : release) if (byte >= 'A' && byte <= 'Z') byte += 'a' - 'A';
-        if (release.find("microsoft") != std::string::npos) {
-            require(!read() && requests == 0, "WSL retains native Windows-policy inheritance authority");
+        if (!exercise_filesystem) {
+            if (claude::test::native_context_unavailable(root)) {
+                require(!read() && requests == 0, "unresolved native policy cannot send credentials");
+            }
+            else {
+                require(read().has_value() && requests == 1, "eligible native context makes one request");
+            }
             fs::remove_all(root);
             return;
         }
-#endif
         require(read().has_value() && requests == 1, "eligible complete path makes one request");
         write(root / "work/.git", "gitdir: /other-checkout/.git/worktrees/linked\n");
         require(!read() && requests == 1, "linked worktree's disjoint consent root remains native");
@@ -202,12 +200,23 @@ void filesystem_contract()
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     try {
-        admission_contract();
-        response_contract();
-        filesystem_contract();
+        require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--filesystem"),
+            "Expected optional --filesystem");
+        if (argc == 2) {
+            if (const auto* reason = claude::test::native_context_unavailable(fs::temp_directory_path())) {
+                std::cout << "Filesystem fixtures unavailable: " << reason << '\n';
+                return 77;
+            }
+            filesystem_contract(true);
+        }
+        else {
+            admission_contract();
+            response_contract();
+            filesystem_contract(false);
+        }
         return 0;
     }
     catch (const std::exception& error) {
