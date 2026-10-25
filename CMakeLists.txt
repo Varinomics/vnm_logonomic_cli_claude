@@ -64,7 +64,8 @@ endif()
 
 add_library(claude_provider STATIC
     src/claude_conversation.cpp
-    src/claude_accounts.cpp src/claude_launcher.cpp src/claude_lifecycle.cpp
+    src/claude_accounts.cpp src/claude_launcher.cpp src/claude_launcher_approval.cpp
+    src/claude_lifecycle.cpp
     src/claude_preparation.cpp src/claude_probes.cpp src/claude_resume.cpp src/claude_sessions.cpp src/claude_usage.cpp
     src/claude_usage_summary.cpp src/claude_wake.cpp)
 claude_target(claude_provider)

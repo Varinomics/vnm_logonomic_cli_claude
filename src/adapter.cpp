@@ -2,6 +2,7 @@
 #include "claude_conversation.h"
 #include "claude_lifecycle.h"
 #include "claude_launcher.h"
+#include "claude_launcher_approval.h"
 #include "claude_preparation.h"
 #include "claude_probes.h"
 #include "claude_sessions.h"
@@ -65,6 +66,10 @@ void invoke(addon::Invocation_context& context, const fs::path& package_root)
         }
         const auto& request = context.request();
         const auto& capability = request.capability.capability_id;
+        if (capability == addon::k_launcher_approval_capability_id) {
+            addon::handle_launcher_approval(context, claude::launcher_approval_rules());
+        }
+        else
         if (capability == "launcher-discovery") {
             addon::Contract_failure failure;
             if (request.operation == "discover") {
@@ -128,6 +133,7 @@ int main()
     options.adapter_name = "claude-addon";
     options.adapter_version = "1.0.0";
     options.capabilities = {
+        {addon::k_launcher_approval_capability_id, addon::k_launcher_approval_version},
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1}, {"managed-assets", 1},
         {addon::k_conversation_export_capability_id, addon::k_conversation_export_version},
         {"accounts", 2}, {"launch-preparation", 3}, {"interactive-resume", 2}, {"interactive-resume", 3},

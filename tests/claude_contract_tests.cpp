@@ -1,5 +1,6 @@
 #include "claude_accounts.h"
 #include "claude_launcher.h"
+#include "claude_launcher_approval.h"
 #include "claude_lifecycle.h"
 #include "claude_preparation.h"
 #include "claude_probes.h"
@@ -154,6 +155,50 @@ Json protocol(bool review)
     auto result = claude::object(R"({"initialized":false,"pending_base64":"","result_base64":"","root_session_id":"","working_directory":"","expected_tools":["Read","Glob","Grep"],"task_tools":[],"expected_mcp_servers":[]})");
     if (review) result.set("working_directory", Json(claude::path_string(fs::current_path())));
     return result;
+}
+
+void launcher_approval_contract()
+{
+    const auto& rules = claude::launcher_approval_rules();
+    const auto yolo = addon::Launcher_approval_action::YOLOFY;
+    const auto undo = addon::Launcher_approval_action::UNYOLOFY;
+    const auto changed = addon::Launcher_approval_disposition::CHANGED;
+    const auto unchanged = addon::Launcher_approval_disposition::UNCHANGED;
+    const auto windows = addon::transform_launcher_approval({
+        {"claude", "cmd", "CLAUDE_CONFIG_DIR=C:\\profiles\\work"}, "windows-x86_64", yolo}, rules);
+    require(windows.disposition == changed &&
+        windows.script_body == "claude --dangerously-skip-permissions",
+        "discovered Windows Claude launcher supports Yolofy");
+    const auto alias = addon::transform_launcher_approval({
+        {"claude --permission-mode=bypassPermissions", "direct", ""}, "linux-x86_64", undo}, rules);
+    require(alias.disposition == changed && alias.script_body == "claude",
+        "Unyolofy removes the equivalent Claude permission mode");
+    const std::string settings = R"(--settings '{"permissions":{"defaultMode":"bypassPermissions"}}')";
+    const auto custom = addon::transform_launcher_approval({
+        {"claude --permission-mode auto --allow-dangerously-skip-permissions " + settings,
+            "bash", ""}, "linux-x86_64", yolo}, rules);
+    require(custom.disposition == changed && custom.script_body.find(settings) != std::string::npos &&
+        custom.script_body.find("--allow-dangerously-skip-permissions") != std::string::npos &&
+        custom.script_body.find("--permission-mode") == std::string::npos,
+        "Claude mode replacement preserves mode availability and inline settings");
+    const auto removed = addon::transform_launcher_approval({
+        {custom.script_body, "bash", ""}, "linux-x86_64", undo}, rules);
+    require(removed.disposition == changed && removed.script_body.find(settings) != std::string::npos &&
+        removed.script_body.find("--allow-dangerously-skip-permissions") != std::string::npos &&
+        removed.script_body.find("--permission-mode") == std::string::npos,
+        "Unyolofy preserves Claude configuration and inserts no replacement policy");
+    const std::string prompt = R"(claude --system-prompt "--dangerously-skip-permissions")";
+    const auto literal = addon::transform_launcher_approval({
+        {prompt, "direct", ""}, "linux-x86_64", undo}, rules);
+    require(literal.disposition == unchanged && literal.script_body == prompt,
+        "Claude prompt text is not an invocation-level bypass");
+    const auto plan = addon::transform_launcher_approval({
+        {"claude --permission-mode plan", "direct", ""}, "linux-x86_64", undo}, rules);
+    require(plan.disposition == unchanged, "Unyolofy preserves non-bypass Claude permission modes");
+    const auto auth = addon::transform_launcher_approval({
+        {"claude auth login", "direct", ""}, "linux-x86_64", yolo}, rules);
+    require(auth.disposition == addon::Launcher_approval_disposition::UNSUPPORTED,
+        "Claude account management is not a session launcher");
 }
 
 void launcher_contract()
@@ -2276,6 +2321,7 @@ int main(int argc, char** argv)
     }
     try {
         review_contract();
+        launcher_approval_contract();
         launcher_contract();
         launcher_discovery_contract();
         launcher_discovery_candidate_limit();
