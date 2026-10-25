@@ -2262,7 +2262,7 @@ void quota_reset_label_contract()
 
 void account_name_contract()
 {
-    // Oracle: accounts@1 names an account with a filesystem profile after the
+    // Oracle: accounts@2 names an account with a filesystem profile after the
     // profile's folder through the SDK's account_display_name.
 #ifdef _WIN32
     const std::string platform = "windows-x86_64";
