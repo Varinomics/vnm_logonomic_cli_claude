@@ -14,7 +14,9 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <memory>
 #include <stdexcept>
+#include <type_traits>
 
 namespace claude {
 namespace {
@@ -144,10 +146,60 @@ std::string reset_text(std::chrono::sys_seconds instant, std::uint64_t now)
     local_seconds local, current;
     std::string zone;
 #ifdef _WIN32
-    const auto* timezone = current_zone();
-    local   = timezone->to_local(instant);
-    current = timezone->to_local(sys_seconds(seconds(now / 1000)));
-    zone    = timezone->name();
+    DYNAMIC_TIME_ZONE_INFORMATION timezone{};
+    if (GetDynamicTimeZoneInformation(&timezone) == TIME_ZONE_ID_INVALID) {
+        throw std::runtime_error("quota_timezone_unavailable");
+    }
+    const auto convert = [&timezone](sys_seconds point) {
+        const year_month_day date{floor<days>(point)};
+        const hh_mm_ss time{point - floor<days>(point)};
+        const SYSTEMTIME utc{
+            (WORD)int(date.year()), (WORD)unsigned(date.month()), 0, (WORD)unsigned(date.day()),
+            (WORD)time.hours().count(), (WORD)time.minutes().count(), (WORD)time.seconds().count(), 0};
+        SYSTEMTIME value{};
+        if (!SystemTimeToTzSpecificLocalTimeEx(&timezone, &utc, &value)) {
+            throw std::runtime_error("quota_timezone_unavailable");
+        }
+        return local_days(year(value.wYear) / month(value.wMonth) / day(value.wDay)) +
+            hours(value.wHour) + minutes(value.wMinute) + seconds(value.wSecond);
+    };
+    local   = convert(instant);
+    current = convert(sys_seconds(seconds(now / 1000)));
+
+    // The system ICU service supplies the IANA identifier used by native usage.
+    using System_module = std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(&FreeLibrary)>;
+    const System_module icu(
+        LoadLibraryExW(L"icu.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32), &FreeLibrary);
+    if (!icu) {
+        throw std::runtime_error("quota_timezone_unavailable");
+    }
+    using Get_default_timezone = std::int32_t (__cdecl*)(char16_t*, std::int32_t, std::int32_t*);
+    const auto get_default_timezone = reinterpret_cast<Get_default_timezone>(
+        GetProcAddress(icu.get(), "ucal_getDefaultTimeZone"));
+    if (!get_default_timezone) {
+        throw std::runtime_error("quota_timezone_unavailable");
+    }
+    std::array<char16_t, 128> identifier{};
+    std::int32_t status = 0;
+    const auto length = get_default_timezone(identifier.data(), (std::int32_t)identifier.size(), &status);
+    if (status > 0 || length <= 0 || length >= (std::int32_t)identifier.size()) {
+        throw std::runtime_error("quota_timezone_unavailable");
+    }
+    const std::wstring wide(identifier.data(), identifier.data() + length);
+    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        wide.data(), length, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) {
+        throw std::runtime_error("quota_timezone_unavailable");
+    }
+    zone.resize(size);
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        wide.data(), length, zone.data(), size, nullptr, nullptr) != size)
+    {
+        throw std::runtime_error("quota_timezone_unavailable");
+    }
+    if (zone == "Etc/Unknown") {
+        throw std::runtime_error("quota_timezone_unavailable");
+    }
 #else
     const auto convert = [](sys_seconds point) {
         const auto stamp = system_clock::to_time_t(point);
