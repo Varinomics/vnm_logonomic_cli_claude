@@ -142,6 +142,7 @@ int main()
         {"usage-lifetime-summary", 1},
         {"usage-saved-daily-tokens", 1},
         {"usage-incremental", 1},
+        {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
         {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
         {"coordination-delivery", 1},

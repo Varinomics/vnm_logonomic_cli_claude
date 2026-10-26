@@ -227,6 +227,7 @@ if(BUILD_TESTING)
     add_dependencies(claude_contract_tests claude_package)
     add_test(NAME claude_contract_tests COMMAND claude_contract_tests "${CLAUDE_PACKAGE_DIRECTORY}")
     add_test(NAME claude_launcher_approval_tests COMMAND claude_contract_tests --launcher-approval)
+    add_test(NAME claude_context_state_tests COMMAND claude_contract_tests --context-state)
     set_tests_properties(claude_launcher_approval_tests PROPERTIES TIMEOUT 30 LABELS "launcher-approval")
     add_executable(claude_fake_vnmctl tests/claude_fake_vnmctl.cpp)
     claude_target(claude_fake_vnmctl)
@@ -246,6 +247,12 @@ if(BUILD_TESTING)
         "$<TARGET_FILE:claude_helper>" "$<TARGET_FILE:claude_fake_vnmctl>"
         "${CLAUDE_PACKAGE_DIRECTORY}/adapter/claude_adapter${CLAUDE_EXECUTABLE_SUFFIX}"
         "${CLAUDE_PACKAGE_DIRECTORY}/assets/claude-hooks/scripts/logonomic-hook-relay.cjs")
+    add_test(NAME claude_context_helper_tests COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_helper_tests.py"
+        "$<TARGET_FILE:claude_helper>" "$<TARGET_FILE:claude_fake_vnmctl>"
+        "${CLAUDE_PACKAGE_DIRECTORY}/adapter/claude_adapter${CLAUDE_EXECUTABLE_SUFFIX}"
+        "${CLAUDE_PACKAGE_DIRECTORY}/assets/claude-hooks/scripts/logonomic-hook-relay.cjs"
+        --context-only)
     add_test(NAME claude_package_validation COMMAND logonomic_cli_addon_validate
         "${CLAUDE_PACKAGE_DIRECTORY}" --platform "${CLAUDE_PLATFORM}")
     add_test(NAME claude_package_conformance COMMAND logonomic_cli_addon_conformance
@@ -259,13 +266,18 @@ if(BUILD_TESTING)
         add_test(NAME claude_hook_contract_tests COMMAND "${CLAUDE_NODE_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_hook_tests.mjs"
             "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/scripts/logonomic-hook-relay.cjs")
+        add_test(NAME claude_context_hook_tests COMMAND "${CLAUDE_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_context_hook_tests.mjs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/hooks/wake.js")
+        set_tests_properties(claude_context_hook_tests PROPERTIES TIMEOUT 30)
     else()
         message(WARNING "Node is unavailable: claude_hook_contract_tests cannot qualify this package and will fail. Use BUILD_TESTING=OFF for a package-only build.")
         add_test(NAME claude_hook_contract_tests COMMAND "${CMAKE_COMMAND}" -E false)
         set_tests_properties(claude_hook_contract_tests PROPERTIES LABELS "missing-test-dependency")
     endif()
     set_tests_properties(claude_contract_tests claude_package_validation claude_package_conformance
-        claude_hook_contract_tests claude_helper_tests claude_initial_prompt_delivery_tests PROPERTIES TIMEOUT 120)
+        claude_hook_contract_tests claude_helper_tests claude_context_helper_tests claude_context_state_tests
+        claude_initial_prompt_delivery_tests PROPERTIES TIMEOUT 120)
 endif()
 if(BUILD_TESTING)
     add_executable(claude_usage_cache_tests tests/claude_usage_cache_tests.cpp)

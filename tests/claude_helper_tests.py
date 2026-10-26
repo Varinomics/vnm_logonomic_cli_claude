@@ -47,7 +47,8 @@ class Adapter:
                 "max_in_flight_requests": 64, "max_progress_frames_per_request": 100000},
             "host": {"product": "logonomic", "version": "1.0.0"}})
         assert self.read()["type"] == "hello"
-        assert self.read()["type"] == "capabilities"
+        self.capabilities = self.read()
+        assert self.capabilities["type"] == "capabilities"
 
     def send(self, frame):
         self.process.stdin.write((json.dumps(frame) + "\n").encode("utf-8"))
@@ -80,6 +81,24 @@ class Adapter:
         self.send({"type": "shutdown", "grace_ms": 5000})
         self.process.stdin.close()
         assert self.process.wait(timeout=10) == 0
+
+    def classify(self, delivery, version, current_session=None):
+        self.serial += 1
+        request_id = "r" + str(self.serial)
+        payload = {"event": delivery["event"], "transition_nonce": delivery["transition_nonce"],
+            "ledger": {"current_epoch": 0, "current_transition": None}}
+        if current_session is not None:
+            payload["ledger"] = {"current_epoch": 2, "current_transition": {
+                "kind": "start", "provider_session_id": current_session, "nonce": "7" * 32}}
+        if version is not None:
+            payload["context_state_version"] = version
+        self.send({"type": "invoke", "request_id": request_id, "capability_id": "helper-ingress",
+            "version": 2, "operation": "classify_event", "deadline_ms": 5000, "payload": payload})
+        while True:
+            response = self.read()
+            if response["type"] == "result":
+                assert response["request_id"] == request_id and response["status"] == "success", response
+                return response["payload"]
 
 
 def sweep_policy(adapter, profile, parent, pid, birth):
@@ -198,6 +217,55 @@ def main():
             elapsed = time.monotonic() - started
             records = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
             return result, records, elapsed
+
+        context_adapter = Adapter(adapter)
+        try:
+            assert {"capability_id": "context-state", "version": 2} in context_adapter.capabilities["capabilities"]
+            context = {"used_tokens": 64000, "context_window": 200000}
+            result, records, _ = run({"hook_event_name": "ModContext", "session_id": "native-session",
+                "context_state": {**context, "unrelated_text": "must remain local"}})
+            assert result.returncode == 0 and result.stdout == "", result.stderr
+            assert [item["operation"] for item in records] == ["provider-event", "acknowledge"]
+            delivery = records[0]["request"]
+            assert delivery["event"]["body"]["context_state"] == context
+            classified = context_adapter.classify(delivery, 2)
+            assert classified["classification"] == "ignore" and classified["observations"] == []
+            expected_update = {**context, "provider_session_id": "native-session",
+                "event_id": delivery["transition_nonce"]}
+            assert classified["context_updates"] == [expected_update]
+            assert context_adapter.classify(delivery, 2) == classified, "redelivery changed the native observation"
+            for version in (None, 1, "2"):
+                unrequested = context_adapter.classify(delivery, version)
+                assert "context_updates" not in unrequested and unrequested["classification"] == "ignore"
+                assert ("context_failure" in unrequested) == (version is not None)
+                if version is not None:
+                    assert "provider_session_id" not in unrequested["context_failure"]
+            for malformed in ({"used_tokens": None, "context_window": 200000},
+                              {**context, "usage_unavailable": "unexpected native content"}):
+                result, records, _ = run({"hook_event_name": "ModTurnComplete", "session_id": "native-session",
+                    "reason": "answer", "context_state": malformed})
+                assert result.returncode == 0, result.stderr
+                invalid = context_adapter.classify(records[0]["request"], 2, "replacement-session")
+                assert invalid["classification"] == "event" and len(invalid["observations"]) == 1
+                assert "context_updates" not in invalid and "context_failure" in invalid
+                assert invalid["context_failure"]["provider_session_id"] == "native-session"
+            result, records, _ = run({"hook_event_name": "ModContext", "session_id": "native-session",
+                "context_state": None})
+            assert result.returncode == 0, result.stderr
+            invalid = context_adapter.classify(records[0]["request"], 2, "replacement-session")
+            assert invalid["classification"] == "ignore" and invalid["observations"] == []
+            assert invalid["context_failure"]["provider_session_id"] == "native-session"
+            result, records, _ = run({"hook_event_name": "ModContext", "session_id": "native-session",
+                "context_state": {"usage_unavailable": True}})
+            assert result.returncode == 0, result.stderr
+            unavailable = context_adapter.classify(records[0]["request"], 2)
+            assert unavailable["context_updates"] == [{"provider_session_id": "native-session",
+                "event_id": records[0]["request"]["transition_nonce"], "usage_unavailable": True}]
+        finally:
+            context_adapter.close()
+        if "--context-only" in sys.argv[5:]:
+            print("Claude helper-to-adapter context checks passed.")
+            return
 
         for mode in ("accepted", "refused", "transport", "stall"):
             result, records, elapsed = run(prompt, CLAUDE_TEST_LIFECYCLE=mode)

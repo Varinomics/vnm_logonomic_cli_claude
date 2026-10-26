@@ -6,6 +6,27 @@ let paused = true;
 let directory;
 let native_id;
 
+async function report_context($, session_id, payload) {
+    let context_state = { usage_unavailable: true };
+    try {
+        const usage   = await $.session.usage();
+        const context = usage.context;
+        if (Number.isSafeInteger(context?.tokens) && context.tokens >= 0 &&
+            Number.isSafeInteger(context?.window) && context.window > 0)
+        {
+            context_state = { used_tokens: context.tokens, context_window: context.window };
+        }
+    }
+    catch { /* A missing native measurement clears the previous reading. */ }
+    if (await $.session.id() !== session_id) {
+        return;
+    }
+    await $.process.run(['node', `${$.plugin.root}/scripts/logonomic-hook-relay.cjs`], {
+        stdin: JSON.stringify({ ...payload, session_id, context_state }),
+        timeoutMs: 13000,
+    });
+}
+
 async function bridge($, operation, id, value) {
     const result = await $.process.run(
         ['node', `${$.plugin.root}/scripts/logonomic-wake.cjs`, operation, directory, ...(id ? [id] : [])],
@@ -101,7 +122,14 @@ export function register(on) {
             }
             catch { /* An unavailable owner disables wake alone. */ }
         }
-        return next(event);
+        const result = await next(event);
+        if (!event.agent_id && event.source !== 'compact') {
+            try {
+                await report_context($, event.session_id, { hook_event_name: 'ModContext' });
+            }
+            catch { /* Context telemetry must not change native startup. */ }
+        }
+        return result;
     });
     on('session.start', async ($, event, next) => {
         directory = await $.env.get('VNM_CLAUDE_WAKE_DIRECTORY');
@@ -127,22 +155,23 @@ export function register(on) {
         return next(event);
     });
     on('turn.complete', async ($, event, next) => {
-        const completed_id = native_id;
+        let completed_id = native_id;
         if (!event.agentId) {
+            try { completed_id ??= await $.session.id(); }
+            catch { /* A missing native identity cannot own a measurement. */ }
             busy = false;
             paused = event.reason !== 'answer';
         }
         const result = await next(event);
-        if (!event.agentId && event.reason === 'answer' && active && native_id === completed_id &&
-            await $.session.id() === completed_id)
-        {
+        if (!event.agentId && completed_id) {
             try {
                 // Classic Stop hooks precede this native completion. Their ACK
                 // may already have retried while we were still busy. Publish a
                 // fresh authenticated event only after native readiness changes.
-                await $.process.run(['node', `${$.plugin.root}/scripts/logonomic-hook-relay.cjs`], {
-                    stdin: JSON.stringify({ hook_event_name: 'ModTurnComplete', session_id: completed_id, reason: 'answer' }),
-                    timeoutMs: 13000,
+                await report_context($, completed_id, {
+                    hook_event_name: event.reason === 'answer' && active && native_id === completed_id
+                        ? 'ModTurnComplete' : 'ModContext',
+                    reason: event.reason,
                 });
             }
             catch { /* Notification failure must not change the completed turn. */ }

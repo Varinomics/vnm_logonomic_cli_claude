@@ -11,6 +11,7 @@ const event_budgets = Object.freeze({
     SubagentStart: 12000,
     SubagentStop: 12000,
     Stop: 12000,
+    ModContext: 12000,
     ModTurnComplete: 12000,
     StopFailure: 12000,
     PermissionRequest: 12000,

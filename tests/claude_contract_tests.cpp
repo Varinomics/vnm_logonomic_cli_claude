@@ -11,6 +11,7 @@
 #include <logonomic_cli_addon/sha256.h>
 
 #include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/context_state.h>
 #include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/ids.h>
@@ -2274,6 +2275,98 @@ void retained_message_contract()
     fs::remove_all(root);
 }
 
+void context_state_contract()
+{
+    // Native session.usage supplies current tokens/window, while compact
+    // SessionStart precedes replacement installation. Neither proves a count.
+    addon::Classify_event_request request;
+    request.context_state_version = addon::k_context_state_capability_version;
+    request.transition_nonce      = std::string(32, '6');
+    request.event.name             = "ModContext";
+    request.event.body = claude::object(R"({"hook_event_name":"ModContext","session_id":"native-session",
+        "context_state":{"used_tokens":64000,"context_window":200000}})");
+    auto result = claude::classify_event(request);
+    require(result.classification == addon::Classification::IGNORED && result.observations.empty() &&
+        !result.transition && result.context_updates.size() == 1 && !result.context_failure,
+        "context-only native reports do not create lifecycle observations");
+    const auto update = result.context_updates.front();
+    require(update.provider_session_id == "native-session" && update.event_id == request.transition_nonce &&
+        update.used_tokens == 64000 && update.context_window == 200000 && !update.compaction_count &&
+        !update.compaction_count_revision && !update.compacted,
+        "native occupancy keeps unknown compaction history and stable delivery identity");
+    require(claude::classify_event(request).context_updates.front().event_id == update.event_id,
+        "redelivery retains the context observation identity");
+    addon::Contract_failure failure;
+    const auto decoded = addon::decode_classify_event_result(addon::encode_classify_event_result(result), &failure);
+    require(decoded && decoded->context_updates.size() == 1 && !decoded->context_failure,
+        "context-only results survive the actual lifecycle codec");
+    addon::Context_state state;
+    addon::apply_context_update(state, update);
+    require(state.used_fraction == 0.32 && !state.compaction_count && !state.compaction_count_complete,
+        "occupancy uses the current native context window without fabricating a count");
+
+    request.context_state_version = 0;
+    require(claude::classify_event(request).context_updates.empty(), "unrequested telemetry stays absent");
+    request.context_state_version = addon::k_context_state_capability_version;
+    request.event.body.set("agent_id", Json("child"));
+    require(claude::classify_event(request).context_updates.empty(), "subagent usage cannot replace root usage");
+    request.event.body = claude::object(R"({"hook_event_name":"ModTurnComplete","session_id":"native-session",
+        "reason":"answer","context_state":{"used_tokens":null,"context_window":200000}})");
+    request.event.name = "ModTurnComplete";
+    request.ledger.current_epoch = 2;
+    request.ledger.current_transition = addon::Ledger_transition{
+        addon::Transition_kind::START, "replacement-session", std::string(32, '7')};
+    result = claude::classify_event(request);
+    require(result.context_updates.empty() && result.context_failure && result.observations.size() == 1 &&
+        result.context_failure->provider_session_id == "native-session" &&
+        result.observations.front().phase_transition == addon::Phase_transition::AWAITING_INPUT,
+        "malformed usage retains its native source and cannot discard completion readiness");
+    const auto failed = addon::decode_classify_event_result(addon::encode_classify_event_result(result), &failure);
+    require(failed && failed->context_failure &&
+        failed->context_failure->provider_session_id == "native-session" && failed->observations.size() == 1,
+        "the result codec retains native failure scope alongside valid lifecycle");
+    auto malformed = request;
+    malformed.event.name = "ModContext";
+    malformed.event.body.set("hook_event_name", Json("ModContext"));
+    malformed.event.body.set("context_state", Json());
+    const auto malformed_result = claude::classify_event(malformed);
+    require(malformed_result.classification == addon::Classification::IGNORED && malformed_result.context_failure &&
+        malformed_result.context_failure->provider_session_id == "native-session",
+        "a non-object context-only payload remains scoped to its source rather than the replacement ledger");
+    malformed.event.body.set("session_id", Json());
+    const auto unscoped = claude::classify_event(malformed);
+    require(unscoped.context_failure && unscoped.context_failure->provider_session_id.empty(),
+        "an unknown native source stays diagnostic-only instead of borrowing the host ledger identity");
+
+    request.event.body.set("context_state", claude::object(R"({"usage_unavailable":true})"));
+    result = claude::classify_event(request);
+    require(result.context_updates.size() == 1 && result.context_updates.front().usage_unavailable,
+        "missing native usage explicitly clears the prior measurement");
+    addon::apply_context_update(state, result.context_updates.front());
+    require(!state.used_fraction && !state.used_tokens && !state.context_window,
+        "unavailable usage remains unknown instead of zero or a retained stale percentage");
+
+    request.event.body.set("context_state", claude::object(R"({"used_tokens":0,"context_window":200000})"));
+    result = claude::classify_event(request);
+    addon::apply_context_update(state, result.context_updates.front());
+    require(state.used_fraction == 0 && state.used_tokens == 0,
+        "an explicit native zero is distinct from a missing measurement");
+
+    request.event.name = "SessionStart";
+    request.event.body = claude::object(R"({"hook_event_name":"SessionStart","session_id":"native-session","source":"compact"})");
+    result = claude::classify_event(request);
+    require(result.observations.empty() && !result.transition && result.context_updates.size() == 1 &&
+        result.context_updates.front().usage_unavailable && !result.context_updates.front().compacted &&
+        !result.context_updates.front().compaction_count,
+        "pre-install compaction invalidates occupancy without claiming a successful compaction");
+    addon::apply_context_update(state, result.context_updates.front());
+    require(!state.used_fraction && !state.compaction_count, "compaction attempt leaves usage and count unknown");
+    request.event.body.set("source", Json("resume"));
+    result = claude::classify_event(request);
+    require(result.transition == addon::Transition_kind::RESUME && result.context_updates.empty(),
+        "resume lifecycle cannot manufacture a complete historical compaction baseline");
+}
+
 void quota_reset_label_contract()
 {
     using namespace logonomic::cli_addon;
@@ -2363,13 +2456,19 @@ void account_name_contract()
 int main(int argc, char** argv)
 {
     if (argc != 2) {
-        std::cerr << "usage: claude_contract_tests <package directory> | --launcher-approval\n";
+        std::cerr << "usage: claude_contract_tests <package directory> | --launcher-approval | --context-state\n";
         return 2;
     }
     try {
         if (std::string_view(argv[1]) == "--launcher-approval") {
             launcher_approval_contract();
             std::cout << "Claude launcher approval contract checks passed.\n";
+            return 0;
+        }
+        if (std::string_view(argv[1]) == "--context-state") {
+            context_state_contract();
+            lifecycle_contract();
+            std::cout << "Claude context state contract checks passed.\n";
             return 0;
         }
         review_contract();
@@ -2383,6 +2482,7 @@ int main(int argc, char** argv)
         wake_preparation_contract();
         wake_binding_contract();
         lifecycle_contract();
+        context_state_contract();
         declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
         structured_contract();
         delegated_readiness_contract();
