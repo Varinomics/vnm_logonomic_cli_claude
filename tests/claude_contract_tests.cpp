@@ -204,12 +204,8 @@ void launcher_approval_contract()
     const auto variadic = addon::transform_launcher_approval({
         {"claude --allowedTools Read --dangerously-skip-permissions hello", "direct", ""},
         "windows-x86_64", undo}, rules);
-    if (variadic.disposition != addon::Launcher_approval_disposition::UNSUPPORTED ||
-        !variadic.script_body.empty())
-    {
-        throw std::runtime_error("Unyolofy must not turn the prompt into an allowedTools value: " +
-            addon::serialize_json_canonical(addon::encode_launcher_approval_transform_result(variadic)));
-    }
+    require(variadic.disposition == changed && variadic.script_body == "claude --allowedTools=Read hello",
+        "Unyolofy preserves the existing prompt through native attached-value termination");
 
     // Claude declares these options <values...>. Each approval span ends
     // their values; deleting it would expose the prompt to that option.
@@ -229,12 +225,43 @@ void launcher_approval_contract()
             const addon::Launcher_request launcher{
                 "claude " + option + " " + value + " " + approval + " hello", "direct", ""};
             const auto result = addon::transform_launcher_approval({launcher, "windows-x86_64", undo}, rules);
-            require(result.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
-                result.script_body.empty(), "unsupported variadic arity supplies no replacement script");
+            require(result.disposition == changed && result.script_body == "claude " + option + "=" + value + " hello",
+                "all native variadic spellings retain their value and following prompt");
+            auto edited = launcher;
+            edited.script_body = result.script_body;
+            const auto again = addon::transform_launcher_approval({edited, "windows-x86_64", undo}, rules);
+            require(again.disposition == unchanged && again.script_body == edited.script_body,
+                "a variadic approval edit is idempotent");
             const auto key = addon::launcher_approval_comparison_key({launcher, "windows-x86_64"}, rules);
-            require(!key.supported && key.key.empty(), "unsupported variadic arity supplies no comparison key");
+            const auto edited_key = addon::launcher_approval_comparison_key({edited, "windows-x86_64"}, rules);
+            require(key.supported && edited_key.supported && key.key == edited_key.key,
+                "safe variadic repair preserves the approval-independent launcher identity");
+        }
+        const addon::Launcher_request saved{"claude " + option + " " + value, "direct", ""};
+        const auto enabled = addon::transform_launcher_approval({saved, "windows-x86_64", yolo}, rules);
+        require(enabled.disposition == changed, "saved variadic launchers without a prompt support Yolofy");
+        const auto disabled = addon::transform_launcher_approval({
+            {enabled.script_body, "direct", ""}, "windows-x86_64", undo}, rules);
+        require(disabled.disposition == changed && disabled.script_body == saved.script_body,
+            "a no-prompt variadic launcher survives both approval actions");
+        for (const std::string first_value : {"--bare", "--"}) {
+            const addon::Launcher_request ambiguous{"claude " + option + " " + first_value, "direct", ""};
+            for (const auto action : {yolo, undo}) {
+                require(addon::transform_launcher_approval({ambiguous, "windows-x86_64", action}, rules).disposition ==
+                    addon::Launcher_approval_disposition::UNSUPPORTED,
+                    "separate option-looking values remain outside the native raw-argv safety boundary");
+            }
+            require(!addon::launcher_approval_comparison_key({ambiguous, "windows-x86_64"}, rules).supported,
+                "ambiguous raw option values do not acquire semantic comparison keys");
         }
     }
+
+    const auto multiple = addon::transform_launcher_approval({
+        {"claude --allowedTools Read Write --dangerously-skip-permissions hello --model sonnet", "direct", ""},
+        "windows-x86_64", undo}, rules);
+    require(multiple.disposition == changed && multiple.script_body ==
+        "claude --allowedTools Read --allowedTools=Write hello --model sonnet",
+        "multiple values preserve their order without hiding a later non-approval option");
 
     const auto single_value = addon::transform_launcher_approval({
         {"claude --plugin-dir plugins --dangerously-skip-permissions hello", "direct", ""},

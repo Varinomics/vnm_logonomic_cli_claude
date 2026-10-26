@@ -13,8 +13,6 @@ const logonomic::cli_addon::Launcher_approval_rules& launcher_approval_rules()
                 {"default", "manual", "acceptEdits", "plan", "auto", "dontAsk"}},
         },
         .conflicting_arguments = {},
-        // Variadic options are omitted: removing an approval flag can make
-        // their values absorb a following prompt.
         .value_arguments = {
             "--model", "--fallback-model", "--agent", "--agents", "--effort",
             "--settings", "--setting-sources", "--system-prompt", "--system-prompt-file",
@@ -35,6 +33,17 @@ const logonomic::cli_addon::Launcher_approval_rules& launcher_approval_rules()
             "update", "install", "auth", "agents", "attach", "auto-mode", "daemon", "doctor",
             "gateway", "import", "logs", "mcp", "plugin", "plugins", "purge", "remote-control",
             "rm", "self-hosted-runner", "setup-token", "stop", "kill", "ultrareview", "help",
+        },
+        // Native repeated occurrences append values; an attached value ends
+        // consumption so removing an approval span cannot absorb a prompt.
+        .variadic_arguments = {
+            {"--add-dir", true, true},
+            {"--allowedTools", true, true},
+            {"--allowed-tools", true, true},
+            {"--disallowedTools", true, true},
+            {"--disallowed-tools", true, true},
+            {"--tools", true, true},
+            {"--mcp-config", true, true},
         },
     };
     return rules;
