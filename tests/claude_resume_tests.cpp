@@ -1,4 +1,5 @@
 #include "claude_accounts.h"
+#include "claude_native_context_fixture.h"
 #include "claude_preparation.h"
 #include "claude_support.h"
 
@@ -246,17 +247,34 @@ void expect_prepared(Fixture& fixture, const char* reason)
         std::string(reason) + ": stored opaque envelope changed");
 }
 
+const char* inspection_unavailable(const fs::path& working_directory)
+{
+#ifdef __APPLE__
+    (void)working_directory;
+    return "macOS managed-preference scope remains native";
+#else
+    return claude::test::native_context_unavailable(working_directory);
+#endif
+}
+
+void native_context_contract()
+{
+    Fixture fixture;
+    const auto* unavailable = inspection_unavailable(fixture.root());
+    fixture.expect(unavailable ? Availability::UNKNOWN : Availability::ABSENT,
+        "empty profile respects native policy authority");
+    write(fixture.transcript(), addon::serialize_json(message("user", k_user)));
+    fixture.expect(unavailable ? Availability::UNKNOWN : Availability::AVAILABLE,
+        "saved transcript respects native policy authority");
+    expect_prepared(fixture, "native policy preserves exact-identity resume preparation");
+}
+
 void transcript_contract()
 {
     // Oracle: Claude's native loadConversationForResume searches its cwd,
     // worktrees and direct project children. Replay chooses a main user or
     // assistant leaf; compaction, rewinds and system-only fallback stay native.
     Fixture fixture;
-#ifdef __APPLE__
-    fixture.expect(Availability::UNKNOWN, "macOS managed-preference scope remains native");
-    expect_prepared(fixture, "unknown macOS inspection");
-    return;
-#endif
     fixture.expect(Availability::ABSENT, "profile without projects has no saved conversation");
     const auto before = snapshot(fixture.root());
     const auto absent = fixture.prepare(true);
@@ -430,6 +448,10 @@ void bounded_inspection_contract()
     require(fs::file_size(path) == size && fs::last_write_time(path) == modified,
         "bounded inspection leaves the source unchanged");
 #endif
+}
+
+void cancelled_inspection_contract()
+{
     Fixture cancelled;
     Context invocation;
     invocation.m_request.capability = {"interactive-resume", 3};
@@ -475,9 +497,8 @@ void packaged_contract(const fs::path& package)
     const auto result = addon::decode_resume_inspect_result(outcome->payload, &failure);
     require(result && addon::validate_resume_inspection(fixture.request(), *result, &failure),
         "packaged inspection acknowledges the exact request");
-#ifndef __APPLE__
-    require(result->availability == Availability::ABSENT, "packaged adapter observes definite absence");
-#endif
+    const auto expected = inspection_unavailable(fixture.root()) ? Availability::UNKNOWN : Availability::ABSENT;
+    require(result->availability == expected, "packaged adapter respects native policy authority");
     addon::Resume_prepare_request preparation;
     preparation.context = fixture.request().context;
     preparation.resume_record = fixture.request().resume_record;
@@ -497,13 +518,24 @@ void packaged_contract(const fs::path& package)
 int main(int argc, char** argv)
 {
     try {
-        require(argc == 2, "Expected the actual Claude package directory");
-        transcript_contract();
-        lookup_contract();
-        context_contract();
-        inaccessible_transcript_contract();
-        bounded_inspection_contract();
-        packaged_contract(addon::path_from_utf8(argv[1]));
+        require(argc == 2 || (argc == 3 && std::string_view(argv[2]) == "--filesystem"),
+            "Expected the actual Claude package directory and optional --filesystem");
+        if (argc == 3) {
+            if (const auto* reason = inspection_unavailable(fs::temp_directory_path())) {
+                std::cout << "Filesystem fixtures unavailable: " << reason << '\n';
+                return 77;
+            }
+            transcript_contract();
+            lookup_contract();
+            context_contract();
+            inaccessible_transcript_contract();
+            bounded_inspection_contract();
+        }
+        else {
+            native_context_contract();
+            cancelled_inspection_contract();
+            packaged_contract(addon::path_from_utf8(argv[1]));
+        }
         std::cout << "Claude resume inspection and preparation contracts passed.\n";
         return 0;
     }

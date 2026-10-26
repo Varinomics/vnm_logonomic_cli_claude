@@ -13,12 +13,13 @@ const logonomic::cli_addon::Launcher_approval_rules& launcher_approval_rules()
                 {"default", "manual", "acceptEdits", "plan", "auto", "dontAsk"}},
         },
         .conflicting_arguments = {},
+        // Variadic options are omitted: removing an approval flag can make
+        // their values absorb a following prompt.
         .value_arguments = {
-            "--model", "--fallback-model", "--agent", "--agents", "--effort", "--add-dir",
+            "--model", "--fallback-model", "--agent", "--agents", "--effort",
             "--settings", "--setting-sources", "--system-prompt", "--system-prompt-file",
-            "--append-system-prompt", "--append-system-prompt-file", "--allowedTools",
-            "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools",
-            "--mcp-config", "--plugin-dir", "--plugin-url", "--session-id", "--name", "-n",
+            "--append-system-prompt", "--append-system-prompt-file",
+            "--plugin-dir", "--plugin-url", "--session-id", "--name", "-n",
             "--input-format", "--output-format", "--json-schema", "--max-turns",
             "--max-budget-usd", "--permission-prompt-tool", "--permission-prompts",
         },

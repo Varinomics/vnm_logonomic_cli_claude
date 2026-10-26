@@ -40,6 +40,7 @@ for (const item of cases) {
             payload: { session: { provider_session_id: 'native-session' }, notification_id: 'notice-1', instruction: 'Read the Logonomic mailbox.' },
         };
         on('session.id', () => ({ value: interleaved || item.changed && identity_calls++ > 0 ? 'different-session' : 'native-session' }));
+        on('session.usage', () => ({ value: { context: { tokens: 64000, window: 200000 } } }));
         on('settings.read', ($, event) => ({ value: {
             crossSessionInbound: event.source === 'project' ? item.project : event.source === 'local' ? item.local :
                 event.source === 'flag' ? (item.race && reserved ? 'hold' : item.inbound === null ? undefined : item.inbound ?? 'accept') : undefined,
@@ -56,10 +57,13 @@ for (const item of cases) {
         });
         on('process.run', async ($, event) => {
             if (event.argv[1].endsWith('/scripts/logonomic-hook-relay.cjs')) {
-                expect(JSON.parse(event.init.stdin)).toEqual({
-                    hook_event_name: 'ModTurnComplete', session_id: 'native-session', reason: 'answer',
+                const report = JSON.parse(event.init.stdin);
+                expect(report).toEqual({
+                    hook_event_name: item.aborted ? 'ModContext' : 'ModTurnComplete',
+                    session_id: 'native-session', reason: item.aborted ? 'aborted' : 'answer',
+                    context_state: { used_tokens: 64000, context_window: 200000 },
                 });
-                completed++;
+                if (report.hook_event_name === 'ModTurnComplete') completed++;
                 return { value: { exitCode: 0, stdout: '', stderr: '' } };
             }
             const operation = event.argv[2];

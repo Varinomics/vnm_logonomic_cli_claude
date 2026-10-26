@@ -1,6 +1,8 @@
 #include "claude_lifecycle.h"
 #include "claude_support.h"
 
+#include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/context_state.h>
 #include <logonomic_cli_addon/limits.h>
 
 #include <algorithm>
@@ -8,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace claude {
 namespace {
@@ -28,6 +31,42 @@ std::string metadata(const addon::Json_value& body, std::string_view field)
         throw std::runtime_error("invalid_provider_event");
     }
     return value;
+}
+
+void classify_context(
+    const addon::Classify_event_request& request, addon::Classify_event_result& result)
+{
+    const auto& body = request.event.body;
+    if (request.context_state_version != addon::k_context_state_capability_version || body.find("agent_id")) {
+        return;
+    }
+    const bool compact = request.event.name == "SessionStart" && text(body, "source") == "compact";
+    const auto* context = body.find("context_state");
+    if (!compact &&
+        (!context || (request.event.name != "ModContext" && request.event.name != "ModTurnComplete")))
+    {
+        return;
+    }
+    auto update = compact || !context->is_object() ? addon::Json_value::object() : *context;
+    if (compact) {
+        // Native compaction hooks precede installation of the replacement
+        // boundary. Invalidate usage without claiming an installed compaction.
+        update.set("usage_unavailable", addon::Json_value(true));
+    }
+    else
+    if (!context->is_object()) {
+        // Keep malformed telemetry attributable to its native source without
+        // carrying arbitrary payload content into a failure diagnostic.
+        update.set("usage_unavailable", addon::Json_value());
+    }
+    const auto* session = body.find("session_id");
+    update.set("provider_session_id", session ? *session : addon::Json_value());
+    update.set("event_id", addon::Json_value(request.transition_nonce));
+    auto updates = addon::Json_value::array();
+    updates.push_back(std::move(update));
+    auto payload = addon::Json_value::object();
+    payload.set("context_updates", std::move(updates));
+    addon::decode_context_updates(payload, result.context_updates, result.context_failure);
 }
 
 } // namespace
@@ -57,9 +96,13 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
         throw std::runtime_error("invalid_provider_event");
     }
     addon::Classify_event_result result;
-    const std::array<std::string_view, 12> supported{
+    if (request.context_failure) {
+        result.context_failure = addon::Context_failure{{}, *request.context_failure};
+    }
+    const std::array<std::string_view, 13> supported{
         "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "UserPromptSubmit", "Stop",
         "StopFailure", "PermissionRequest", "PreToolUse", "PostToolUse", "PostToolUseFailure", "ModTurnComplete",
+        "ModContext",
     };
     if (std::find(supported.begin(), supported.end(), name) == supported.end()) {
         return result;
@@ -72,12 +115,17 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
     {
         return result;
     }
+    classify_context(request, result);
+    if (name == "ModContext" || (name == "ModTurnComplete" && text(body, "reason") != "answer") ||
+        (name == "SessionStart" && text(body, "source") == "compact"))
+    {
+        return result;
+    }
     addon::Lifecycle_observation observation;
     observation.provider_event_name = name;
     observation.provider_session_id = metadata(body, "session_id");
     result.classification = addon::Classification::EVENT;
     if (name == "SessionStart") {
-        if (text(body, "source") == "compact") return {};
         observation.session_source = metadata(body, "source");
         observation.session_transition = addon::Session_transition::STARTED;
         result.classification = addon::Classification::TRANSITION;
@@ -101,7 +149,6 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
     }
     else {
         if (name == "ModTurnComplete") {
-            if (text(body, "reason") != "answer") return {};
             observation.phase_transition = addon::Phase_transition::AWAITING_INPUT;
             observation.phase_evidence = addon::Evidence::CONFIRMED;
             result.observations.push_back(std::move(observation));

@@ -192,6 +192,10 @@ if(BUILD_TESTING)
     add_dependencies(claude_resume_tests claude_package)
     add_test(NAME claude_resume_tests COMMAND claude_resume_tests "${CLAUDE_PACKAGE_DIRECTORY}")
     set_tests_properties(claude_resume_tests PROPERTIES TIMEOUT 60 LABELS "resume;packaged-adapter")
+    add_test(NAME claude_resume_filesystem_tests
+        COMMAND claude_resume_tests "${CLAUDE_PACKAGE_DIRECTORY}" --filesystem)
+    set_tests_properties(claude_resume_filesystem_tests PROPERTIES
+        TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "resume;filesystem-fixture")
     add_executable(claude_conversation_tests tests/claude_conversation_tests.cpp)
     target_link_libraries(claude_conversation_tests PRIVATE claude_provider)
     claude_target(claude_conversation_tests)
@@ -202,6 +206,9 @@ if(BUILD_TESTING)
     target_link_libraries(claude_quota_direct_tests PRIVATE claude_quota_direct claude_provider)
     add_test(NAME claude_quota_direct_tests COMMAND claude_quota_direct_tests)
     set_tests_properties(claude_quota_direct_tests PROPERTIES TIMEOUT 30 LABELS "quota")
+    add_test(NAME claude_quota_direct_filesystem_tests COMMAND claude_quota_direct_tests --filesystem)
+    set_tests_properties(claude_quota_direct_filesystem_tests PROPERTIES
+        TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "quota;filesystem-fixture")
     add_executable(claude_session_declaration_tests tests/claude_session_declaration_tests.cpp)
     claude_target(claude_session_declaration_tests)
     add_dependencies(claude_session_declaration_tests claude_package)
@@ -219,6 +226,9 @@ if(BUILD_TESTING)
     claude_target(claude_contract_tests)
     add_dependencies(claude_contract_tests claude_package)
     add_test(NAME claude_contract_tests COMMAND claude_contract_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    add_test(NAME claude_launcher_approval_tests COMMAND claude_contract_tests --launcher-approval)
+    add_test(NAME claude_context_state_tests COMMAND claude_contract_tests --context-state)
+    set_tests_properties(claude_launcher_approval_tests PROPERTIES TIMEOUT 30 LABELS "launcher-approval")
     add_executable(claude_fake_vnmctl tests/claude_fake_vnmctl.cpp)
     claude_target(claude_fake_vnmctl)
     add_executable(claude_fake_cli tests/claude_fake_cli.cpp)
@@ -237,6 +247,12 @@ if(BUILD_TESTING)
         "$<TARGET_FILE:claude_helper>" "$<TARGET_FILE:claude_fake_vnmctl>"
         "${CLAUDE_PACKAGE_DIRECTORY}/adapter/claude_adapter${CLAUDE_EXECUTABLE_SUFFIX}"
         "${CLAUDE_PACKAGE_DIRECTORY}/assets/claude-hooks/scripts/logonomic-hook-relay.cjs")
+    add_test(NAME claude_context_helper_tests COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_helper_tests.py"
+        "$<TARGET_FILE:claude_helper>" "$<TARGET_FILE:claude_fake_vnmctl>"
+        "${CLAUDE_PACKAGE_DIRECTORY}/adapter/claude_adapter${CLAUDE_EXECUTABLE_SUFFIX}"
+        "${CLAUDE_PACKAGE_DIRECTORY}/assets/claude-hooks/scripts/logonomic-hook-relay.cjs"
+        --context-only)
     add_test(NAME claude_package_validation COMMAND logonomic_cli_addon_validate
         "${CLAUDE_PACKAGE_DIRECTORY}" --platform "${CLAUDE_PLATFORM}")
     add_test(NAME claude_package_conformance COMMAND logonomic_cli_addon_conformance
@@ -250,13 +266,18 @@ if(BUILD_TESTING)
         add_test(NAME claude_hook_contract_tests COMMAND "${CLAUDE_NODE_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_hook_tests.mjs"
             "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/scripts/logonomic-hook-relay.cjs")
+        add_test(NAME claude_context_hook_tests COMMAND "${CLAUDE_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_context_hook_tests.mjs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/hooks/wake.js")
+        set_tests_properties(claude_context_hook_tests PROPERTIES TIMEOUT 30)
     else()
         message(WARNING "Node is unavailable: claude_hook_contract_tests cannot qualify this package and will fail. Use BUILD_TESTING=OFF for a package-only build.")
         add_test(NAME claude_hook_contract_tests COMMAND "${CMAKE_COMMAND}" -E false)
         set_tests_properties(claude_hook_contract_tests PROPERTIES LABELS "missing-test-dependency")
     endif()
     set_tests_properties(claude_contract_tests claude_package_validation claude_package_conformance
-        claude_hook_contract_tests claude_helper_tests claude_initial_prompt_delivery_tests PROPERTIES TIMEOUT 120)
+        claude_hook_contract_tests claude_helper_tests claude_context_helper_tests claude_context_state_tests
+        claude_initial_prompt_delivery_tests PROPERTIES TIMEOUT 120)
 endif()
 if(BUILD_TESTING)
     add_executable(claude_usage_cache_tests tests/claude_usage_cache_tests.cpp)

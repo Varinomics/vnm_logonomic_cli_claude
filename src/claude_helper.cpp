@@ -91,6 +91,17 @@ std::optional<addon::Json_value> read_event(bool watch_parent)
     {
         if (const auto* value = event->find(key)) sanitized.set(key, *value);
     }
+    if (const auto* context = event->find("context_state")) {
+        auto bounded = addon::Json_value::object();
+        for (const auto key : {"used_tokens", "context_window", "usage_unavailable"}) {
+            const auto* value = context->find(key);
+            if (value) {
+                bounded.set(key, value->is_number() || value->is_boolean() || value->is_null()
+                    ? *value : addon::Json_value());
+            }
+        }
+        sanitized.set("context_state", std::move(bounded));
+    }
     if (name->as_string() == "Stop" && !event->find("agent_id")) {
         const auto* reply = event->find("last_assistant_message");
         if (reply && reply->is_string() && reply->as_string().size() <= 2048) {
