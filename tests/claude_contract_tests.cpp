@@ -199,6 +199,53 @@ void launcher_approval_contract()
         {"claude auth login", "direct", ""}, "linux-x86_64", yolo}, rules);
     require(auth.disposition == addon::Launcher_approval_disposition::UNSUPPORTED,
         "Claude account management is not a session launcher");
+
+    const auto variadic = addon::transform_launcher_approval({
+        {"claude --allowedTools Read --dangerously-skip-permissions hello", "direct", ""},
+        "windows-x86_64", undo}, rules);
+    if (variadic.disposition != addon::Launcher_approval_disposition::UNSUPPORTED ||
+        !variadic.script_body.empty())
+    {
+        throw std::runtime_error("Unyolofy must not turn the prompt into an allowedTools value: " +
+            addon::serialize_json_canonical(addon::encode_launcher_approval_transform_result(variadic)));
+    }
+
+    // Claude declares these options <values...>. Each approval span ends
+    // their values; deleting it would expose the prompt to that option.
+    const std::vector<std::pair<std::string, std::string>> variadic_options{
+        {"--add-dir",          "workspace"},
+        {"--allowedTools",     "Read"},
+        {"--allowed-tools",    "Read"},
+        {"--disallowedTools",  "Read"},
+        {"--disallowed-tools", "Read"},
+        {"--tools",            "Read"},
+        {"--mcp-config",       "servers.json"},
+    };
+    for (const auto& [option, value] : variadic_options) {
+        for (const std::string approval : {
+            "--dangerously-skip-permissions", "--permission-mode bypassPermissions"})
+        {
+            const addon::Launcher_request launcher{
+                "claude " + option + " " + value + " " + approval + " hello", "direct", ""};
+            const auto result = addon::transform_launcher_approval({launcher, "windows-x86_64", undo}, rules);
+            require(result.disposition == addon::Launcher_approval_disposition::UNSUPPORTED &&
+                result.script_body.empty(), "unsupported variadic arity supplies no replacement script");
+            const auto key = addon::launcher_approval_comparison_key({launcher, "windows-x86_64"}, rules);
+            require(!key.supported && key.key.empty(), "unsupported variadic arity supplies no comparison key");
+        }
+    }
+
+    const auto single_value = addon::transform_launcher_approval({
+        {"claude --plugin-dir plugins --dangerously-skip-permissions hello", "direct", ""},
+        "windows-x86_64", undo}, rules);
+    require(single_value.disposition == changed && single_value.script_body == "claude --plugin-dir plugins hello",
+        "single-value options keep their value and the following prompt");
+    const auto after_delimiter = addon::transform_launcher_approval({
+        {"claude --dangerously-skip-permissions -- --allowedTools Read hello", "direct", ""},
+        "windows-x86_64", undo}, rules);
+    require(after_delimiter.disposition == changed &&
+        after_delimiter.script_body == "claude -- --allowedTools Read hello",
+        "variadic option spelling after the delimiter remains a literal operand");
 }
 
 void launcher_contract()
@@ -2316,10 +2363,15 @@ void account_name_contract()
 int main(int argc, char** argv)
 {
     if (argc != 2) {
-        std::cerr << "usage: claude_contract_tests <package directory>\n";
+        std::cerr << "usage: claude_contract_tests <package directory> | --launcher-approval\n";
         return 2;
     }
     try {
+        if (std::string_view(argv[1]) == "--launcher-approval") {
+            launcher_approval_contract();
+            std::cout << "Claude launcher approval contract checks passed.\n";
+            return 0;
+        }
         review_contract();
         launcher_approval_contract();
         launcher_contract();
