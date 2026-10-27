@@ -5,11 +5,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <optional>
 #include <regex>
 #include <sstream>
-#include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace claude {
 namespace {
@@ -27,7 +28,7 @@ std::optional<Usage_result> usage_result(const Json& event)
 {
     if (text(event, "type") != "result") return std::nullopt;
     if (flag(event, "is_error") || text(event, "subtype") == "error") {
-        throw std::runtime_error("quota_failed");
+        throw addon::Quota_failure::REQUEST_FAILED;
     }
     return Usage_result{text(event, "result"), text(event, "local_command") == "usage"};
 }
@@ -52,7 +53,7 @@ Usage_result usage_text(std::string_view bytes)
         const auto result = usage_result(*event);
         if (result && !result->content.empty()) return *result;
     }
-    throw std::runtime_error("quota_output_unavailable");
+    throw addon::Quota_failure::INVALID_RESPONSE;
 }
 
 std::optional<addon::Quota_window> quota_window(
@@ -63,7 +64,9 @@ std::optional<addon::Quota_window> quota_window(
     std::smatch match;
     if (!std::regex_search(content, match, pattern)) return std::nullopt;
     const double used = std::stod(match[1].str());
-    if (!std::isfinite(used)) throw std::runtime_error("quota_window_invalid");
+    if (!std::isfinite(used)) {
+        throw addon::Quota_failure::INVALID_RESPONSE;
+    }
     addon::Quota_window window;
     window.used_percent   = used;
     window.window_minutes = minutes;
@@ -88,7 +91,9 @@ std::optional<addon::Quota_window> quota_window(
         trim_end();
     }
     const auto begin = reset.find_first_not_of(" \t");
-    if (begin == std::string::npos) throw std::runtime_error("quota_window_invalid");
+    if (begin == std::string::npos) {
+        throw addon::Quota_failure::INVALID_RESPONSE;
+    }
     reset.erase(0, begin);
     window.reset_text = std::move(reset);
     return window;
@@ -117,30 +122,37 @@ addon::Auth_status inspect_auth(const addon::Structured_inspection& inspection)
     return addon::Auth_status::UNKNOWN;
 }
 
-addon::Quota_observation inspect_quota(const addon::Structured_inspection& inspection)
+addon::Quota_inspect_result inspect_quota(const addon::Structured_inspection& inspection)
 {
-    addon::Quota_observation result;
-    result.state = addon::Quota_status::FAILED;
-    if (inspection.timed_out || inspection.exit_code != 0) return result;
+    if (inspection.timed_out) {
+        return addon::make_quota_failure(addon::Quota_failure::TIMED_OUT);
+    }
+    if (inspection.exit_code != 0) {
+        return addon::make_quota_failure(addon::Quota_failure::PROCESS_FAILED, {},
+            addon::Quota_diagnostic{addon::Quota_failure_stage::PROCESS_EXIT, inspection.exit_code});
+    }
+    addon::Quota_observation observation;
     try {
         const auto usage = usage_text(inspection.stdout_bytes);
-        result.primary   = quota_window(usage.content, "session", 300);
-        result.secondary = quota_window(usage.content, "week", 10080);
-        if (result.primary && result.secondary) {
-            result.state = addon::Quota_status::READY;
+        observation.primary   = quota_window(usage.content, "session", 300);
+        observation.secondary = quota_window(usage.content, "week", 10080);
+        if (observation.primary && observation.secondary) {
+            observation.state = addon::Quota_status::READY;
         }
-        else {
-            if (!result.primary && !result.secondary && usage.local_usage_command) {
-                result.state = addon::Quota_status::UNAVAILABLE;
-            }
-            result.primary.reset();
-            result.secondary.reset();
+        else
+        if (observation.primary || observation.secondary || !usage.local_usage_command) {
+            return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
         }
+    }
+    catch (addon::Quota_failure reason) {
+        return addon::make_quota_failure(reason);
     }
     catch (const std::exception&) {
-        result.primary.reset();
-        result.secondary.reset();
+        return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
     }
+    addon::Quota_inspect_result result;
+    result.complete = true;
+    result.observation = std::move(observation);
     return result;
 }
 
@@ -197,11 +209,11 @@ void handle_probes(addon::Invocation_context& context, const std::filesystem::pa
         addon::Quota_inspect_result result;
         result.complete = input->inspection.final;
         if (result.complete) {
-            result.observation = inspect_quota(input->inspection);
+            result = inspect_quota(input->inspection);
             result.observation->scope = scope(input->account_context);
         }
         else result.protocol_state = input->inspection.protocol_state;
-        context.succeed(addon::encode_quota_inspect_result(result, 2));
+        context.succeed(addon::encode_quota_inspect_result(result, 2, input->report_quota_failure));
     }
 }
 

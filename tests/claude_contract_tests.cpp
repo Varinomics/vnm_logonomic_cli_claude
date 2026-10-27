@@ -2032,18 +2032,18 @@ void probe_contract()
     require(claude::inspect_auth(input) == addon::Auth_status::NOT_LOGGED_IN, "native logged-out exit semantics");
     input.exit_code = 0;
     input.stdout_bytes = R"({"type":"result","subtype":"success","is_error":false,"result":"Current session: 35% used, resets 3pm (Europe/Berlin)\nCurrent week: 21.5% used, resets September 17."})";
-    const auto quota = claude::inspect_quota(input);
+    const auto quota = *claude::inspect_quota(input).observation;
     require(quota.state == addon::Quota_status::READY && quota.primary->used_percent == 35 &&
         quota.secondary->used_percent == 21.5, "both native quota windows parsed");
     require(quota.secondary->reset_text == "September 17", "text reset retained without guessing epoch");
     // Native y() omits the reset suffix for a null API resets_at value.
     input.stdout_bytes = R"json({"type":"result","subtype":"success","local_command":"usage","result":"Current session: 0% used\nCurrent week (all models): 100% used · resets Oct 4, 10pm (Europe/Berlin)"})json";
-    const auto unknown_reset = claude::inspect_quota(input);
+    const auto unknown_reset = *claude::inspect_quota(input).observation;
     require(unknown_reset.state == addon::Quota_status::READY && unknown_reset.primary->used_percent == 0 &&
         !unknown_reset.primary->reset_text && unknown_reset.secondary->reset_text == "Oct 4, 10pm (Europe/Berlin)",
         "an unknown primary reset never borrows the weekly reset");
     input.stdout_bytes = R"({"type":"result","subtype":"success","is_error":false,"result":"Current session: 135.5% used, resets 3pm\nCurrent week: 121% used, resets September 17."})";
-    const auto overage = claude::inspect_quota(input);
+    const auto overage = *claude::inspect_quota(input).observation;
     require(overage.state == addon::Quota_status::READY && overage.primary->used_percent == 135.5 &&
         overage.secondary->used_percent == 121, "native quota overage remains observable without clamping");
 
@@ -2052,16 +2052,90 @@ void probe_contract()
         R"({"type":"result","subtype":"success","is_error":false,)"
         R"("local_command":"usage","result":"Total cost: $0.0000\n)"
         R"(Total duration (API): 0s\nUsage: 0 input, 0 output, 0 cache read, 0 cache write"}])";
-    const auto print_mode = claude::inspect_quota(input);
+    const auto print_mode = *claude::inspect_quota(input).observation;
     require(print_mode.state == addon::Quota_status::UNAVAILABLE && !print_mode.primary && !print_mode.secondary,
         "print-mode usage totals do not authenticate subscription quota windows");
 
     input.stdout_bytes =
         R"({"type":"result","subtype":"success","is_error":false,)"
         R"("local_command":"usage","result":"Current session: 35% used, resets 3pm"})";
-    const auto incomplete = claude::inspect_quota(input);
+    const auto incomplete = *claude::inspect_quota(input).observation;
     require(incomplete.state == addon::Quota_status::FAILED && !incomplete.primary && !incomplete.secondary,
         "incomplete quota evidence remains a failed observation without partial windows");
+}
+
+void quota_failure_contract()
+{
+    addon::Probe_inspect_request request;
+    request.inspection.final = true;
+    request.account_context = addon::Account_context{};
+    request.account_context->adapter_account_key = "claude-quota-account";
+    const auto inspect = [
+            &request
+        ]()
+        {
+            Context invocation;
+            invocation.m_request.capability.capability_id = "quota";
+            invocation.m_request.operation = "inspect";
+            invocation.m_request.payload = addon::encode_probe_inspect_request(request, 2);
+            claude::handle_probes(invocation, {});
+            addon::Contract_failure failure;
+            const auto result = addon::decode_quota_inspect_result(invocation.m_payload, true, &failure, 2);
+            require(result && result->complete && result->observation,
+                "a quota failure remains a complete decodable observation");
+            require(result->observation->scope.source_account_key == "claude-quota-account",
+                "quota failures retain their selected account");
+            return *result;
+        };
+    request.inspection.stdout_bytes = "{broken-json";
+    const auto neutral = inspect();
+    require(neutral.observation->state == addon::Quota_status::FAILED && !neutral.failure_reason,
+        "a host that did not ask for the cause receives a neutral failure");
+    request.report_quota_failure = true;
+    for (const auto* output : {
+        R"({"type":"result","subtype":"success","local_command":"usage","result":"Current session: 35% used"})",
+        "{broken-json"})
+    {
+        request.inspection.stdout_bytes = output;
+        const auto result = inspect();
+        require(result.observation->state == addon::Quota_status::FAILED &&
+            !result.observation->primary && !result.observation->secondary,
+            "malformed quota evidence does not publish partial figures");
+        require(result.failure_reason && *result.failure_reason != "authentication_required",
+            "malformed quota evidence retains a non-authentication failure reason");
+        require(addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::INVALID_RESPONSE,
+            "missing and malformed quota windows retain the invalid-response category");
+    }
+    request.inspection.stdout_bytes =
+        R"({"type":"result","is_error":true,"result":"private-native-detail"})";
+    request.inspection.stderr_bytes = "private-native-detail";
+    const auto rejected = inspect();
+    require(rejected.failure_reason &&
+        addon::parse_quota_failure(*rejected.failure_reason) == addon::Quota_failure::REQUEST_FAILED,
+        "a native error result is distinguished from malformed quota evidence");
+    require(addon::serialize_json(addon::encode_quota_inspect_result(rejected, 2, true)).find("private-native-detail") ==
+        std::string::npos, "native failure content does not escape the quota privacy boundary");
+
+    request.inspection.exit_code = 2;
+    const auto exited = inspect();
+    require(exited.failure_reason &&
+        addon::parse_quota_failure(*exited.failure_reason) == addon::Quota_failure::PROCESS_FAILED,
+        "a failed native exit is distinguished from malformed output");
+    require(exited.diagnostic && exited.diagnostic->stage == addon::Quota_failure_stage::PROCESS_EXIT &&
+        exited.diagnostic->code == 2, "the native exit status survives for developer diagnostics");
+    request.inspection.timed_out = true;
+    const auto timeout = inspect();
+    require(timeout.failure_reason &&
+        addon::parse_quota_failure(*timeout.failure_reason) == addon::Quota_failure::TIMED_OUT,
+        "a timeout is distinguished from a native process failure");
+
+    request.inspection.exit_code = 0;
+    request.inspection.timed_out = false;
+    request.inspection.stdout_bytes =
+        R"({"type":"result","local_command":"usage","result":"Total cost: $0.0000"})";
+    const auto unavailable = inspect();
+    require(unavailable.observation->state == addon::Quota_status::UNAVAILABLE && !unavailable.failure_reason,
+        "native usage without subscription windows remains unavailable without an invented failure");
 }
 
 #ifdef _WIN32
@@ -2417,7 +2491,7 @@ void quota_reset_label_contract()
         Structured_inspection inspection;
         inspection.final=true; inspection.exit_code=0;
         inspection.stdout_bytes=serialize_json(event);
-        const auto observation=claude::inspect_quota(inspection);
+        const auto observation=*claude::inspect_quota(inspection).observation;
         const bool good=expected.empty() ? (!observation.primary && !observation.secondary) :
             (observation.primary && observation.secondary &&
              observation.primary->reset_text.value_or("")==expected &&
@@ -2483,7 +2557,7 @@ void account_name_contract()
 int main(int argc, char** argv)
 {
     if (argc != 2) {
-        std::cerr << "usage: claude_contract_tests <package directory> | --launcher-approval | --context-state\n";
+        std::cerr << "usage: claude_contract_tests <package directory> | --launcher-approval | --context-state | --quota\n";
         return 2;
     }
     try {
@@ -2496,6 +2570,13 @@ int main(int argc, char** argv)
             context_state_contract();
             lifecycle_contract();
             std::cout << "Claude context state contract checks passed.\n";
+            return 0;
+        }
+        if (std::string_view(argv[1]) == "--quota") {
+            probe_contract();
+            quota_failure_contract();
+            quota_reset_label_contract();
+            std::cout << "Claude quota contract checks passed.\n";
             return 0;
         }
         review_contract();
@@ -2515,6 +2596,7 @@ int main(int argc, char** argv)
         delegated_readiness_contract();
         permission_posture_contract();
         probe_contract();
+        quota_failure_contract();
 #ifdef _WIN32
         probe_profile_contract();
 #endif

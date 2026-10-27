@@ -78,7 +78,7 @@ void response_contract()
     addon::Structured_inspection input;
     input.final = true;
     input.stdout_bytes = *output;
-    const auto observed = claude::inspect_quota(input);
+    const auto observed = *claude::inspect_quota(input).observation;
     require(observed.state == addon::Quota_status::READY && observed.primary->used_percent == 0 &&
         !observed.primary->reset_text && observed.secondary->used_percent == 100 && observed.secondary->reset_text,
         "direct output uses native floor semantics and corrected optional resets");
