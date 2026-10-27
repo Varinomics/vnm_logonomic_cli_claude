@@ -2087,6 +2087,11 @@ void quota_failure_contract()
                 "quota failures retain their selected account");
             return *result;
         };
+    request.inspection.stdout_bytes = "{broken-json";
+    const auto neutral = inspect();
+    require(neutral.observation->state == addon::Quota_status::FAILED && !neutral.failure_reason,
+        "a host that did not ask for the cause receives a neutral failure");
+    request.report_quota_failure = true;
     for (const auto* output : {
         R"({"type":"result","subtype":"success","local_command":"usage","result":"Current session: 35% used"})",
         "{broken-json"})
@@ -2108,7 +2113,7 @@ void quota_failure_contract()
     require(rejected.failure_reason &&
         addon::parse_quota_failure(*rejected.failure_reason) == addon::Quota_failure::REQUEST_FAILED,
         "a native error result is distinguished from malformed quota evidence");
-    require(addon::serialize_json(addon::encode_quota_inspect_result(rejected)).find("private-native-detail") ==
+    require(addon::serialize_json(addon::encode_quota_inspect_result(rejected, 2, true)).find("private-native-detail") ==
         std::string::npos, "native failure content does not escape the quota privacy boundary");
 
     request.inspection.exit_code = 2;

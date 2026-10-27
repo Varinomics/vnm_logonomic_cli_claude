@@ -148,6 +148,7 @@ int main()
         {"coordination-delivery", 1},
         {addon::k_interactive_initial_prompt_capability_id, addon::k_interactive_initial_prompt_version},
         {addon::k_session_wake_capability_id, addon::k_session_wake_version},
+        {addon::k_quota_failure_capability_id, addon::k_quota_failure_version},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler([package_root](addon::Invocation_context& context) { invoke(context, package_root); });

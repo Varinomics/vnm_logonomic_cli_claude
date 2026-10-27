@@ -213,7 +213,7 @@ void handle_probes(addon::Invocation_context& context, const std::filesystem::pa
             result.observation->scope = scope(input->account_context);
         }
         else result.protocol_state = input->inspection.protocol_state;
-        context.succeed(addon::encode_quota_inspect_result(result, 2));
+        context.succeed(addon::encode_quota_inspect_result(result, 2, input->report_quota_failure));
     }
 }
 
