@@ -9,7 +9,7 @@
 namespace claude {
 
 logonomic::cli_addon::Auth_status inspect_auth(const logonomic::cli_addon::Structured_inspection& inspection);
-logonomic::cli_addon::Quota_observation inspect_quota(const logonomic::cli_addon::Structured_inspection& inspection);
+logonomic::cli_addon::Quota_inspect_result inspect_quota(const logonomic::cli_addon::Structured_inspection& inspection);
 void handle_probes(logonomic::cli_addon::Invocation_context& context, const std::filesystem::path& package_root);
 
 } // namespace claude
