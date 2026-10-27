@@ -273,6 +273,7 @@ def main():
             assert json.loads(result.stdout) == expected
             assert records[0]["operation"] == "request-title-instruction"
             assert records[0]["request"]["changed_files_requested"] is True
+            assert records[0]["request"]["delivery"] == {"version": 1, "kind": "model-context"}
             deliveries = [item for item in records if item["operation"] == "provider-event"]
             assert deliveries and all(item == deliveries[0] for item in deliveries)
             acknowledgments = [item for item in records if item["operation"] == "acknowledge"]
@@ -283,12 +284,33 @@ def main():
         for mode in ("empty", "refused"):
             result, records, _ = run(prompt, CLAUDE_TEST_CONTEXT=mode)
             assert result.returncode == 0 and result.stdout == ""
+        checkpoint = {"hook_event_name": "PreToolUse", "session_id": "native-session", "tool_name": "Bash",
+                      "tool_input": {"command": "private tool input"}}
+        result, records, _ = run(checkpoint, CLAUDE_TEST_CONTEXT="peer")
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+            "additionalContext": "Peer session parser-review: the requested parser result is ready."}}
+        assert len(records) == 1 and records[0]["operation"] == "request-title-instruction"
+        request = records[0]["request"]
+        assert request["hook_event_name"] == "PreToolUse" and request["changed_files_requested"] is False
+        assert request["delivery"] == {"version": 1, "kind": "model-context"} and "tool_input" not in request
+        result, records, _ = run({**checkpoint, "agent_id": "child"})
+        assert result.returncode == 0 and result.stdout == "" and not records
+        for tool in ("AskUserQuestion", "ExitPlanMode"):
+            result, records, _ = run({**checkpoint, "tool_name": tool})
+            assert result.returncode == 0 and result.stdout == "", result.stderr
+            assert [item["operation"] for item in records] == ["provider-event", "acknowledge"]
+            assert records[0]["request"]["event"]["body"]["tool_name"] == tool
+        hooks = json.loads((relay.parent.parent / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
+        assert len(hooks["PreToolUse"]) == 1 and "matcher" not in hooks["PreToolUse"][0]
+        assert hooks["PostToolUse"][0]["matcher"] == "^(AskUserQuestion|ExitPlanMode)$"
         stop = {"hook_event_name": "Stop", "session_id": "native-session",
                 "last_assistant_message": "Which directory?"}
         for payload, retained in ((stop, True), ({**stop, "agent_id": "child"}, False),
                                   ({**stop, "last_assistant_message": "x" * 2049}, False)):
             result, records, _ = run(payload)
             assert result.returncode == 0, result.stderr
+            assert result.stdout == ""
             delivered = next(item for item in records if item["operation"] == "provider-event")
             event = delivered["request"]["event"]
             assert event["name"] == "Stop"

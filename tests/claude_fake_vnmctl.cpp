@@ -47,7 +47,9 @@ int main(int argc, char** argv)
         auto response = addon::Json_value::object();
         response.set("accepted", addon::Json_value(true));
         response.set("instruction_required", addon::Json_value(mode == "title"));
-        response.set("instruction", addon::Json_value(mode == "empty" ? "" : "Host changed-files and delegation.\nExact notice text."));
+        response.set("instruction", addon::Json_value(mode == "empty" ? "" : mode == "peer"
+            ? "Peer session parser-review: the requested parser result is ready."
+            : "Host changed-files and delegation.\nExact notice text."));
         std::cout << addon::serialize_json(response) << '\n';
         return 0;
     }

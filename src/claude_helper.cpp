@@ -176,7 +176,8 @@ int run_helper(int argc, char** argv)
         if (!root_context || cancelled()) return true;
         const auto* changed = event->find("changed_files_requested");
         const auto instruction = client.request_title_instruction("claude", name,
-            changed && changed->is_boolean() && changed->as_boolean());
+            name == "UserPromptSubmit" && changed && changed->is_boolean() && changed->as_boolean(),
+            addon::Model_context_delivery{});
         if (!instruction.completed || !instruction.accepted || instruction.instruction.empty()) return true;
         auto hook = addon::Json_value::object();
         hook.set("hookEventName", addon::Json_value(name));
@@ -188,6 +189,11 @@ int run_helper(int argc, char** argv)
         context_emitted = true;
         return true;
     };
+    const auto tool = text(*event, "tool_name");
+    if (name == "PreToolUse" && tool != "AskUserQuestion" && tool != "ExitPlanMode") {
+        // Context-only checkpoints must not create native attention transitions.
+        return emit_context() ? addon::k_helper_exit_committed : addon::k_helper_exit_transport_failure;
+    }
     // An active root prompt can carry host-admitted instructions even when
     // its independent lifecycle evidence lacks native turn correlation.
     if (name == "UserPromptSubmit" && !emit_context()) return addon::k_helper_exit_transport_failure;
