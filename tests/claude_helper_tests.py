@@ -82,7 +82,7 @@ class Adapter:
         self.process.stdin.close()
         assert self.process.wait(timeout=10) == 0
 
-    def classify(self, delivery, version, current_session=None):
+    def classify(self, delivery, version, current_session=None, *, attention=False, pending=None):
         self.serial += 1
         request_id = "r" + str(self.serial)
         payload = {"event": delivery["event"], "transition_nonce": delivery["transition_nonce"],
@@ -92,13 +92,124 @@ class Adapter:
                 "kind": "start", "provider_session_id": current_session, "nonce": "7" * 32}}
         if version is not None:
             payload["context_state_version"] = version
-        self.send({"type": "invoke", "request_id": request_id, "capability_id": "helper-ingress",
-            "version": 2, "operation": "classify_event", "deadline_ms": 5000, "payload": payload})
+        if pending is not None:
+            payload["pending_conversational_request_id"] = pending
+        self.send({"type": "invoke", "request_id": request_id,
+            "capability_id": "attention-kind" if attention else "helper-ingress",
+            "version": 1 if attention else 2, "operation": "classify_event", "deadline_ms": 5000, "payload": payload})
         while True:
             response = self.read()
             if response["type"] == "result":
                 assert response["request_id"] == request_id and response["status"] == "success", response
                 return response["payload"]
+
+
+def reply_evidence_contract(helper, executable, relay, environment, capture):
+    adapter = Adapter(executable)
+    stop = {"hook_event_name": "Stop", "session_id": "native-session", "prompt_id": "native-turn"}
+    question = "Which directory should I use?"
+    private = "Earlier-detail-canary " * 180
+    long_paragraph = "Please provide " + "the required configuration detail " * 120 + "for this task."
+    utf8_paragraph = "Which " + "résumé🙂 " * 400 + "should I use？"
+
+    def deliver(payload):
+        capture.write_text("", encoding="utf-8")
+        _, stdout = relay_through_launcher(relay, payload, environment)
+        if payload["hook_event_name"] == "Stop":
+            assert stdout == b"", "reply evidence must not answer the native question"
+        records = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
+        return next(record["request"] for record in records if record["operation"] == "provider-event")
+
+    cases = (
+        ("long explanation", private + "\n\n" + question, True, True),
+        ("long paragraph", long_paragraph, True, True),
+        ("UTF-8 paragraph", utf8_paragraph, True, True),
+        ("ordinary conclusion", private + "\n\nThe change is complete.", True, False),
+        ("earlier question", question + "\n\nThe change is complete.", True, False),
+        ("short question", question, True, True),
+        ("open fence", "\x60\x60\x60text\n" + private + "\n\n" + question, False, False),
+        ("closed fence", "~~~~text\n" + private + "\n\n" + question + "\n~~~~", False, False),
+        ("prose after fence", "\x60\x60\x60\n" + private + "\n\x60\x60\x60\n\n" + question, True, True),
+        ("lazy blockquote", "> Quoted text\n" + private + question, False, False),
+        ("indented code", "    " + question, False, False),
+        ("invalid native type", {"text": question}, False, False),
+        ("embedded NUL", "Which \0directory?", False, False),
+    )
+    try:
+        assert {"capability_id": "attention-kind", "version": 1} in adapter.capabilities["capabilities"]
+        for invalid in (b'{"hook_event_name":"Stop","last_assistant_message":"\xff?"}',
+                        b'{"hook_event_name":"Stop","last_assistant_message":"Which directory?'):
+            capture.write_text("", encoding="utf-8")
+            rejected = subprocess.run([str(helper), "event"], input=invalid,
+                capture_output=True, timeout=10, env=environment, **launch_options())
+            assert rejected.returncode == 2 and rejected.stdout == b""
+            assert capture.read_text(encoding="utf-8") == "", "invalid native input reached the host"
+        positive = None
+        for label, reply, retained, hint in cases:
+            delivery = deliver({**stop, "last_assistant_message": reply})
+            body = delivery["event"]["body"]
+            assert "last_assistant_message" not in body, label
+            assert "Earlier-detail-canary" not in json.dumps(body), label
+            assert ("assistant_reply_evidence" in body) == retained, label
+            if retained:
+                evidence = body["assistant_reply_evidence"]
+                assert set(evidence) == {"scope", "context", "prefix", "suffix"}, label
+                assert evidence["scope"] == "final_paragraph_edges" and evidence["context"] == "prose", label
+                assert all(0 < len(evidence[edge].encode("utf-8")) <= 128 for edge in ("prefix", "suffix")), label
+                if reply == long_paragraph:
+                    assert evidence["prefix"].startswith("Please provide ") and evidence["suffix"].endswith("for this task.")
+                if reply == utf8_paragraph:
+                    assert evidence["suffix"].endswith("should I use？")
+            classified = adapter.classify(delivery, None, "native-session", attention=True)
+            assert ("attention_kind" in classified) == hint, label
+            observation = classified["observations"][0]
+            assert observation["provider_event_name"] == "Stop" and observation["provider_turn_id"] == "native-turn", label
+            assert observation["phase_transition"] == "awaiting_input" and observation["phase_evidence"] == "inferred", label
+            assert observation["outcome_transition"] == "none", label
+            assert adapter.classify(delivery, None, "native-session", attention=True) == classified, label
+            plain = adapter.classify(delivery, None, "native-session")
+            assert plain["observations"][0]["attention_transition"] == "none", label
+            if hint:
+                assert classified["attention_kind"] == {"version": 1, "observation_index": 0, "kind": "conversational_hint"}
+                assert observation["attention_transition"] == "requested" and observation["attention_evidence"] == "inferred"
+                assert observation["attention_request_id"]
+                positive = delivery
+            else:
+                assert observation["attention_transition"] == "none" and observation["attention_request_id"] == "", label
+
+        assert positive is not None
+        for extra in ({"agent_id": "child"}, {"agent_id": ""}, {"hook_event_name": "StopFailure"}):
+            delivery = deliver({**stop, "last_assistant_message": question, "error": "native error", **extra})
+            assert "assistant_reply_evidence" not in delivery["event"]["body"]
+            assert "last_assistant_message" not in delivery["event"]["body"]
+            assert "attention_kind" not in adapter.classify(delivery, None, "native-session", attention=True)
+
+        # Native input cannot smuggle preconstructed metadata past the helper.
+        supplied = positive["event"]["body"]["assistant_reply_evidence"]
+        delivery = deliver({**stop, "assistant_reply_evidence": supplied})
+        assert "assistant_reply_evidence" not in delivery["event"]["body"]
+
+        # The classifier also validates the evidence contract at its own boundary.
+        for malformed in (None, question, {**supplied, "scope": "complete_message"},
+                          {**supplied, "context": "code"}, {**supplied, "prefix": "x" * 129},
+                          {**supplied, "suffix": ""}, {**supplied, "extra": True}):
+            delivery = json.loads(json.dumps(positive))
+            delivery["event"]["body"]["assistant_reply_evidence"] = malformed
+            assert "attention_kind" not in adapter.classify(delivery, None, "native-session", attention=True)
+        delivery["event"]["body"].pop("assistant_reply_evidence")
+        delivery["event"]["body"]["last_assistant_message"] = question
+        assert "attention_kind" not in adapter.classify(delivery, None, "native-session", attention=True)
+
+        hint = adapter.classify(positive, None, "native-session", attention=True)
+        request_id = hint["observations"][0]["attention_request_id"]
+        answer = deliver({"hook_event_name": "UserPromptSubmit", "session_id": "native-session",
+            "prompt_id": "next-turn", "prompt": "Use the chosen directory."})
+        resolved = adapter.classify(answer, None, "native-session", attention=True, pending=request_id)
+        assert resolved["observations"][0]["attention_transition"] == "resolved"
+        assert resolved["observations"][0]["attention_request_id"] == request_id
+        assert "attention_kind" not in adapter.classify(answer, None, "native-session", attention=True)
+    finally:
+        adapter.close()
 
 
 def sweep_policy(adapter, profile, parent, pid, birth):
@@ -218,6 +329,11 @@ def main():
             records = [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
             return result, records, elapsed
 
+        if "--reply-only" in sys.argv[5:]:
+            reply_evidence_contract(helper, adapter, relay, environment, capture)
+            print("Claude helper-to-adapter reply evidence checks passed.")
+            return
+
         context_adapter = Adapter(adapter)
         try:
             assert {"capability_id": "context-state", "version": 2} in context_adapter.capabilities["capabilities"]
@@ -304,19 +420,7 @@ def main():
         hooks = json.loads((relay.parent.parent / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
         assert len(hooks["PreToolUse"]) == 1 and "matcher" not in hooks["PreToolUse"][0]
         assert hooks["PostToolUse"][0]["matcher"] == "^(AskUserQuestion|ExitPlanMode)$"
-        stop = {"hook_event_name": "Stop", "session_id": "native-session",
-                "last_assistant_message": "Which directory?"}
-        for payload, retained in ((stop, True), ({**stop, "agent_id": "child"}, False),
-                                  ({**stop, "last_assistant_message": "x" * 2049}, False)):
-            result, records, _ = run(payload)
-            assert result.returncode == 0, result.stderr
-            assert result.stdout == ""
-            delivered = next(item for item in records if item["operation"] == "provider-event")
-            event = delivered["request"]["event"]
-            assert event["name"] == "Stop"
-            assert ("last_assistant_message" in event["body"]) == retained
-            if retained:
-                assert event["body"]["last_assistant_message"] == stop["last_assistant_message"]
+        reply_evidence_contract(helper, adapter, relay, environment, capture)
         result, records, _ = run({**prompt, "agent_id": "child-agent"})
         assert result.stdout == "" and all(item["operation"] != "request-title-instruction" for item in records)
         start = {"hook_event_name": "SessionStart", "session_id": "new-session", "source": "startup"}

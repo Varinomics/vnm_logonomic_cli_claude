@@ -226,6 +226,8 @@ if(BUILD_TESTING)
     claude_target(claude_contract_tests)
     add_dependencies(claude_contract_tests claude_package)
     add_test(NAME claude_contract_tests COMMAND claude_contract_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    add_test(NAME claude_reply_contract_tests
+        COMMAND claude_contract_tests "${CLAUDE_PACKAGE_DIRECTORY}" --reply-evidence)
     add_test(NAME claude_launcher_approval_tests COMMAND claude_contract_tests --launcher-approval)
     add_test(NAME claude_context_state_tests COMMAND claude_contract_tests --context-state)
     add_test(NAME claude_quota_tests COMMAND claude_contract_tests --quota)
@@ -255,6 +257,12 @@ if(BUILD_TESTING)
         "${CLAUDE_PACKAGE_DIRECTORY}/adapter/claude_adapter${CLAUDE_EXECUTABLE_SUFFIX}"
         "${CLAUDE_PACKAGE_DIRECTORY}/assets/claude-hooks/scripts/logonomic-hook-relay.cjs"
         --context-only)
+    add_test(NAME claude_reply_helper_tests COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_helper_tests.py"
+        "$<TARGET_FILE:claude_helper>" "$<TARGET_FILE:claude_fake_vnmctl>"
+        "${CLAUDE_PACKAGE_DIRECTORY}/adapter/claude_adapter${CLAUDE_EXECUTABLE_SUFFIX}"
+        "${CLAUDE_PACKAGE_DIRECTORY}/assets/claude-hooks/scripts/logonomic-hook-relay.cjs"
+        --reply-only)
     add_test(NAME claude_package_validation COMMAND logonomic_cli_addon_validate
         "${CLAUDE_PACKAGE_DIRECTORY}" --platform "${CLAUDE_PLATFORM}")
     add_test(NAME claude_package_conformance COMMAND logonomic_cli_addon_conformance
@@ -279,6 +287,7 @@ if(BUILD_TESTING)
     endif()
     set_tests_properties(claude_contract_tests claude_package_validation claude_package_conformance
         claude_hook_contract_tests claude_helper_tests claude_context_helper_tests claude_context_state_tests
+        claude_reply_contract_tests claude_reply_helper_tests
         claude_initial_prompt_delivery_tests PROPERTIES TIMEOUT 120)
 endif()
 if(BUILD_TESTING)

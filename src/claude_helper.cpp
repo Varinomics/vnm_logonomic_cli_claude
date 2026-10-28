@@ -5,6 +5,7 @@
 #include <logonomic_cli_addon/helper_client.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
+#include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 
 #if defined(_WIN32)
@@ -83,7 +84,7 @@ std::optional<addon::Json_value> read_event(bool watch_parent)
     if (!name || !name->is_string() || name->as_string().empty()) {
         return std::nullopt;
     }
-    // Keep native correlation and only a bounded complete root reply for the
+    // Keep native correlation and bounded final-paragraph evidence for the
     // local conversational heuristic; prompts and tool results stay here.
     auto sanitized = addon::Json_value::object();
     for (const auto key : {"hook_event_name", "session_id", "source", "reason", "agent_id", "agent_type",
@@ -104,8 +105,11 @@ std::optional<addon::Json_value> read_event(bool watch_parent)
     }
     if (name->as_string() == "Stop" && !event->find("agent_id")) {
         const auto* reply = event->find("last_assistant_message");
-        if (reply && reply->is_string() && reply->as_string().size() <= 2048) {
-            sanitized.set("last_assistant_message", *reply);
+        if (reply && reply->is_string()) {
+            auto evidence = addon::assistant_reply_evidence(reply->as_string());
+            if (!evidence.is_null()) {
+                sanitized.set("assistant_reply_evidence", std::move(evidence));
+            }
         }
     }
     std::string prompt;
