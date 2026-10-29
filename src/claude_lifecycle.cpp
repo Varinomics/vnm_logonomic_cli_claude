@@ -182,8 +182,8 @@ addon::Attention_classification_result classify_attention(const addon::Attention
     auto& observation = result.base.observations.front();
     const auto& name = request.base.event.name;
     if (name == "Stop") {
-        const auto* message = request.base.event.body.find("last_assistant_message");
-        if (message && message->is_string() && addon::looks_like_reply_request(message->as_string())) {
+        const auto* evidence = request.base.event.body.find("assistant_reply_evidence");
+        if (evidence && addon::looks_like_reply_request_evidence(*evidence)) {
             observation.attention_transition = addon::Attention_transition::REQUESTED;
             observation.attention_evidence = addon::Evidence::INFERRED;
             observation.attention_request_id = "conversation-" + std::to_string(request.base.ledger.current_epoch) + "-" +

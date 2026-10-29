@@ -1225,7 +1225,8 @@ void lifecycle_contract()
     {
         addon::Attention_classification_request request;
         request.base.event.name = "Stop";
-        request.base.event.body = claude::object(R"({"hook_event_name":"Stop","session_id":"session","last_assistant_message":"Which directory?"})");
+        request.base.event.body = claude::object(R"({"hook_event_name":"Stop","session_id":"session"})");
+        request.base.event.body.set("assistant_reply_evidence", addon::assistant_reply_evidence("Which directory?"));
         auto result = claude::classify_attention(request);
         require(result.attention_kind && result.attention_kind->kind == "conversational_hint",
             "ordinary complete assistant question gives inferred hint");
@@ -1340,7 +1341,8 @@ void declared_profile_admits_every_shape(const fs::path& package)
     classify("UserPromptSubmit", R"(,"prompt_id":"turn-a")", "the declaration refuses a turn start");
     classify("PermissionRequest", R"(,"prompt_id":"turn-a")", "the declaration refuses an approval request");
     classify("Stop", R"(,"prompt_id":"turn-a")", "the declaration refuses a turn completion");
-    const auto hint = classify("Stop", R"(,"prompt_id":"turn-a","last_assistant_message":"Which directory?")",
+    const auto hint = classify("Stop", R"(,"prompt_id":"turn-a","assistant_reply_evidence":)" +
+        addon::serialize_json(addon::assistant_reply_evidence("Which directory?")),
         "the declaration refuses a completion that ends in a question");
     request.pending_conversational_request_id = hint.base.observations.front().attention_request_id;
     classify("UserPromptSubmit", R"(,"prompt_id":"turn-b")",
@@ -2556,11 +2558,17 @@ void account_name_contract()
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) {
-        std::cerr << "usage: claude_contract_tests <package directory> | --launcher-approval | --context-state | --quota\n";
+    if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--reply-evidence")) {
+        std::cerr << "usage: claude_contract_tests <package directory> [--reply-evidence] | --launcher-approval | --context-state | --quota\n";
         return 2;
     }
     try {
+        if (argc == 3) {
+            lifecycle_contract();
+            declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
+            std::cout << "Claude reply evidence contract checks passed.\n";
+            return 0;
+        }
         if (std::string_view(argv[1]) == "--launcher-approval") {
             launcher_approval_contract();
             std::cout << "Claude launcher approval contract checks passed.\n";
