@@ -795,25 +795,50 @@ void initial_prompt_contract()
             const addon::Initial_prompt_request marked{pointer(brief) + " " + marker, brief};
             require_refusal(prepare("windows-x86_64", "cmd", {"cmd.exe", "/c", "claude"}, marked),
                 "cmd.exe would rewrite a prompt with a variable reference or a quote");
+            require_refusal(prepare("windows-x86_64", "direct", {"claude.cmd"}, marked),
+                "an npm batch shim would rewrite a prompt with a variable reference or a quote");
+            require_refusal(prepare("windows-x86_64", "powershell", {"powershell.exe", "-Command", "claude"}, marked),
+                "a PowerShell lookup could select an npm batch shim that rewrites the prompt");
+            require(acknowledged_argv(prepare("windows-x86_64", "direct", {"claude.exe"}, marked), marked).back() ==
+                marked.text, "a native Windows launch carries every prompt byte");
             require(acknowledged_argv(prepare("linux-x86_64", "direct", {"claude"}, marked), marked).back() ==
                 marked.text, "a POSIX launch carries every prompt byte");
         }
-        require_refusal(prepare("windows-x86_64", "direct", {"claude", "--model", "sonnet&echo"}, prompt),
-            "an unquoted Windows argument with a cmd operator refuses");
+        require_refusal(prepare("windows-x86_64", "direct", {"claude.cmd", "--model", "sonnet&echo"}, prompt),
+            "an unquoted batch argument with a cmd operator refuses");
         require_refusal(prepare("windows-x86_64", "cmd", {"cmd.exe", "/c", "\"C:\\Program Files\\Claude\\claude.exe\""},
             prompt), "cmd.exe strips the quotes of a program with a space and refuses");
         require_refusal(prepare("windows-x86_64", "direct", {"C:\\Program Files\\nodejs\\claude.cmd"}, prompt),
             "cmd.exe also strips the quotes of a batch file with a space that the host starts directly");
         require(acknowledged_argv(prepare("windows-x86_64", "direct", {"C:\\Program Files\\Claude\\claude.exe"}, prompt),
             prompt).front() == "C:\\Program Files\\Claude\\claude.exe", "a native image with a space needs no cmd.exe");
+        for (const auto* instruction_text : {"Be precise!", "Report 100% coverage."}) {
+            for (const auto* program : {"claude", "C:/Tools %PATH% !bang/claude.exe"}) {
+                const std::vector<std::string> launcher{program, "--append-system-prompt", instruction_text};
+                const auto prepared = acknowledged_argv(
+                    prepare("windows-x86_64", "direct", launcher, prompt), prompt);
+                const auto reading = claude_reading(prepared);
+                require(prepared.front() == launcher.front() &&
+                    reading.values("--append-system-prompt") ==
+                        std::vector<std::string>{std::string(instruction_text) + " " + instruction},
+                    "a native Windows launch preserves percent and exclamation characters verbatim");
+            }
+            const auto prepared = acknowledged_argv(prepare("windows-x86_64", "powershell",
+                {"powershell.exe", "-Command", std::string("claude.exe --append-system-prompt '") + instruction_text + "'"},
+                prompt), prompt);
+            require(prepared.back().find(std::string(instruction_text) + " " + instruction) != std::string::npos,
+                "PowerShell can carry these characters when it explicitly invokes the native image");
+        }
         const std::string long_instruction(3900, 'i');
         const std::string long_prompt(3900, 's');
         require_refusal(prepare_launch(root, "windows-x86_64", "cmd",
                 {"cmd.exe", "/c", "claude --system-prompt " + long_prompt}, prompt, long_instruction),
             "a command line over cmd.exe's limit refuses");
-        require(acknowledged_argv(prepare_launch(root, "linux-x86_64", "direct",
-                {"claude", "--system-prompt", long_prompt}, prompt, long_instruction), prompt).back() == prompt.text,
-            "the same arguments fit a direct POSIX launch");
+        for (const auto* platform : {"linux-x86_64", "windows-x86_64"}) {
+            require(acknowledged_argv(prepare_launch(root, platform, "direct",
+                    {"claude", "--system-prompt", long_prompt}, prompt, long_instruction), prompt).back() == prompt.text,
+                "the same arguments fit a direct native launch");
+        }
         require_refusal(prepare_launch(root, "linux-x86_64", "bash", {"bash", "-c", "claude"}, prompt, long_instruction),
             "a rendering over the argument bound refuses");
         require_refusal(prepare("windows-x86_64", "powershell", {"powershell.exe", "-NoLogo", "-Command", "claude"},

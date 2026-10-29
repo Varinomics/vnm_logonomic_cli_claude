@@ -542,6 +542,14 @@ void run_cases(const Layout& layout, const fs::path& fake_cli)
         deliver(layout, delivery, false);
         deliver(layout, delivery, true);
     }
+
+    const auto native_layout = make_layout(layout.root / "native %PATH% !bang");
+    copy_program(fake_cli, native_layout.tools / "claude.exe");
+    const Delivery_case native_characters{
+        "direct native image, percent and exclamation paths", "direct", "claude.exe",
+        {utf8(native_layout.tools / "claude.exe")}, {native_layout.tools}};
+    deliver(native_layout, native_characters, false);
+    deliver(native_layout, native_characters, true);
 }
 
 #else

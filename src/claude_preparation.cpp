@@ -362,6 +362,7 @@ std::optional<std::vector<std::string>> initial_prompt_argv(
     // directly behind the program, where an option always follows it.
     command.insert(command.begin() + 1, {"--add-dir", *directory});
     const auto shell = cli_argument_index(argv) ? std::string{} : executable_name(argv.front());
+    const bool powershell = shell == "powershell" || shell == "pwsh";
     if (windows) {
         // A POSIX shell on Windows converts path-like arguments (MSYS, Cygwin)
         // or runs Claude under WSL, where the brief's Windows path names nothing.
@@ -372,17 +373,22 @@ std::optional<std::vector<std::string>> initial_prompt_argv(
         // with one. The line of a cmd launcher, and of a batch file the host
         // starts directly, begins with the program, quoted when it holds a space.
         const auto program = executable_name(command.front());
-        const bool batch = shell.empty() && (program.ends_with(".cmd") || program.ends_with(".bat"));
-        if ((shell == "cmd" || batch) && command.front().find(' ') != std::string::npos) {
+        const bool batch = program.ends_with(".cmd") || program.ends_with(".bat");
+        if ((shell == "cmd" || (shell.empty() && batch)) && command.front().find(' ') != std::string::npos) {
             return std::nullopt;
         }
-        if (!std::all_of(command.begin(), command.end(), cmd_literal) ||
-            cmd_argument_characters(command) + k_cmd_program_allowance > k_cmd_line_characters)
+        // A direct native launch has no cmd.exe expansion or line limit. A
+        // PowerShell lookup can still select an npm .cmd shim unless the
+        // launcher names the native image explicitly.
+        const bool cmd = shell == "cmd" || batch ||
+            (powershell && !addon::lower(command.front()).ends_with(".exe"));
+        if (cmd && (!std::all_of(command.begin(), command.end(), cmd_literal) ||
+            cmd_argument_characters(command) + k_cmd_program_allowance > k_cmd_line_characters))
         {
             return std::nullopt;
         }
     }
-    if ((shell == "powershell" || shell == "pwsh") && !std::all_of(command.begin() + 1, command.end(), powershell_literal)) {
+    if (powershell && !std::all_of(command.begin() + 1, command.end(), powershell_literal)) {
         return std::nullopt;
     }
     return carried_argv(argv, std::move(command));
