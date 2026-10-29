@@ -257,7 +257,9 @@ int main()
     // Oracle: Anthropic Agent SDK transcript parent chains and parallel tool
     // recovery. A response has separate UUIDs for blocks sharing message.id.
     // Primary source paths and compaction semantics: docs/conversation_export.md.
-    const auto root = fs::temp_directory_path() / ("claude-conversation-" + addon::random_nonce_hex());
+    auto root = fs::temp_directory_path() / ("claude-conversation-" + addon::random_nonce_hex());
+    fs::create_directories(root);
+    root = fs::canonical(root);
     const auto profile = root / "profile";
     const auto source = profile / "projects/project-a/session-a.jsonl";
     const std::string body =
