@@ -1,5 +1,7 @@
 # Logonomic Claude CLI add-on
 
+[![CI](https://github.com/Varinomics/vnm_logonomic_cli_claude/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_logonomic_cli_claude/actions/workflows/ci.yml)
+
 Standalone C++20 Claude Code provider for Logonomic on Windows, Linux and macOS.
 The package depends on the public Logonomic CLI add-on SDK and, outside
 Windows, libcurl for its quota helper. It owns launcher
