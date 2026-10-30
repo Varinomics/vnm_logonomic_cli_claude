@@ -205,8 +205,6 @@ task/EOF delivery, lifecycle correlation, auth and quota interpretation, transcr
 deduplication, partial coverage, hook response admission, and initial-prompt
 preparation and refusal. A delivery test runs every prepared initial-prompt
 launcher shape against a stand-in CLI that records the arguments it receives.
-Qualification of the coordinated host file-cache handoff and package
-persistence is required before cutover.
 
 The Claude icon derives from Lobe Icons. Its unchanged MIT notice is in
 `package/notices/lobe_icons_mit.txt`; `package/provenance/lobe_icons.json`
