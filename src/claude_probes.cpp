@@ -1,6 +1,7 @@
 #include "claude_probes.h"
 #include "claude_accounts.h"
 #include "claude_launcher.h"
+#include "claude_quota_windows.h"
 #include "claude_support.h"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace claude {
 namespace {
@@ -22,59 +24,114 @@ struct Usage_result
 {
     std::string content;
     bool local_usage_command = false;
+    std::optional<Json> limits;
 };
 
 std::optional<Usage_result> usage_result(const Json& event)
 {
-    if (text(event, "type") != "result") return std::nullopt;
-    if (flag(event, "is_error") || text(event, "subtype") == "error") {
+    if (text(event, "type") == "result" && (flag(event, "is_error") || text(event, "subtype") == "error")) {
         throw addon::Quota_failure::REQUEST_FAILED;
     }
-    return Usage_result{text(event, "result"), text(event, "local_command") == "usage"};
+    const auto* report = event.find("usage_report");
+    if (report && report->is_object()) {
+        const auto* rates = report->find("rate_limits");
+        const auto* limits = rates ? rates->find("limits") : nullptr;
+        if (limits && !limits->is_null()) {
+            if (!limits->is_array()) {
+                throw addon::Quota_failure::INVALID_RESPONSE;
+            }
+            return Usage_result{{}, true, *limits};
+        }
+    }
+    const auto* run = event.find("local_command_run");
+    const bool native_usage_command = text(event, "type") == "assistant" && run &&
+        text(*run, "command") == "usage" && !run->find("plugin");
+    if ((report && report->is_object()) || native_usage_command) {
+        const auto* message = event.find("message");
+        const auto* content = message ? message->find("content") : nullptr;
+        if (content && content->is_array()) {
+            std::string fallback;
+            for (const auto& block : content->as_array()) {
+                if (text(block, "type") == "text") {
+                    if (!fallback.empty()) {
+                        fallback += '\n';
+                    }
+                    fallback += text(block, "text");
+                }
+            }
+            if (!fallback.empty()) {
+                return Usage_result{std::move(fallback), true, std::nullopt};
+            }
+        }
+    }
+    if (text(event, "type") != "result") {
+        return std::nullopt;
+    }
+    return Usage_result{text(event, "result"), text(event, "local_command") == "usage", std::nullopt};
 }
 
 Usage_result usage_text(std::string_view bytes)
 {
     addon::Json_parse_error error;
     const auto value = addon::parse_json(bytes, addon::Json_parse_limits{}, &error);
+    std::optional<Usage_result> structured;
+    std::optional<Usage_result> fallback;
+    const auto accept = [&](const Json& event) {
+        auto result = usage_result(event);
+        if (result && result->limits) {
+            structured = std::move(result);
+        }
+        else
+        if (result && !result->content.empty()) {
+            fallback = std::move(result);
+        }
+    };
     if (value && value->is_object()) {
-        if (auto result = usage_result(*value); result && !result->content.empty()) return *result;
+        accept(*value);
     }
+    else
     if (value && value->is_array()) {
         for (const auto& event : value->as_array()) {
-            const auto result = usage_result(event);
-            if (result && !result->content.empty()) return *result;
+            accept(event);
         }
     }
-    std::istringstream lines{std::string(bytes)};
-    for (std::string line; std::getline(lines, line);) {
-        const auto event = addon::parse_json(line, addon::Json_parse_limits{}, &error);
-        if (!event || !event->is_object()) continue;
-        const auto result = usage_result(*event);
-        if (result && !result->content.empty()) return *result;
+    else {
+        std::istringstream lines{std::string(bytes)};
+        for (std::string line; std::getline(lines, line);) {
+            const auto event = addon::parse_json(line, addon::Json_parse_limits{}, &error);
+            if (event && event->is_object()) {
+                accept(*event);
+            }
+        }
+    }
+    if (structured) {
+        return *structured;
+    }
+    if (fallback) {
+        return *fallback;
     }
     throw addon::Quota_failure::INVALID_RESPONSE;
 }
 
-std::optional<addon::Quota_window> quota_window(
-    const std::string& content, const std::string& name, std::uint64_t minutes)
+addon::Quota_window quota_window(const std::smatch& row)
 {
-    const std::regex pattern("Current " + name + R"([^:\r\n]*:[ \t]*(\d+(?:\.\d+)?)% used([^\r\n]*))",
-        std::regex::icase);
-    std::smatch match;
-    if (!std::regex_search(content, match, pattern)) return std::nullopt;
-    const double used = std::stod(match[1].str());
-    if (!std::isfinite(used)) {
+    const double used = std::stod(row[2].str());
+    if (!std::isfinite(used) || used < 0) {
         throw addon::Quota_failure::INVALID_RESPONSE;
     }
     addon::Quota_window window;
-    window.used_percent   = used;
-    window.window_minutes = minutes;
-    window.label          = "Current " + name;
+    window.used_percent = used;
+    auto label = row[1].str();
+    label.erase(0, label.find_first_not_of(" \t"));
+    label.erase(label.find_last_not_of(" \t") + 1);
+    window.label = std::move(label);
     // A missing native reset is unknown. Do not borrow the next window's reset.
-    const auto tail = match[2].str();
+    const auto tail = row[3].str();
     const std::regex reset_pattern(R"(resets[ \t]*([^\r\n]+))", std::regex::icase);
-    if (!std::regex_search(tail, match, reset_pattern)) return window;
+    std::smatch match;
+    if (!std::regex_search(tail, match, reset_pattern)) {
+        return window;
+    }
     auto reset = match[1].str();
     const auto trim_end = [&] {
         while (!reset.empty() && (reset.back() == ' ' || reset.back() == '\t')) reset.pop_back();
@@ -134,14 +191,39 @@ addon::Quota_inspect_result inspect_quota(const addon::Structured_inspection& in
     addon::Quota_observation observation;
     try {
         const auto usage = usage_text(inspection.stdout_bytes);
-        observation.primary   = quota_window(usage.content, "session", 300);
-        observation.secondary = quota_window(usage.content, "week", 10080);
-        if (observation.primary && observation.secondary) {
+        if (usage.limits) {
+            observation.windows = parse_quota_windows(*usage.limits);
+            if (!observation.windows) {
+                return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
+            }
             observation.state = addon::Quota_status::READY;
         }
-        else
-        if (observation.primary || observation.secondary || !usage.local_usage_command) {
-            return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
+        else {
+            std::vector<addon::Quota_window> windows;
+            const std::regex pattern(R"(^[ \t]*([^\r\n]+):[ \t]*(-?\d+(?:\.\d+)?)% used([^\r\n]*)$)",
+                std::regex::icase);
+            std::istringstream lines(usage.content);
+            for (std::string line; std::getline(lines, line);) {
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                std::smatch row;
+                if (std::regex_match(line, row, pattern)) {
+                    windows.push_back(quota_window(row));
+                }
+                else
+                if (line.find("% used") != std::string::npos) {
+                    return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
+                }
+            }
+            if (!windows.empty()) {
+                observation.state = addon::Quota_status::READY;
+                observation.windows = std::move(windows);
+            }
+            else
+            if (!usage.local_usage_command) {
+                return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
+            }
         }
     }
     catch (addon::Quota_failure reason) {
@@ -153,6 +235,9 @@ addon::Quota_inspect_result inspect_quota(const addon::Structured_inspection& in
     addon::Quota_inspect_result result;
     result.complete = true;
     result.observation = std::move(observation);
+    if (!addon::decode_quota_inspect_result(addon::encode_quota_inspect_result(result, 3), true, nullptr, 3)) {
+        return addon::make_quota_failure(addon::Quota_failure::INVALID_RESPONSE);
+    }
     return result;
 }
 
@@ -213,7 +298,7 @@ void handle_probes(addon::Invocation_context& context, const std::filesystem::pa
             result.observation->scope = scope(input->account_context);
         }
         else result.protocol_state = input->inspection.protocol_state;
-        context.succeed(addon::encode_quota_inspect_result(result, 2, input->report_quota_failure));
+        context.succeed(addon::encode_quota_inspect_result(result, 3, input->report_quota_failure));
     }
 }
 

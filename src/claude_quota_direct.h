@@ -23,7 +23,7 @@ std::optional<std::string> current_quota_access_token(
     const logonomic::cli_addon::Json_value& config,
     std::uint64_t now, std::uint64_t remaining_ms);
 std::optional<std::string> quota_usage_output(
-    const logonomic::cli_addon::Json_value& response, std::uint64_t now);
+    const logonomic::cli_addon::Json_value& response);
 
 // Reads the same inherited context as the native fallback. It never refreshes,
 // persists credentials, or sends a credential before admission is complete.

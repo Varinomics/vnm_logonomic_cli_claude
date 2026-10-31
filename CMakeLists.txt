@@ -62,6 +62,10 @@ if(WIN32)
     target_link_libraries(claude_native_context PRIVATE advapi32)
 endif()
 
+add_library(claude_quota_windows STATIC src/claude_quota_windows.cpp)
+claude_target(claude_quota_windows)
+target_include_directories(claude_quota_windows PUBLIC src)
+
 add_library(claude_provider STATIC
     src/claude_conversation.cpp
     src/claude_accounts.cpp src/claude_launcher.cpp src/claude_launcher_approval.cpp
@@ -70,7 +74,8 @@ add_library(claude_provider STATIC
     src/claude_usage_summary.cpp src/claude_wake.cpp)
 claude_target(claude_provider)
 target_include_directories(claude_provider PUBLIC src)
-target_link_libraries(claude_provider PUBLIC logonomic_cli_addon_sdk::sdk PRIVATE claude_native_context)
+target_link_libraries(claude_provider PUBLIC logonomic_cli_addon_sdk::sdk
+    PRIVATE claude_native_context claude_quota_windows)
 add_executable(claude_adapter src/adapter.cpp)
 target_link_libraries(claude_adapter PRIVATE claude_provider)
 claude_target(claude_adapter)
@@ -81,7 +86,7 @@ add_executable(claude_launch_bridge src/claude_launch_bridge.cpp)
 claude_target(claude_launch_bridge)
 add_library(claude_quota_direct STATIC src/claude_quota_direct.cpp src/claude_quota_http.cpp)
 claude_target(claude_quota_direct)
-target_link_libraries(claude_quota_direct PRIVATE claude_native_context)
+target_link_libraries(claude_quota_direct PRIVATE claude_native_context claude_quota_windows)
 target_include_directories(claude_quota_direct PUBLIC src)
 target_link_libraries(claude_launch_bridge PRIVATE claude_quota_direct)
 if(WIN32)

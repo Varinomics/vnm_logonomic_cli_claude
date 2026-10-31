@@ -206,6 +206,13 @@ deduplication, partial coverage, hook response admission, and initial-prompt
 preparation and refusal. A delivery test runs every prepared initial-prompt
 launcher shape against a stand-in CLI that records the arguments it receives.
 
+Quota uses `quota@3` to report every observed limit in provider order. Structured
+Claude usage reports take precedence over older named fields and text output,
+including an empty collection when the server reports no limits. Limit scopes,
+headline selection, percentages and optional resets are preserved; missing
+durations remain unknown. Hosts supporting only `quota@2` cannot consume these
+observations, while the package's other capabilities remain independent.
+
 The Claude icon derives from Lobe Icons. Its unchanged MIT notice is in
 `package/notices/lobe_icons_mit.txt`; `package/provenance/lobe_icons.json`
 records the upstream source and SVG viewport normalization.

@@ -1,6 +1,6 @@
 {
   "capability_id": "quota",
-  "version": 2,
+  "version": 3,
   "payload": {
     "environment_names": [
       "CLAUDE_CONFIG_DIR",

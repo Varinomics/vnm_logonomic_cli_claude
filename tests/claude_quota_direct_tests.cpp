@@ -71,27 +71,79 @@ void admission_contract()
 
 void response_contract()
 {
-    constexpr std::uint64_t now = 1790899200000;
-    const auto body = claude::object(R"({"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":100.8,"resets_at":"2026-10-04T20:00:00.010907+00:00"}})");
-    const auto output = claude::quota_usage_output(body, now);
-    require(output.has_value(), "native ISO reset and explicit unknown primary reset are supported");
-    addon::Structured_inspection input;
-    input.final = true;
-    input.stdout_bytes = *output;
-    const auto observed = *claude::inspect_quota(input).observation;
-    require(observed.state == addon::Quota_status::READY && observed.primary->used_percent == 0 &&
-        !observed.primary->reset_text && observed.secondary->used_percent == 100 && observed.secondary->reset_text,
-        "direct output uses native floor semantics and corrected optional resets");
-    for (const auto* value : {"{}", R"({"error":{"type":"rate_limit_error"}})",
-        R"({"five_hour":null,"seven_day":{"utilization":20}})",
-        R"({"five_hour":{"utilization":null},"seven_day":{"utilization":20}})",
-        R"({"five_hour":{"utilization":10},"seven_day":{"utilization":20,"resets_at":"tomorrow"}})"})
+    const auto inspect = [](std::string_view body) {
+        const auto output = claude::quota_usage_output(claude::object(body));
+        require(output.has_value(), "a valid usage reply retains every observed quota window");
+        addon::Structured_inspection input;
+        input.final = true;
+        input.stdout_bytes = *output;
+        const auto result = claude::inspect_quota(input);
+        require(result.observation && result.observation->state == addon::Quota_status::READY &&
+            result.observation->windows.has_value(), "direct quota reaches the collection observation");
+        return *result.observation->windows;
+    };
+    for (const auto* body : {
+        R"({"five_hour":null,"seven_day":{"utilization":20,"resets_at":null}})",
+        R"({"seven_day":{"utilization":20,"resets_at":null}})",
+        R"({"limits":null,"seven_day":{"utilization":20,"resets_at":null}})",
+        R"({"five_hour":null,"seven_day":{"utilization":20,"resets_at":null},"extra_usage":{"is_enabled":false,"monthly_limit":null,"used_credits":null,"utilization":null}})",
+        R"({"seven_day":{"utilization":20},"optional_window":{"is_enabled":false,"utilization":12}})"})
     {
-        require(!claude::quota_usage_output(claude::object(value), now), "unusable replies defer to native cache/error semantics");
+        const auto windows = inspect(body);
+        require(windows.size() == 1 && windows[0].used_percent == 20 &&
+            windows[0].label == "Current week (all models)" && !windows[0].window_minutes,
+            "removed and absent session limits preserve the observed weekly scope without guessing duration");
     }
-    const auto unknown = claude::quota_usage_output(claude::object(
-        R"({"five_hour":{"utilization":30,"resets_at":null},"seven_day":{"utilization":20,"resets_at":null}})"), now);
-    require(unknown.has_value(), "both observed utilizations survive unknown resets");
+    const auto legacy = inspect(
+        R"({"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":100.8,"resets_at":"2026-10-04T20:00:00.010907+00:00"}})");
+    require(legacy.size() == 2 && legacy[0].used_percent == 0 && !legacy[0].resets_at_ms &&
+        legacy[1].used_percent == 100.8 && legacy[1].resets_at_ms,
+        "structured direct output preserves precision, overage and independent optional reset metadata");
+    const auto windows = inspect(R"({
+        "five_hour":{"utilization":90},
+        "limits":[
+            {"kind":"weekly_all","group":"weekly","percent":21.5,"resets_at":1791144000,"scope":null,"is_active":false},
+            {"kind":"weekly_scoped","group":"weekly","percent":37.25,"resets_at":"2026-10-04T22:00:00+02:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":true},
+            {"kind":"monthly_feature","group":"monthly","percent":125.75,"resets_at":null,"scope":{"feature":{"display_name":"Code review"}},"is_active":false}
+        ]
+    })");
+    require(windows.size() == 3 && windows[0].used_percent == 21.5 && windows[1].used_percent == 37.25 &&
+        windows[2].used_percent == 125.75, "the authoritative ordered collection supersedes the old named slots");
+    require(windows[1].label == "Current week (Fable)" &&
+        windows[2].label->find("Code review") != std::string::npos && !windows[2].window_minutes,
+        "added scopes retain their public labels without a fixed model or period allowlist");
+    require(windows[0].headline == false && windows[1].headline == true && windows[2].headline == false,
+        "the server headline selection never removes the other quota windows");
+    require(windows[0].resets_at_ms == 1791144000000ULL &&
+        windows[0].resets_at_ms == windows[1].resets_at_ms && *legacy[1].resets_at_ms == 1791144000010ULL,
+        "numeric seconds and ISO offsets normalize to the same millisecond instant");
+    require(inspect(R"({"limits":[],"seven_day":{"utilization":90}})").empty(),
+        "an authoritative empty collection clears removed limits without reviving named fields");
+    const auto added = inspect(R"({"new_scope":{"utilization":14,"resets_at":null},"seven_day":null})");
+    require(added.size() == 1 && added[0].label == "New scope" && added[0].used_percent == 14,
+        "compatible older replies can add a quota scope without changing its parser");
+    const auto scoped = inspect(R"({"limits":[
+        {"kind":"premium","group":"monthly","percent":15,"scope":{"model":{"display_name":"Fable"},"surface":{"display_name":"Code"}}},
+        {"kind":"weekly_all","group":"weekly","percent":25,"scope":{"model":{"display_name":"Fable"}}}
+    ]})");
+    require(scoped[0].label == "Monthly: Premium (Fable, Code)" && !scoped[0].window_minutes &&
+        scoped[1].label == "Current week (Fable)",
+        "changed groups and scopes stay visible without contradictory scope claims or assumed durations");
+    const auto unknown = inspect(
+        R"({"five_hour":{"utilization":null},"seven_day":{"utilization":20,"resets_at":null}})");
+    require(unknown.size() == 1 && !unknown[0].resets_at_ms,
+        "unobserved utilization and unknown reset metadata do not erase the observed window");
+    for (const auto* value : {"{}", R"({"error":{"type":"rate_limit_error"}})",
+        R"({"limits":{}})", R"({"limits":[{"kind":"weekly_all","percent":"20"}]})",
+        R"({"limits":[{"kind":"weekly_all","percent":-1}]})",
+        R"({"limits":[{"kind":"weekly_all","percent":20,"resets_at":"tomorrow"}]})",
+        R"({"limits":[{"kind":"weekly_all","percent":20,"resets_at":"2026-10-04T-1:00:00Z"}]})",
+        R"({"limits":[{"kind":"weekly_all","percent":20,"resets_at":1791144000.5}]})",
+        R"({"seven_day":{"utilization":20,"resets_at":"tomorrow"}})"})
+    {
+        require(!claude::quota_usage_output(claude::object(value)),
+            "malformed observed figures or reset metadata retain native fallback semantics");
+    }
 }
 
 int requests = 0;

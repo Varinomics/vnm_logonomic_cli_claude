@@ -1,22 +1,14 @@
 #include "claude_quota_direct.h"
 #include "claude_support.h"
 #include "claude_native_context.h"
+#include "claude_quota_windows.h"
 
 #include <logonomic_cli_addon/launcher_utilities.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <ctime>
-#endif
-
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <cmath>
-#include <memory>
-#include <stdexcept>
-#include <type_traits>
+#include <exception>
 
 namespace claude {
 namespace {
@@ -98,140 +90,6 @@ bool configuration_supported(const fs::path& profile, const fs::path& working_di
 #endif
 }
 
-std::optional<std::chrono::sys_seconds> parse_reset(std::string_view text)
-{
-    // The endpoint's ISO timestamp carries its own offset. Admit that shape
-    // instead of guessing dates from locale-dependent text.
-    if (text.size() < 20 || text[4] != '-' || text[7] != '-' || text[10] != 'T' ||
-        text[13] != ':' || text[16] != ':') return std::nullopt;
-    const auto number = [&](std::size_t offset, std::size_t count) -> std::optional<int> {
-        int value = 0;
-        const auto parsed = std::from_chars(text.data() + offset, text.data() + offset + count, value);
-        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + offset + count) return std::nullopt;
-        return value;
-    };
-    const auto year   = number(0, 4);
-    const auto month  = number(5, 2);
-    const auto day    = number(8, 2);
-    const auto hour   = number(11, 2);
-    const auto minute = number(14, 2);
-    const auto second = number(17, 2);
-    if (!year || !month || !day || !hour || !minute || !second || *hour > 23 || *minute > 59 || *second > 59)
-        return std::nullopt;
-    const std::chrono::year_month_day date{std::chrono::year(*year), std::chrono::month(*month), std::chrono::day(*day)};
-    if (!date.ok()) return std::nullopt;
-    std::size_t offset = 19;
-    if (text[offset] == '.') {
-        ++offset;
-        const auto start = offset;
-        while (offset < text.size() && text[offset] >= '0' && text[offset] <= '9') ++offset;
-        if (offset == start) return std::nullopt;
-    }
-    int zone_minutes = 0;
-    if (text.substr(offset) != "Z") {
-        if (text.size() != offset + 6 || (text[offset] != '+' && text[offset] != '-') || text[offset + 3] != ':')
-            return std::nullopt;
-        const auto hours = number(offset + 1, 2);
-        const auto minutes = number(offset + 4, 2);
-        if (!hours || !minutes || *hours > 23 || *minutes > 59) return std::nullopt;
-        zone_minutes = (*hours * 60 + *minutes) * (text[offset] == '+' ? 1 : -1);
-    }
-    return std::chrono::sys_days(date) + std::chrono::hours(*hour) + std::chrono::minutes(*minute - zone_minutes) +
-        std::chrono::seconds(*second);
-}
-
-std::string reset_text(std::chrono::sys_seconds instant, std::uint64_t now)
-{
-    using namespace std::chrono;
-    local_seconds local, current;
-    std::string zone;
-#ifdef _WIN32
-    DYNAMIC_TIME_ZONE_INFORMATION timezone{};
-    if (GetDynamicTimeZoneInformation(&timezone) == TIME_ZONE_ID_INVALID) {
-        throw std::runtime_error("quota_timezone_unavailable");
-    }
-    const auto convert = [&timezone](sys_seconds point) {
-        const year_month_day date{floor<days>(point)};
-        const hh_mm_ss time{point - floor<days>(point)};
-        const SYSTEMTIME utc{
-            (WORD)int(date.year()), (WORD)unsigned(date.month()), 0, (WORD)unsigned(date.day()),
-            (WORD)time.hours().count(), (WORD)time.minutes().count(), (WORD)time.seconds().count(), 0};
-        SYSTEMTIME value{};
-        if (!SystemTimeToTzSpecificLocalTimeEx(&timezone, &utc, &value)) {
-            throw std::runtime_error("quota_timezone_unavailable");
-        }
-        return local_days(year(value.wYear) / month(value.wMonth) / day(value.wDay)) +
-            hours(value.wHour) + minutes(value.wMinute) + seconds(value.wSecond);
-    };
-    local   = convert(instant);
-    current = convert(sys_seconds(seconds(now / 1000)));
-
-    // The system ICU service supplies the IANA identifier used by native usage.
-    using System_module = std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(&FreeLibrary)>;
-    const System_module icu(
-        LoadLibraryExW(L"icu.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32), &FreeLibrary);
-    if (!icu) {
-        throw std::runtime_error("quota_timezone_unavailable");
-    }
-    using Get_default_timezone = std::int32_t (__cdecl*)(char16_t*, std::int32_t, std::int32_t*);
-    const auto get_default_timezone = reinterpret_cast<Get_default_timezone>(
-        GetProcAddress(icu.get(), "ucal_getDefaultTimeZone"));
-    if (!get_default_timezone) {
-        throw std::runtime_error("quota_timezone_unavailable");
-    }
-    std::array<char16_t, 128> identifier{};
-    std::int32_t status = 0;
-    const auto length = get_default_timezone(identifier.data(), (std::int32_t)identifier.size(), &status);
-    if (status > 0 || length <= 0 || length >= (std::int32_t)identifier.size()) {
-        throw std::runtime_error("quota_timezone_unavailable");
-    }
-    const std::wstring wide(identifier.data(), identifier.data() + length);
-    const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-        wide.data(), length, nullptr, 0, nullptr, nullptr);
-    if (size <= 0) {
-        throw std::runtime_error("quota_timezone_unavailable");
-    }
-    zone.resize(size);
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-        wide.data(), length, zone.data(), size, nullptr, nullptr) != size)
-    {
-        throw std::runtime_error("quota_timezone_unavailable");
-    }
-    if (zone == "Etc/Unknown") {
-        throw std::runtime_error("quota_timezone_unavailable");
-    }
-#else
-    const auto convert = [](sys_seconds point) {
-        const auto stamp = system_clock::to_time_t(point);
-        std::tm value{};
-        if (!localtime_r(&stamp, &value)) throw std::runtime_error("quota_timezone_unavailable");
-        return local_days(year(value.tm_year + 1900) / month(value.tm_mon + 1) / day(value.tm_mday)) +
-            hours(value.tm_hour) + minutes(value.tm_min) + seconds(value.tm_sec);
-    };
-    local   = convert(instant);
-    current = convert(sys_seconds(seconds(now / 1000)));
-    const auto path = fs::canonical("/etc/localtime");
-    const auto spelling = path_string(path);
-    const auto begin = spelling.find("/zoneinfo/");
-    if (begin == std::string::npos) throw std::runtime_error("quota_timezone_unavailable");
-    zone = spelling.substr(begin + 10);
-#endif
-    if (zone == "Etc/UTC" || zone == "Etc/GMT") zone = "UTC";
-    const year_month_day date{floor<days>(local)};
-    const year_month_day today{floor<days>(current)};
-    const hh_mm_ss time{local - floor<days>(local)};
-    constexpr std::array months{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    std::string result = std::string(months[unsigned(date.month()) - 1]) + ' ' + std::to_string(unsigned(date.day()));
-    if (date.year() != today.year()) result += ", " + std::to_string(int(date.year()));
-    const auto hour = time.hours().count();
-    result += ", " + std::to_string(hour % 12 == 0 ? 12 : hour % 12);
-    if (time.minutes().count() != 0) {
-        result += time.minutes().count() < 10 ? ":0" : ":";
-        result += std::to_string(time.minutes().count());
-    }
-    return result + (hour < 12 ? "am (" : "pm (") + zone + ')';
-}
-
 } // namespace
 
 bool quota_environment_supported(const Quota_environment& environment)
@@ -300,32 +158,19 @@ std::optional<std::string> current_quota_access_token(
     return bearer;
 }
 
-std::optional<std::string> quota_usage_output(const Json& response, std::uint64_t now)
+std::optional<std::string> quota_usage_output(const Json& response)
 {
-    if (!response.is_object() || response.find("error")) return std::nullopt;
-    std::string content;
-    for (const auto& [key, title] : {std::pair{"five_hour", "Current session"},
-        {"seven_day", "Current week (all models)"}})
-    {
-        const auto* window = response.find(key);
-        const auto* used = window ? window->find("utilization") : nullptr;
-        if (!window || !window->is_object() || !used || !used->is_number() ||
-            !std::isfinite(used->as_number()) || used->as_number() < 0) return std::nullopt;
-        if (!content.empty()) content += '\n';
-        content += std::string(title) + ": " + std::to_string(std::floor(used->as_number())) + "% used";
-        if (const auto* reset = window->find("resets_at"); reset && !reset->is_null()) {
-            if (!reset->is_string()) return std::nullopt;
-            const auto parsed = parse_reset(reset->as_string());
-            if (!parsed) return std::nullopt;
-            content += " · resets " + reset_text(*parsed, now);
-        }
+    const auto limits = quota_response_limits(response);
+    if (!limits) {
+        return std::nullopt;
     }
+    auto rates = Json::object();
+    rates.set("limits", *limits);
+    auto report = Json::object();
+    report.set("rate_limits", std::move(rates));
     auto result = Json::object();
-    result.set("type", Json("result"));
-    result.set("subtype", Json("success"));
-    result.set("local_command", Json("usage"));
-    result.set("is_error", Json(false));
-    result.set("result", Json(std::move(content)));
+    result.set("type", Json("assistant"));
+    result.set("usage_report", std::move(report));
     return addon::serialize_json(result) + '\n';
 }
 
@@ -357,10 +202,10 @@ std::optional<std::string> direct_quota_output(
         const auto current = read_object(profile / ".credentials.json", true);
         if (!current || addon::serialize_json(*current) != addon::serialize_json(*credentials)) return std::nullopt;
         const auto response = addon::parse_json(*bytes, addon::Json_parse_limits{}, nullptr);
-        return response ? quota_usage_output(*response, now_ms()) : std::nullopt;
+        return response ? quota_usage_output(*response) : std::nullopt;
     }
     catch (const std::exception&) {
-        // Unsupported files, storage, timezones and replies remain native.
+        // Unsupported files, storage and replies remain native.
         // Exception text can contain paths or provider data and is never logged.
         return std::nullopt;
     }

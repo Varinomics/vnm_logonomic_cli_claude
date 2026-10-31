@@ -2051,6 +2051,9 @@ void probe_contract()
 {
     addon::Structured_inspection input;
     input.final = true;
+    input.stdout_bytes = R"({"type":"result","subtype":"success","local_command":"usage","result":"Current week (all models): 20% used"})";
+    require(claude::inspect_quota(input).observation->state == addon::Quota_status::READY,
+        "native usage with only a weekly quota window remains available");
     input.stdout_bytes = R"({"loggedIn":true})";
     require(claude::inspect_auth(input) == addon::Auth_status::AUTHENTICATED, "auth requires matching successful exit");
     input.exit_code = 1;
@@ -2060,19 +2063,19 @@ void probe_contract()
     input.exit_code = 0;
     input.stdout_bytes = R"({"type":"result","subtype":"success","is_error":false,"result":"Current session: 35% used, resets 3pm (Europe/Berlin)\nCurrent week: 21.5% used, resets September 17."})";
     const auto quota = *claude::inspect_quota(input).observation;
-    require(quota.state == addon::Quota_status::READY && quota.primary->used_percent == 35 &&
-        quota.secondary->used_percent == 21.5, "both native quota windows parsed");
-    require(quota.secondary->reset_text == "September 17", "text reset retained without guessing epoch");
+    require(quota.state == addon::Quota_status::READY && quota.windows->at(0).used_percent == 35 &&
+        quota.windows->at(1).used_percent == 21.5, "both native quota windows parsed");
+    require(quota.windows->at(1).reset_text == "September 17", "text reset retained without guessing epoch");
     // Native y() omits the reset suffix for a null API resets_at value.
     input.stdout_bytes = R"json({"type":"result","subtype":"success","local_command":"usage","result":"Current session: 0% used\nCurrent week (all models): 100% used · resets Oct 4, 10pm (Europe/Berlin)"})json";
     const auto unknown_reset = *claude::inspect_quota(input).observation;
-    require(unknown_reset.state == addon::Quota_status::READY && unknown_reset.primary->used_percent == 0 &&
-        !unknown_reset.primary->reset_text && unknown_reset.secondary->reset_text == "Oct 4, 10pm (Europe/Berlin)",
+    require(unknown_reset.state == addon::Quota_status::READY && unknown_reset.windows->at(0).used_percent == 0 &&
+        !unknown_reset.windows->at(0).reset_text && unknown_reset.windows->at(1).reset_text == "Oct 4, 10pm (Europe/Berlin)",
         "an unknown primary reset never borrows the weekly reset");
     input.stdout_bytes = R"({"type":"result","subtype":"success","is_error":false,"result":"Current session: 135.5% used, resets 3pm\nCurrent week: 121% used, resets September 17."})";
     const auto overage = *claude::inspect_quota(input).observation;
-    require(overage.state == addon::Quota_status::READY && overage.primary->used_percent == 135.5 &&
-        overage.secondary->used_percent == 121, "native quota overage remains observable without clamping");
+    require(overage.state == addon::Quota_status::READY && overage.windows->at(0).used_percent == 135.5 &&
+        overage.windows->at(1).used_percent == 121, "native quota overage remains observable without clamping");
 
     input.stdout_bytes =
         R"([{"type":"system","subtype":"init"},)"
@@ -2080,15 +2083,68 @@ void probe_contract()
         R"("local_command":"usage","result":"Total cost: $0.0000\n)"
         R"(Total duration (API): 0s\nUsage: 0 input, 0 output, 0 cache read, 0 cache write"}])";
     const auto print_mode = *claude::inspect_quota(input).observation;
-    require(print_mode.state == addon::Quota_status::UNAVAILABLE && !print_mode.primary && !print_mode.secondary,
+    require(print_mode.state == addon::Quota_status::UNAVAILABLE && !print_mode.windows,
         "print-mode usage totals do not authenticate subscription quota windows");
 
     input.stdout_bytes =
         R"({"type":"result","subtype":"success","is_error":false,)"
         R"("local_command":"usage","result":"Current session: 35% used, resets 3pm"})";
-    const auto incomplete = *claude::inspect_quota(input).observation;
-    require(incomplete.state == addon::Quota_status::FAILED && !incomplete.primary && !incomplete.secondary,
-        "incomplete quota evidence remains a failed observation without partial windows");
+    const auto session_only = *claude::inspect_quota(input).observation;
+    require(session_only.state == addon::Quota_status::READY && session_only.windows->size() == 1 &&
+        session_only.windows->at(0).used_percent == 35 && !session_only.windows->at(0).window_minutes,
+        "a single observed session limit does not require a weekly sibling or an assumed duration");
+
+    input.stdout_bytes = R"([
+        {"type":"assistant","usage_report":{"rate_limits":{"limits":[
+            {"kind":"weekly_all","group":"weekly","percent":12.5,"resets_at":null,"is_active":false},
+            {"kind":"weekly_scoped","group":"weekly","percent":67.25,"scope":{"model":{"display_name":"Fable"}},"is_active":true}
+        ]}}},
+        {"type":"result","local_command":"usage","result":"Current session: 95% used"}
+    ])";
+    const auto structured = *claude::inspect_quota(input).observation;
+    require(structured.state == addon::Quota_status::READY && structured.windows->size() == 2 &&
+        structured.windows->at(0).used_percent == 12.5 && structured.windows->at(1).label == "Current week (Fable)",
+        "native structured usage preserves scopes and overrides its narrower text projection");
+
+    input.stdout_bytes =
+        R"({"type":"assistant","usage_report":{"rate_limits":{"limits":[]}}})" "\n"
+        R"({"type":"result","local_command":"usage","result":"Current session: 95% used"})";
+    const auto empty = *claude::inspect_quota(input).observation;
+    require(empty.state == addon::Quota_status::READY && empty.windows && empty.windows->empty(),
+        "an authoritative empty native collection cannot revive a removed limit from text");
+
+    input.stdout_bytes = R"({"type":"assistant","usage_report":{"rate_limits":{"limits":null}},"message":{"content":[
+        {"type":"text","text":"Daily review: 8.5% used\nCurrent week (all models): 20% used\nCurrent week (Fable): 60% used"}
+    ]}})";
+    const auto fallback = *claude::inspect_quota(input).observation;
+    require(fallback.state == addon::Quota_status::READY && fallback.windows->size() == 3 &&
+        fallback.windows->at(0).label == "Daily review" && !fallback.windows->at(0).window_minutes &&
+        fallback.windows->at(2).label == "Current week (Fable)",
+        "canonical native text remains a dynamic fallback when no structured rows were supplied");
+
+    for (const auto* report : {"", "\"usage_report\":null,"}) {
+        input.stdout_bytes = std::string("{") + report +
+            R"("type":"assistant","local_command_run":{"command":"usage","args":""},"message":{"content":[
+                {"type":"text","text":"Current week (Fable): 60% used"}
+            ]}})";
+        const auto legacy_twin = *claude::inspect_quota(input).observation;
+        require(legacy_twin.state == addon::Quota_status::READY && legacy_twin.windows->size() == 1 &&
+            legacy_twin.windows->front().label == "Current week (Fable)",
+            "native local usage text remains available when its optional structured report is absent or null");
+    }
+    input.stdout_bytes = R"({"type":"assistant","local_command_run":{"command":"status","args":""},"message":{"content":[
+        {"type":"text","text":"Current week: 60% used"}
+    ]}})";
+    require(claude::inspect_quota(input).observation->state == addon::Quota_status::FAILED,
+        "another local command's text cannot authenticate quota figures");
+
+    input.stdout_bytes =
+        R"({"type":"assistant","usage_report":{"rate_limits":{"limits":[]}}})" "\n"
+        R"({"type":"result","is_error":true,"result":"private-native-detail"})";
+    const auto rejected = claude::inspect_quota(input);
+    require(rejected.observation->state == addon::Quota_status::FAILED && rejected.failure_reason &&
+        addon::parse_quota_failure(*rejected.failure_reason) == addon::Quota_failure::REQUEST_FAILED,
+        "a final native failure cannot be hidden by an earlier structured usage event");
 }
 
 void quota_failure_contract()
@@ -2107,7 +2163,7 @@ void quota_failure_contract()
             invocation.m_request.payload = addon::encode_probe_inspect_request(request, 2);
             claude::handle_probes(invocation, {});
             addon::Contract_failure failure;
-            const auto result = addon::decode_quota_inspect_result(invocation.m_payload, true, &failure, 2);
+            const auto result = addon::decode_quota_inspect_result(invocation.m_payload, true, &failure, 3);
             require(result && result->complete && result->observation,
                 "a quota failure remains a complete decodable observation");
             require(result->observation->scope.source_account_key == "claude-quota-account",
@@ -2120,18 +2176,18 @@ void quota_failure_contract()
         "a host that did not ask for the cause receives a neutral failure");
     request.report_quota_failure = true;
     for (const auto* output : {
-        R"({"type":"result","subtype":"success","local_command":"usage","result":"Current session: 35% used"})",
+        R"({"type":"result","subtype":"success","local_command":"usage","result":"Current session: unavailable% used"})",
         "{broken-json"})
     {
         request.inspection.stdout_bytes = output;
         const auto result = inspect();
         require(result.observation->state == addon::Quota_status::FAILED &&
-            !result.observation->primary && !result.observation->secondary,
+            !result.observation->windows,
             "malformed quota evidence does not publish partial figures");
         require(result.failure_reason && *result.failure_reason != "authentication_required",
             "malformed quota evidence retains a non-authentication failure reason");
         require(addon::parse_quota_failure(*result.failure_reason) == addon::Quota_failure::INVALID_RESPONSE,
-            "missing and malformed quota windows retain the invalid-response category");
+            "malformed quota windows retain the invalid-response category");
     }
     request.inspection.stdout_bytes =
         R"({"type":"result","is_error":true,"result":"private-native-detail"})";
@@ -2140,7 +2196,7 @@ void quota_failure_contract()
     require(rejected.failure_reason &&
         addon::parse_quota_failure(*rejected.failure_reason) == addon::Quota_failure::REQUEST_FAILED,
         "a native error result is distinguished from malformed quota evidence");
-    require(addon::serialize_json(addon::encode_quota_inspect_result(rejected, 2, true)).find("private-native-detail") ==
+    require(addon::serialize_json(addon::encode_quota_inspect_result(rejected, 3, true)).find("private-native-detail") ==
         std::string::npos, "native failure content does not escape the quota privacy boundary");
 
     request.inspection.exit_code = 2;
@@ -2519,10 +2575,10 @@ void quota_reset_label_contract()
         inspection.final=true; inspection.exit_code=0;
         inspection.stdout_bytes=serialize_json(event);
         const auto observation=*claude::inspect_quota(inspection).observation;
-        const bool good=expected.empty() ? (!observation.primary && !observation.secondary) :
-            (observation.primary && observation.secondary &&
-             observation.primary->reset_text.value_or("")==expected &&
-             observation.secondary->reset_text.value_or("")==expected);
+        const bool good=expected.empty() ? (observation.state == Quota_status::FAILED && !observation.windows) :
+            (observation.windows && observation.windows->size() == 2 &&
+             observation.windows->at(0).reset_text.value_or("")==expected &&
+             observation.windows->at(1).reset_text.value_or("")==expected);
         std::cout << (good?"PASS":"FAIL") << " reset_label=[" << input << "] expected=[" << expected << "]\n";
         require(good, "ARC-005 quota reset label must preserve balanced parentheses in both windows");
     }
