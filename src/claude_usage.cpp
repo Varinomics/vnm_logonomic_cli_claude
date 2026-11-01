@@ -1057,6 +1057,7 @@ std::vector<fs::path> transcript_files(const fs::path& profile, addon::Invocatio
 std::vector<Usage_session> scan_usage(const fs::path& profile, addon::Invocation_context& context, const Usage_cache_input& cache_input)
 {
     std::lock_guard cache_lock(s_cache_mutex);
+    context.report_progress(0, std::nullopt);
     File_cache cache;
     std::string receipt;
     if (cache_input.selected_directory) {
@@ -1301,6 +1302,7 @@ void handle_incremental_usage(addon::Invocation_context& context, const char*& s
     }
     else {
         std::lock_guard cache_lock(s_cache_mutex);
+        context.report_progress(0, std::nullopt);
         if (!addon::validate_usage_cache_allocation(candidate, storage, &failure)) {
             throw std::runtime_error(failure.reason_code);
         }
