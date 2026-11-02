@@ -67,7 +67,7 @@ claude_target(claude_quota_windows)
 target_include_directories(claude_quota_windows PUBLIC src)
 
 add_library(claude_provider STATIC
-    src/claude_conversation.cpp
+    src/claude_conversation.cpp src/claude_cost.cpp
     src/claude_accounts.cpp src/claude_launcher.cpp src/claude_launcher_approval.cpp
     src/claude_lifecycle.cpp
     src/claude_preparation.cpp src/claude_probes.cpp src/claude_resume.cpp src/claude_sessions.cpp src/claude_usage.cpp
@@ -191,6 +191,12 @@ include(CTest)
 option(LOGONOMIC_CLI_ADDON_LARGE_DATA_TESTS
     "Register full-size usage history and capacity regressions" OFF)
 if(BUILD_TESTING)
+    add_executable(claude_cost_tests tests/claude_cost_tests.cpp)
+    claude_target(claude_cost_tests)
+    target_link_libraries(claude_cost_tests PRIVATE claude_provider)
+    add_dependencies(claude_cost_tests claude_package)
+    add_test(NAME claude_cost_tests COMMAND claude_cost_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    set_tests_properties(claude_cost_tests PROPERTIES TIMEOUT 60 LABELS "quota;usage;packaged-adapter")
     add_executable(claude_resume_tests tests/claude_resume_tests.cpp)
     claude_target(claude_resume_tests)
     target_link_libraries(claude_resume_tests PRIVATE claude_provider)

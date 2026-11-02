@@ -1,5 +1,6 @@
 #include "claude_probes.h"
 #include "claude_accounts.h"
+#include "claude_cost.h"
 #include "claude_launcher.h"
 #include "claude_quota_windows.h"
 #include "claude_support.h"
@@ -296,9 +297,26 @@ void handle_probes(addon::Invocation_context& context, const std::filesystem::pa
         if (result.complete) {
             result = inspect_quota(input->inspection);
             result.observation->scope = scope(input->account_context);
+            if (input->report_quota_cost && input->account_context &&
+                (!result.observation->windows || result.observation->windows->empty()))
+            {
+                // Saved costs remain account evidence even when the current
+                // native quota probe failed. Its original status is unchanged.
+                try {
+                    result.cost = read_recorded_cost(*input->account_context, context);
+                }
+                catch (const std::exception&) {
+                    if (context.cancel_requested()) {
+                        context.fail(addon::Result_status::CANCELLED, "cancelled");
+                        return;
+                    }
+                    result.cost_failed = true;
+                }
+            }
         }
         else result.protocol_state = input->inspection.protocol_state;
-        context.succeed(addon::encode_quota_inspect_result(result, 3, input->report_quota_failure));
+        context.succeed(addon::encode_quota_inspect_result(
+            result, 3, input->report_quota_failure, input->report_quota_cost));
     }
 }
 

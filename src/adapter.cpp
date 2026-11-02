@@ -150,6 +150,7 @@ int main()
         {addon::k_session_wake_capability_id, addon::k_session_wake_version},
         {addon::k_model_context_delivery_capability_id, addon::k_model_context_delivery_version},
         {addon::k_quota_failure_capability_id, addon::k_quota_failure_version},
+        {addon::k_quota_cost_capability_id, addon::k_quota_cost_version},
     };
     addon::Adapter_runtime runtime(std::move(options));
     runtime.set_invoke_handler([package_root](addon::Invocation_context& context) { invoke(context, package_root); });
