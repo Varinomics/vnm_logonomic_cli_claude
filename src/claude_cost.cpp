@@ -57,7 +57,7 @@ double amount(const Json* value)
     return value->as_number();
 }
 
-Json object(std::string_view bytes)
+Json receipt_object(std::string_view bytes)
 {
     addon::Json_parse_limits limits;
     limits.max_bytes        = k_max_receipt_bytes;
@@ -108,7 +108,7 @@ std::optional<addon::Quota_cost> read_recorded_cost(
         if (fingerprint(entry.path()) != before) {
             throw std::runtime_error("cost_source_changed");
         }
-        const auto record   = object(bytes);
+        const auto record   = receipt_object(bytes);
         const auto* version = record.find("version");
         const auto* instant = record.find("recorded_at_ms");
         const auto session  = text(record, "session_id");
