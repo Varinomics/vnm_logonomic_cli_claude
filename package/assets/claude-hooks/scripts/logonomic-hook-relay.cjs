@@ -29,6 +29,11 @@ function relay_hook(payload, options = {})
     if (!Object.hasOwn(event_budgets, event)) return Promise.resolve("");
     const directory = environment.LOGONOMIC_PROVIDER_HELPERS_DIR || "";
     if (!path.isAbsolute(directory) || !environment.LOGONOMIC_SESSION_CAPABILITY) return Promise.resolve("");
+    // Ordinary child tools produce neither model context nor a lifecycle event.
+    if (event === "PreToolUse" && Object.hasOwn(payload, "agent_id") &&
+        payload.tool_name !== "AskUserQuestion" && payload.tool_name !== "ExitPlanMode") {
+        return Promise.resolve("");
+    }
     const executable = path.join(directory, process.platform === "win32" ? "claude_helper.exe" : "claude_helper");
     // Native ownership comes from the Mod's direct helper invocation. A Node
     // launcher may interpose here, so neither its PID nor payload data owns it.
