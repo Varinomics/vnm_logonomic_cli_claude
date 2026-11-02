@@ -38,6 +38,40 @@ assert.equal(await relay_hook(payload, { environment, spawn: fake_spawn(accepted
 assert.equal(await relay_hook(payload, { environment, spawn: fake_spawn('{"accepted":true}') }), "");
 assert.equal(await relay_hook(payload, { environment, spawn: fake_spawn("x".repeat(65537)) }), "");
 assert.equal(await relay_hook(payload, { environment: {}, spawn() { throw new Error("must not spawn"); } }), "");
+const checkpoint = { hook_event_name: "PreToolUse", session_id: "SessionCase", tool_name: "Read" };
+let root_helper_calls = 0;
+for (const instruction of ["Fresh context 1", "Fresh context 2"]) {
+    const response = JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: instruction } });
+    assert.equal(await relay_hook(checkpoint, {
+        environment, spawn: fake_spawn(response, 0, "PreToolUse", event => {
+            ++root_helper_calls;
+            assert.deepEqual(event, checkpoint);
+        }),
+    }), response + "\n");
+}
+assert.equal(root_helper_calls, 2);
+for (const agent_id of ["child", "", null, false, 0, [], {}]) {
+    let helper_spawns = 0;
+    assert.equal(await relay_hook({ ...checkpoint, agent_id }, {
+        environment, spawn() { ++helper_spawns; throw new Error("unexpected helper spawn"); },
+    }), "");
+    assert.equal(helper_spawns, 0, `ordinary PreToolUse with agent_id=${JSON.stringify(agent_id)}`);
+}
+for (const event of [
+    { ...checkpoint, agent_id: "child", tool_name: "AskUserQuestion" },
+    { ...checkpoint, agent_id: "child", tool_name: "ExitPlanMode" },
+    { ...checkpoint, agent_id: "child", hook_event_name: "PostToolUse" },
+    { ...payload, agent_id: "child" },
+]) {
+    let helper_calls = 0;
+    assert.equal(await relay_hook(event, {
+        environment, spawn: fake_spawn("", 0, event.hook_event_name, forwarded => {
+            ++helper_calls;
+            assert.deepEqual(forwarded, event);
+        }),
+    }), "");
+    assert.equal(helper_calls, 1, `${event.hook_event_name} ${event.tool_name || ""} must reach the helper`);
+}
 for (const event_name of ["SessionStart", "SessionEnd"]) {
     assert.equal(await relay_hook({ hook_event_name: event_name, native_owner_pid: -1 }, {
         environment, spawn: fake_spawn("", 0, event_name, event => assert.equal(event.native_owner_pid, undefined)),
