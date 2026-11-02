@@ -306,10 +306,8 @@ void handle_probes(addon::Invocation_context& context, const std::filesystem::pa
                     result.cost = read_recorded_cost(*input->account_context, context);
                 }
                 catch (const std::exception&) {
-                    if (context.cancel_requested()) {
-                        context.fail(addon::Result_status::CANCELLED, "cancelled");
-                        return;
-                    }
+                    // Optional local evidence cannot cancel or replace the
+                    // completed core quota result, including on cancellation.
                     result.cost_failed = true;
                 }
             }

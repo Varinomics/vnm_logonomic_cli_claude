@@ -8,6 +8,7 @@
 #include <logonomic_cli_addon/package_source.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -18,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -69,7 +71,15 @@ class Context final : public addon::Invocation_context
 {
 public:
     const addon::Invoke_request& request() const override { return m_request; }
-    bool cancel_requested() const override { return m_cancelled; }
+    bool cancel_requested() const override
+    {
+        if (m_cancel_probe_delay.count() > 0) {
+            const auto delay = m_cancel_probe_delay;
+            m_cancel_probe_delay = std::chrono::milliseconds(0);
+            std::this_thread::sleep_for(delay);
+        }
+        return m_cancelled;
+    }
     bool wait_for_cancel(int) override { return m_cancelled; }
     void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
     void succeed(Json payload) override { m_payload = std::move(payload); m_finished = true; }
@@ -85,6 +95,8 @@ public:
     addon::Result_status  m_status = addon::Result_status::SUCCESS;
     bool                  m_finished = false;
     bool                  m_cancelled = false;
+
+    mutable std::chrono::milliseconds m_cancel_probe_delay{0};
 };
 
 addon::Account_context account_for(const fs::path& profile)
@@ -139,37 +151,18 @@ void expect_failure(const fs::path& profile, std::string_view reason)
     throw std::runtime_error("invalid cost evidence was accepted");
 }
 
-void native_snapshots(const fs::path& root)
+void unattributed_native_costs(const fs::path& root)
 {
     const auto profile = root / "native";
-    const auto first   = profile / "projects/repository/first.jsonl";
-    write(first, native_cost("first", 1.25) + native_cost("first", 2.5));
-    auto message = Json::object();
-    message.set("type", Json("assistant"));
-    message.set("sessionId", Json("second"));
-    message.set("message", Json(std::string(70 * 1024, 's')));
-    write(profile / "projects/repository/second.jsonl",
-        addon::serialize_json(message) + '\n' + native_cost("second", 4));
-    auto value = read(profile);
-    check(value && value->amount == 6.5 && value->estimated && value->currency == "USD" &&
-        value->label == "Recorded sessions" && !value->available,
-        "last native snapshots produce a scoped local estimate without a made-up balance");
-
-    write(first, native_cost("first", 3.5) + "{\"type\":\"cost-state\"");
-    value = read(profile);
-    check(value && value->amount == 7.5, "a changed transcript refreshes while its torn final line is ignored");
-    write(profile / "projects/repository/copy.jsonl", native_cost("first", 3.5));
-    check(read(profile)->amount == 7.5, "a copied ancestor cost is not charged to its receiving file");
-    write(profile / "projects/duplicate/first.jsonl", native_cost("first", 3.5));
-    check(read(profile)->amount == 7.5, "identical copies of the same session are counted once");
-    write(profile / "projects/duplicate/first.jsonl", native_cost("first", 3.75));
-    expect_failure(profile, "cost_session_conflict");
-
-    const auto fork = root / "fork";
-    write(fork / "projects/repository/child.jsonl",
-        "{\"type\":\"user\",\"sessionId\":\"child\",\"forkedFrom\":{\"sessionId\":\"parent\"}}\n" +
-        native_cost("child", 6));
-    expect_failure(fork, "cost_session_overlap");
+    write(profile / "projects/repository/session.jsonl", native_cost("session", 6.5));
+    check(!read(profile), "nominal native cost without per-session API billing is not reported as API consumption");
+    write(profile / "projects/repository/broken.jsonl", "not a valid transcript\n");
+    check(!read(profile), "unattributed native transcripts cannot cause an optional API cost failure");
+    write_receipt(profile, "review", 1.75);
+    const auto value = read(profile);
+    check(value && value->amount == 1.75 && value->estimated && value->currency == "USD" &&
+        value->label == "Recorded API runs" && !value->available,
+        "positive API run evidence does not relabel the profile's unrelated native history as spend");
 }
 
 void receipt_evidence(const fs::path& root)
@@ -184,11 +177,6 @@ void receipt_evidence(const fs::path& root)
     write_receipt(profile, "review", 6.6474);
     write_receipt(profile, "other", 1.5);
     check(std::abs(read(profile)->amount - 8.1474) < 1e-10, "recorded receipts contribute once per session");
-    write(profile / "projects/repository/review.jsonl", native_cost("review", 6.6474));
-    check(std::abs(read(profile)->amount - 8.1474) < 1e-10,
-        "a matching native snapshot and receipt are deduplicated");
-    write(profile / "projects/repository/review.jsonl", native_cost("review", 8));
-    expect_failure(profile, "cost_session_conflict");
 
     const auto wrong_profile = root / "wrong-profile";
     auto wrong = receipt(profile, "review", 5);
@@ -201,17 +189,9 @@ void receipt_evidence(const fs::path& root)
     write(invalid / "logonomic-cost-receipts/review.json", "{\"total_cost_usd\":1e400}");
     expect_failure(invalid, "cost_record_invalid");
 
-    const auto overlap = root / "receipt-with-native-overlap";
-    write(overlap / "projects/repository/child.jsonl",
-        "{\"type\":\"fork-context-ref\"}\n" + native_cost("child", 6));
-    write_receipt(overlap, "review", 1.75);
-    const auto reviews = read(overlap);
-    check(reviews && reviews->amount == 1.75 && reviews->label == "Recorded API runs",
-        "unusable native lineage leaves independently recorded reviews available with their narrower coverage");
-
     Context mismatched;
     auto wrong_account = account_for(profile);
-    wrong_account.adapter_account_key = account_for(overlap).adapter_account_key;
+    wrong_account.adapter_account_key = account_for(wrong_profile).adapter_account_key;
     bool refused = false;
     try {
         (void)claude::read_recorded_cost(wrong_account, mismatched);
@@ -244,6 +224,47 @@ addon::Probe_inspect_request inspect_request(const fs::path& profile, bool repor
     return request;
 }
 
+void optional_cost_failures(const fs::path& root)
+{
+    const auto profile = root / "optional";
+    write_receipt(profile, "review", 5.25);
+    for (const auto [cancelled, failed] : {std::pair{false, false}, std::pair{false, true},
+            std::pair{true, false}, std::pair{true, true}})
+    {
+        auto request = inspect_request(profile, true);
+        request.report_quota_failure = true;
+        request.inspection.exit_code = failed ? 1 : 0;
+        Context context;
+        context.m_request.capability = {"quota", 3};
+        context.m_request.operation   = "inspect";
+        context.m_request.payload     = addon::encode_probe_inspect_request(request, 2);
+        context.m_cancelled = cancelled;
+        if (!cancelled) {
+            // Occupy the optional read's local budget without depending on
+            // filesystem speed or a race against the host's five-second limit.
+            context.m_cancel_probe_delay = std::chrono::milliseconds(600);
+        }
+        claude::handle_probes(context, {});
+        const auto result = addon::decode_quota_inspect_result(context.m_payload, true, nullptr, 3);
+        check(context.finished() && context.m_status == addon::Result_status::SUCCESS && result &&
+            result->complete && result->observation && !result->cost && result->cost_failed,
+            "cancelled or budget-exhausted optional cost returns a completed result without a partial total");
+        if (failed) {
+            check(result->observation->state == addon::Quota_status::FAILED &&
+                result->failure_reason == addon::quota_failure_reason(addon::Quota_failure::PROCESS_FAILED) &&
+                result->diagnostic && result->diagnostic->code == 1,
+                "optional interruption preserves the completed core failure and diagnostic");
+        }
+        else {
+            check(result->observation->state == addon::Quota_status::UNAVAILABLE &&
+                !result->failure_reason && !result->diagnostic,
+                "optional interruption does not invent a core quota failure");
+        }
+    }
+    const auto value = read(profile);
+    check(value && value->amount == 5.25, "an interrupted optional read does not block subsequent account reads");
+}
+
 void packaged_dispatch(const fs::path& package, const fs::path& root)
 {
     const auto profile = root / "packaged";
@@ -269,8 +290,15 @@ void packaged_dispatch(const fs::path& package, const fs::path& root)
     check(!hidden.cost && !hidden.cost_failed, "costs leave the provider only after negotiation");
     const auto saved = dispatch(inspect_request(profile, true));
     check(saved.observation && saved.observation->state == addon::Quota_status::UNAVAILABLE &&
-        saved.cost && saved.cost->amount == 5.25 && !saved.cost_failed,
+        saved.cost && saved.cost->amount == 5.25 && saved.cost->label == "Recorded API runs" && !saved.cost_failed,
         "saved cost survives unavailable quota without using the fresh probe's zero");
+
+    const auto subscription_profile = root / "subscription";
+    write(subscription_profile / "projects/repository/session.jsonl", native_cost("session", 12.5));
+    const auto signed_out_subscription = dispatch(inspect_request(subscription_profile, true));
+    check(signed_out_subscription.observation->state == addon::Quota_status::UNAVAILABLE &&
+        !signed_out_subscription.cost && !signed_out_subscription.cost_failed,
+        "a signed-out subscription's nominal native costs do not become API spend or a new cost error");
 
     auto failed_probe = inspect_request(profile, true);
     failed_probe.report_quota_failure = true;
@@ -330,8 +358,9 @@ int main(int argc, char** argv)
     try {
         check(argc == 2, "cost tests require the built package directory");
         Temporary_directory fixture;
-        native_snapshots(fixture.path());
+        unattributed_native_costs(fixture.path());
         receipt_evidence(fixture.path());
+        optional_cost_failures(fixture.path());
         packaged_dispatch(addon::path_from_utf8(argv[1]), fixture.path());
         std::cout << "Claude recorded cost checks passed.\n";
         return 0;

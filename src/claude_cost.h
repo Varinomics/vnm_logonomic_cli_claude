@@ -7,9 +7,10 @@
 
 namespace claude {
 
-// Local recorded session estimates, without a claim about historical payer,
-// billing period, credit balance, or sessions whose costs were not saved.
-// Missing records return nothing; unreadable or conflicting evidence throws.
+// API-billed session estimates from profile-bound result receipts, without a
+// claim about billing period, credit balance, or runs whose costs were not saved.
+// Native snapshots do not establish billing. Missing receipts return nothing;
+// unreadable or incomplete evidence throws without publishing a partial total.
 std::optional<logonomic::cli_addon::Quota_cost> read_recorded_cost(
     const logonomic::cli_addon::Account_context& account,
     logonomic::cli_addon::Invocation_context& context);

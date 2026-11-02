@@ -135,6 +135,12 @@ dated series, reports that capability as unavailable; a malformed part fails
 only the capabilities that read it. These totals are reported apart from the
 transcript scan and are never added to it.
 
+The optional `quota-cost@1` capability reports estimated USD for recorded API
+runs from profile-bound result receipts that establish API billing for each
+session. Native transcript cost snapshots do not identify the historical payer
+and are not API consumption evidence. Missing receipts do not mean zero; these
+observations establish neither a billing period nor an available account balance.
+
 Delegated review and implementation use session contract version 3 and keep
 native stdin open through initialization and live status/catalog checks of
 each required host stdio server's initial connection. Pending discovery is
