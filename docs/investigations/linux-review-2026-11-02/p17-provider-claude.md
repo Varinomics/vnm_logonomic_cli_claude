@@ -1,9 +1,13 @@
 # P17 — Claude hooks and fixture portability
 
-Date: 2026-11-02  
-Owner: `Varinomics/vnm_logonomic_cli_claude`  
-Draft PR: https://github.com/Varinomics/vnm_logonomic_cli_claude/pull/7  
-Branch: `work/linux-review-20261102-p17-provider-claude`  
+Date: 2026-11-02
+
+Owner: `Varinomics/vnm_logonomic_cli_claude`
+
+Draft PR: https://github.com/Varinomics/vnm_logonomic_cli_claude/pull/7
+
+Branch: `work/linux-review-20261102-p17-provider-claude`
+
 Validated code commit: `8a2028036b6aa7811179d87c74fb7ab530cbc9f8`
 
 ## Outcome and continuation
