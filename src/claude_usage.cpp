@@ -424,7 +424,7 @@ std::string cache_path(const fs::path& path)
 {
     auto normalized = fs::absolute(path).lexically_normal();
 #ifdef _WIN32
-    const auto source = normalized.native();
+    const auto& source = normalized.native();
     const int size = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, source.data(),
         static_cast<int>(source.size()), nullptr, 0, nullptr, nullptr, 0);
     if (size <= 0) throw std::runtime_error("usage_cache_path_invalid");

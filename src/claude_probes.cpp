@@ -106,10 +106,10 @@ Usage_result usage_text(std::string_view bytes)
         }
     }
     if (structured) {
-        return *structured;
+        return std::move(*structured);
     }
     if (fallback) {
-        return *fallback;
+        return std::move(*fallback);
     }
     throw addon::Quota_failure::INVALID_RESPONSE;
 }
