@@ -105,29 +105,23 @@ logonomic_cli_addon_package_platform(CLAUDE_PLATFORM)
 set(CLAUDE_EXECUTABLE_SUFFIX "${CMAKE_EXECUTABLE_SUFFIX}")
 logonomic_cli_addon_package_directory(logonomic.cli.claude CLAUDE_PACKAGE_DIRECTORY)
 configure_file(package/logonomic-cli-addon.json.in generated/logonomic-cli-addon.json @ONLY)
-logonomic_cli_addon_package_indexer(claude_package_indexer claude_index_dependencies)
-set(claude_index_command ${claude_package_indexer} "${CLAUDE_PACKAGE_DIRECTORY}"
-    --third-party assets/claude.svg notices/lobe_icons_mit.txt provenance/lobe_icons.json)
-set(claude_runtime_inputs "")
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CLAUDE_RUNTIME_NOTICES_DIRECTORY "" CACHE PATH
         "Copyright/license files for external runtimes, named <library filename>.txt")
 endif()
+set(claude_index_options)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # The bridge also owns native fallback. Its HTTP runtime must travel with
-    # the package, so absence of a system libcurl cannot break ordinary launch.
-    foreach(target claude_adapter claude_helper claude_launch_bridge)
-        set_target_properties(${target} PROPERTIES
-            BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
-        target_link_options(${target} PRIVATE "LINKER:--disable-new-dtags")
-    endforeach()
-    configure_file(cmake/claude_package_runtime.cmake.in generated/package-runtime.cmake @ONLY)
-    set(claude_index_command "${CMAKE_COMMAND}"
-        "-DPACKAGE=${CLAUDE_PACKAGE_DIRECTORY}" "-DINDEX=$<TARGET_FILE:logonomic_cli_addon_index>"
-        -P "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime.cmake")
-    list(APPEND claude_runtime_inputs "${CMAKE_CURRENT_BINARY_DIR}/generated/package-runtime.cmake"
-        "$<TARGET_FILE:CURL::libcurl>")
-elseif(APPLE)
+    list(APPEND claude_index_options LINUX_RUNTIME
+        CONTROLLED_TARGETS claude_adapter claude_helper claude_launch_bridge)
+    if(CLAUDE_RUNTIME_NOTICES_DIRECTORY)
+        list(APPEND claude_index_options RUNTIME_NOTICES "${CLAUDE_RUNTIME_NOTICES_DIRECTORY}")
+    endif()
+endif()
+logonomic_cli_addon_package_indexer(claude_package_indexer claude_index_dependencies ${claude_index_options})
+set(claude_index_command ${claude_package_indexer} "${CLAUDE_PACKAGE_DIRECTORY}"
+    --third-party assets/claude.svg notices/lobe_icons_mit.txt provenance/lobe_icons.json)
+set(claude_runtime_inputs "")
+if(APPLE)
     find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
     logonomic_cli_addon_macos_runtime_deployer(CLAUDE_MACOS_RUNTIME_DEPLOYER)
     foreach(target claude_adapter claude_helper claude_launch_bridge)
