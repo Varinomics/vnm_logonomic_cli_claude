@@ -17,6 +17,7 @@
 #include <set>
 #include <sstream>
 #include <system_error>
+#include <utility>
 
 namespace claude {
 namespace addon = logonomic::cli_addon;
@@ -39,7 +40,7 @@ constexpr std::string_view k_prompt_suggestions = "--prompt-suggestions";
 std::string bounded_display_name(std::string_view value)
 {
     if (auto fitted = logonomic::cli_addon::fitted_display_name(value)) {
-        return *fitted;
+        return std::move(*fitted);
     }
     return "Claude";
 }

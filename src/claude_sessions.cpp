@@ -366,16 +366,17 @@ addon::Structured_inspect_result inspect_session(
         if (!parsed || !parsed->is_object()) return failed("invalid_structured_output");
         Json state = std::move(*parsed);
         const auto* initialized_value = state.find("initialized");
-        const auto pending_value = addon::decode_base64(text(state, "pending_base64"));
-        const auto result_value  = addon::decode_base64(text(state, "result_base64"));
+        auto pending_value = addon::decode_base64(text(state, "pending_base64"));
+        auto result_value  = addon::decode_base64(text(state, "result_base64"));
         if (!initialized_value || !initialized_value->is_boolean() || !pending_value || !result_value) {
             return failed("invalid_protocol_state");
         }
         bool initialized = initialized_value->as_boolean();
         std::string root_session = text(state, "root_session_id");
-        std::string pending = *pending_value + inspection.stdout_bytes;
+        std::string pending = std::move(*pending_value);
+        pending += inspection.stdout_bytes;
         bool pending_before_input = flag(state, "pending_before_input");
-        std::string answer = *result_value;
+        std::string answer = std::move(*result_value);
         const bool review = purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
         const auto initial_phase = text(state, "mcp_phase");
         if (!initial_phase.empty() && initial_phase != "released" && inspection.final) {
@@ -504,13 +505,13 @@ addon::Structured_inspect_result inspect_session(
             pending_before_input = true;
         }
         if (text(state, "mcp_phase") == "verified" && pending.find_first_not_of(" \t\r\n") == std::string::npos) {
-            const auto prompt = addon::decode_base64(text(state, "prompt_base64"));
+            auto prompt = addon::decode_base64(text(state, "prompt_base64"));
             if (!prompt || prompt->empty()) {
                 return failed("invalid_protocol_state");
             }
             Json message = Json::object();
             message.set("role", Json("user"));
-            message.set("content", Json(*prompt));
+            message.set("content", Json(std::move(*prompt)));
             Json frame = Json::object();
             frame.set("type", Json("user"));
             frame.set("session_id", Json(""));

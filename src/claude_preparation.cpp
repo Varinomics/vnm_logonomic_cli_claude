@@ -432,7 +432,7 @@ bool canonical_resume_directory(const std::string& directory)
     auto normalized = path.lexically_normal();
     if (normalized != normalized.root_path() && normalized.filename().empty()) normalized = normalized.parent_path();
     const auto bytes = normalized.generic_u8string();
-    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()) == directory;
+    return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()) == directory;
 }
 
 std::optional<std::vector<std::string>> prepared_argv(
