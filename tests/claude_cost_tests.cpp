@@ -228,7 +228,7 @@ void optional_cost_failures(const fs::path& root)
 {
     const auto profile = root / "optional";
     write_receipt(profile, "review", 5.25);
-    for (const auto [cancelled, failed] : {std::pair{false, false}, std::pair{false, true},
+    for (const auto& [cancelled, failed] : {std::pair{false, false}, std::pair{false, true},
             std::pair{true, false}, std::pair{true, true}})
     {
         auto request = inspect_request(profile, true);

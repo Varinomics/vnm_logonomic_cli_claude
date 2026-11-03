@@ -1111,7 +1111,10 @@ void wake_binding_contract()
             Json registration = Json::object();
             registration.set("provider_session_id", Json(session));
             registration.set("transition_nonce", Json(nonce));
-            std::ofstream(root / "registration.json", std::ios::binary) << addon::serialize_json(registration);
+            std::ofstream output(root / "registration.json", std::ios::binary);
+            output << addon::serialize_json(registration);
+            output.close();
+            require(static_cast<bool>(output), "wake fixture writes and closes its registration");
         };
         register_target("another-session", target.correlation.transition_nonce);
         unavailable();
@@ -1149,9 +1152,12 @@ void wake_binding_contract()
                             claimed.replace_extension(".claimed");
                             fs::rename(pending, claimed);
                             std::ifstream input(claimed, std::ios::binary);
+                            require(input.is_open(), "native wake fixture opens the claimed request");
                             const std::string bytes{
                                 std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+                            require(!input.bad(), "native wake fixture reads the claimed request");
                             received = addon::parse_json(bytes, addon::Json_parse_limits{}, nullptr);
+                            require(received.has_value(), "native wake fixture decodes the claimed request");
                             const auto response = operation == "inspect"
                                 ? addon::encode_session_wake_readiness({true, {}})
                                 : addon::encode_session_wake_notify_result(
@@ -1178,8 +1184,17 @@ void wake_binding_contract()
             if (bridge_error) {
                 std::rethrow_exception(bridge_error);
             }
-            require(received && claude::text(*received, "operation") == operation,
-                "matching session identity and nonce reach the native bridge");
+            const bool native_bridge_reached = received && claude::text(*received, "operation") == operation;
+            if (!native_bridge_reached) {
+                std::cerr << "wake bridge operation=" << operation
+                    << " status=" << static_cast<int>(invocation.m_status)
+                    << " reason=" << invocation.m_reason
+                    << " payload=" << addon::serialize_json(invocation.m_payload) << '\n';
+                for (const auto& entry : fs::directory_iterator(root)) {
+                    std::cerr << "wake bridge entry=" << claude::path_string(entry.path().filename()) << '\n';
+                }
+            }
+            require(native_bridge_reached, "matching session identity and nonce reach the native bridge");
             const auto* payload = received->find("payload");
             require(payload && payload->find("session") &&
                 payload->find("session")->as_object().size() == 1 && !payload->find("binding"),
