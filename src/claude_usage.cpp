@@ -1200,21 +1200,37 @@ struct Message_owner
 
 using Message_owners = std::map<std::string, Message_owner>;
 
-Message_owners assign_index_owners(Usage_index& index)
+template<class Insert_owner>
+void check_index_owners(const Usage_index& index, Insert_owner&& insert_owner)
 {
-    Message_owners owners;
     for (const auto& [source, indexed] : index.sources) {
-        std::set<std::string> ids;
+        std::set<std::string_view> ids;
         for (const auto& [id, session] : indexed.messages) {
             (void)session;
             ids.insert(id);
         }
         for (const auto& [id, session] : indexed.owners) {
-            if (!ids.contains(id) || !owners.emplace(id, Message_owner{source, session}).second) {
+            if (!ids.contains(id) || !insert_owner(source, id, session)) {
                 throw std::runtime_error("usage_cache_invalid");
             }
         }
     }
+}
+
+void validate_index_owners(const Usage_index& index)
+{
+    std::set<std::string_view> owned;
+    check_index_owners(index, [&](const auto&, const auto& id, const auto&) {
+        return owned.insert(id).second;
+    });
+}
+
+Message_owners assign_index_owners(Usage_index& index)
+{
+    Message_owners owners;
+    check_index_owners(index, [&](const auto& source, const auto& id, const auto& session) {
+        return owners.emplace(id, Message_owner{source, session}).second;
+    });
     for (auto& [source, indexed] : index.sources) {
         for (const auto& [id, session] : indexed.messages) {
             if (owners.try_emplace(id, Message_owner{source, session}).second) {
@@ -1356,7 +1372,7 @@ void handle_incremental_usage(addon::Invocation_context& context, const char*& s
         stage = "reading usage history and saving its candidate cache";
         File_cache updated;
         std::set<std::string> changed_ids;
-        Usage_index next_index = index;
+        std::optional<Usage_index> candidate_index;
         const auto files = transcript_files(profile, context);
         std::uint64_t processed = 0;
         for (const auto& file : files) {
@@ -1384,14 +1400,18 @@ void handle_incremental_usage(addon::Invocation_context& context, const char*& s
                     for (const auto& message : fresh.messages) {
                         changed_ids.insert(message.id);
                     }
-                    next_index.sources[source] = index_source(fresh);
+                    if (!candidate_index) {
+                        candidate_index.emplace(index);
+                    }
+                    candidate_index->sources[source] = index_source(fresh);
                     updated.emplace(source, std::move(fresh));
                 }
             }
             context.report_progress(++processed, files.size());
         }
         Repository_map current_repositories;
-        for (const auto& [source, indexed] : next_index.sources) {
+        const auto& observed_index = candidate_index ? *candidate_index : index;
+        for (const auto& [source, indexed] : observed_index.sources) {
             (void)source;
             for (const auto& cwd : indexed.directories) {
                 if (cancelled()) {
@@ -1409,16 +1429,22 @@ void handle_incremental_usage(addon::Invocation_context& context, const char*& s
                 }
             }
         }
-        next_index.repositories = std::move(current_repositories);
-        const auto owners = assign_index_owners(next_index);
-        apply_message_owners(updated, owners);
-        if (!adoption && updated.empty() && next_index.repositories == index.repositories) {
+        if (!adoption && updated.empty() && current_repositories == index.repositories) {
+            // Saved owners still need membership and uniqueness checks on an unchanged scan.
+            validate_index_owners(index);
             if (cancelled()) {
                 throw std::runtime_error("cancelled");
             }
             context.succeed(addon::encode_usage_incremental_result(result));
             return;
         }
+        if (!candidate_index) {
+            candidate_index.emplace(index);
+        }
+        auto& next_index = *candidate_index;
+        next_index.repositories = std::move(current_repositories);
+        const auto owners = assign_index_owners(next_index);
+        apply_message_owners(updated, owners);
         Snapshot snapshot;
         snapshot.profile = profile_key;
         snapshot.scope.observed_at_ms = now_ms();
