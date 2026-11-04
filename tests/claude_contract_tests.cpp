@@ -369,6 +369,9 @@ void launcher_discovery_contract()
         const auto executable = bin / "claude";
 #endif
         std::ofstream(executable).close();
+#ifndef _WIN32
+        fs::permissions(executable, fs::perms::owner_exec, fs::perm_options::add);
+#endif
         std::ofstream(selected / ".credentials.json") << "{}";
         std::ofstream(sibling / ".credentials.json") << "{}";
         std::ofstream(long_profile / ".credentials.json") << "{}";
@@ -475,6 +478,7 @@ void launcher_discovery_candidate_limit()
 #else
         const std::string platform = addon::host_platform_id();
         std::ofstream(bin / "claude").close();
+        fs::permissions(bin / "claude", fs::perms::owner_exec, fs::perm_options::add);
 #endif
         std::ofstream(selected / ".credentials.json") << "{}";
         for (int i = 0; i < 24; ++i) {
@@ -531,6 +535,7 @@ void launcher_discovery_scan_limit()
 #else
         const std::string platform = addon::host_platform_id();
         std::ofstream(bin / "claude").close();
+        fs::permissions(bin / "claude", fs::perms::owner_exec, fs::perm_options::add);
 #endif
         std::ofstream(selected / ".credentials.json") << "{}";
         for (std::size_t i = 0; i < scan_limit + 8; ++i) {

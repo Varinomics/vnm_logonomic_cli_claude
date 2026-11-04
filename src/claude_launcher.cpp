@@ -331,114 +331,101 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
     const logonomic::cli_addon::Discover_request& request)
 {
     namespace fs = std::filesystem;
-    const auto path = text(request.ambient_environment, "PATH");
     const bool windows = request.platform_id == "windows-x86_64";
-    std::istringstream directories(path);
-    std::string directory;
-    while (std::getline(directories, directory, windows ? ';' : ':')) {
-        if (directory.empty()) {
-            continue;
+    const auto program = addon::resolve_program("claude", addon::environment_pairs(request.ambient_environment),
+        {}, Launcher_whitespace::ASCII);
+    if (!program) return {};
+    const auto runner = addon::preferred_discovery_runner(*program, windows ? "cmd" : "direct");
+    std::vector<addon::Launcher_candidate> launchers;
+    auto selected = text(request.ambient_environment, "CLAUDE_CONFIG_DIR");
+    if (selected.empty()) {
+        auto home = text(request.ambient_environment, windows ? "USERPROFILE" : "HOME");
+        if (home.empty()) home = request.default_home_fallback;
+        if (!home.empty()) selected = path_string(addon::path_from_utf8(home) / ".claude");
+    }
+    std::vector<fs::path> profiles;
+    std::set<std::string> canonical_profiles;
+    std::optional<std::string> selected_profile_identity;
+    const auto selected_path = addon::path_from_utf8(selected);
+    const auto add_profile = [&](const fs::path& profile) {
+        const std::string profile_path = path_string(profile.lexically_normal());
+        const std::string environment_text = "CLAUDE_CONFIG_DIR=" + profile_path;
+        if (!is_valid_claude_config_environment_text(environment_text)) {
+            return;
         }
-        for (const auto& suffix : windows ? std::vector<std::string>{".exe", ".cmd", ".ps1", ".bat"}
-                                         : std::vector<std::string>{""})
-        {
-            const auto candidate = addon::path_from_utf8(directory) / ("claude" + suffix);
-            std::error_code error;
-            if (fs::is_regular_file(candidate, error) && !error) {
-                std::vector<addon::Launcher_candidate> launchers;
-                auto selected = text(request.ambient_environment, "CLAUDE_CONFIG_DIR");
-                if (selected.empty()) {
-                    auto home = text(request.ambient_environment, windows ? "USERPROFILE" : "HOME");
-                    if (home.empty()) home = request.default_home_fallback;
-                    if (!home.empty()) selected = path_string(addon::path_from_utf8(home) / ".claude");
-                }
-                std::vector<fs::path> profiles;
-                std::set<std::string> canonical_profiles;
-                std::optional<std::string> selected_profile_identity;
-                const auto selected_path = addon::path_from_utf8(selected);
-                const auto add_profile = [&](const fs::path& profile) {
-                    const std::string profile_path = path_string(profile.lexically_normal());
-                    const std::string environment_text = "CLAUDE_CONFIG_DIR=" + profile_path;
-                    if (!is_valid_claude_config_environment_text(environment_text)) {
-                        return;
-                    }
-                    std::error_code canonical_error;
-                    const auto canonical = fs::canonical(profile, canonical_error);
-                    if (canonical_error) {
-                        return;
-                    }
-                    const std::string identity = path_string(canonical);
-                    if (!canonical_profiles.insert(identity).second) {
-                        return;
-                    }
-                    profiles.push_back(profile);
-                    if (profile == selected_path) {
-                        selected_profile_identity = identity;
-                    }
-                };
-                if (selected_path.is_absolute()) {
-                    // A profile that cannot be checked, such as one on an unreachable
-                    // share, is not a candidate: it must not fail the discovery of
-                    // the launcher. A folder that cannot be read is skipped.
-                    std::error_code profile_error;
-                    if (fs::is_regular_file(selected_path / ".credentials.json", profile_error)) {
-                        add_profile(selected_path);
-                    }
-                    const auto parent = selected_path.parent_path();
-                    if (fs::is_directory(parent, profile_error)) {
-                        std::size_t scanned_entries = 0;
-                        for (fs::directory_iterator entry(parent, profile_error), end;
-                            !profile_error && entry != end &&
-                            scanned_entries < k_max_profile_directory_entries_to_scan;
-                            entry.increment(profile_error), ++scanned_entries)
-                        {
-                            const auto profile = entry->path();
-                            std::error_code entry_error;
-                            if (entry->is_directory(entry_error) && path_string(profile.filename()).starts_with(".claude") &&
-                                fs::is_regular_file(profile / ".credentials.json", entry_error))
-                            {
-                                add_profile(profile);
-                                if (profiles.size() == addon::limits::k_max_discovery_candidates) {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                for (const auto& profile : profiles) {
-                    if (launchers.size() == addon::limits::k_max_discovery_candidates) {
+        std::error_code canonical_error;
+        const auto canonical = fs::canonical(profile, canonical_error);
+        if (canonical_error) {
+            return;
+        }
+        const std::string identity = path_string(canonical);
+        if (!canonical_profiles.insert(identity).second) {
+            return;
+        }
+        profiles.push_back(profile);
+        if (profile == selected_path) {
+            selected_profile_identity = identity;
+        }
+    };
+    if (selected_path.is_absolute()) {
+        // A profile that cannot be checked, such as one on an unreachable
+        // share, is not a candidate: it must not fail the discovery of
+        // the launcher. A folder that cannot be read is skipped.
+        std::error_code profile_error;
+        if (fs::is_regular_file(selected_path / ".credentials.json", profile_error)) {
+            add_profile(selected_path);
+        }
+        const auto parent = selected_path.parent_path();
+        if (fs::is_directory(parent, profile_error)) {
+            std::size_t scanned_entries = 0;
+            for (fs::directory_iterator entry(parent, profile_error), end;
+                !profile_error && entry != end &&
+                scanned_entries < k_max_profile_directory_entries_to_scan;
+                entry.increment(profile_error), ++scanned_entries)
+            {
+                const auto profile = entry->path();
+                std::error_code entry_error;
+                if (entry->is_directory(entry_error) && path_string(profile.filename()).starts_with(".claude") &&
+                    fs::is_regular_file(profile / ".credentials.json", entry_error))
+                {
+                    add_profile(profile);
+                    if (profiles.size() == addon::limits::k_max_discovery_candidates) {
                         break;
                     }
-                    const std::string profile_path = path_string(profile.lexically_normal());
-                    const std::string environment_text = "CLAUDE_CONFIG_DIR=" + profile_path;
-                    if (!is_valid_claude_config_environment_text(environment_text)) continue;
-                    std::error_code canonical_error;
-                    const auto canonical = fs::canonical(profile, canonical_error);
-                    if (canonical_error) continue;
-                    const bool is_selected = selected_profile_identity &&
-                        path_string(canonical) == *selected_profile_identity;
-                    std::string profile_label = path_string(profile.filename());
-                    if (profile_label.starts_with(".claude")) profile_label.erase(0, 7);
-                    while (!profile_label.empty() &&
-                        (profile_label.front() == '-' || profile_label.front() == '_' || profile_label.front() == '.'))
-                    {
-                        profile_label.erase(0, 1);
-                    }
-                    for (char& ch : profile_label) {
-                        if (ch == '-' || ch == '_' || ch == '.') ch = ' ';
-                    }
-                    launchers.push_back({"profile_" + account_key(profile).substr(8, 24),
-                        bounded_display_name(profile_label.empty() ? "Claude" : "Claude " + profile_label),
-                        "claude", windows ? "cmd" : "direct",
-                        environment_text, is_selected, addon::Json_value::object()});
                 }
-                if (launchers.empty()) launchers.push_back({"interactive", "Claude", "claude", windows ? "cmd" : "direct",
-                    "", true, addon::Json_value::object()});
-                return launchers;
             }
         }
     }
-    return {};
+    for (const auto& profile : profiles) {
+        if (launchers.size() == addon::limits::k_max_discovery_candidates) {
+            break;
+        }
+        const std::string profile_path = path_string(profile.lexically_normal());
+        const std::string environment_text = "CLAUDE_CONFIG_DIR=" + profile_path;
+        if (!is_valid_claude_config_environment_text(environment_text)) continue;
+        std::error_code canonical_error;
+        const auto canonical = fs::canonical(profile, canonical_error);
+        if (canonical_error) continue;
+        const bool is_selected = selected_profile_identity &&
+            path_string(canonical) == *selected_profile_identity;
+        std::string profile_label = path_string(profile.filename());
+        if (profile_label.starts_with(".claude")) profile_label.erase(0, 7);
+        while (!profile_label.empty() &&
+            (profile_label.front() == '-' || profile_label.front() == '_' || profile_label.front() == '.'))
+        {
+            profile_label.erase(0, 1);
+        }
+        for (char& ch : profile_label) {
+            if (ch == '-' || ch == '_' || ch == '.') ch = ' ';
+        }
+        launchers.push_back({"profile_" + account_key(profile).substr(8, 24),
+            bounded_display_name(profile_label.empty() ? "Claude" : "Claude " + profile_label),
+            "claude", runner,
+            environment_text, is_selected, addon::Json_value::object()});
+    }
+    if (launchers.empty()) launchers.push_back({"interactive", "Claude", "claude", runner,
+        "", true, addon::Json_value::object()});
+    return launchers;
 }
 
 } // namespace claude
