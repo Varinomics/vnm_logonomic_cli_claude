@@ -617,6 +617,171 @@ void many_messages_contract(const fs::path& fixture)
     fs::remove_all(profile);
 }
 
+void incremental_unchanged_contract(const fs::path& fixture)
+{
+    const auto profile = fixture / "native-profile";
+    const auto source = profile / "projects/project/a.jsonl";
+    const auto other = profile / "projects/project/b.jsonl";
+    const auto copy = profile / "projects/project/z.jsonl";
+    const auto repository = fixture / "repository";
+    fs::create_directories(repository);
+    const auto record = [&](std::string_view session, std::string_view id, unsigned tokens) {
+        auto value = addon::parse_json(assistant_record(session, id, tokens), {}, nullptr);
+        check(value.has_value(), "unchanged fixture record parses");
+        value->set("cwd", addon::Json_value(addon::path_to_utf8(repository)));
+        return addon::serialize_json(*value) + '\n';
+    };
+    write(source, record("main", "shared", 10) + record("main", "private", 2));
+    write(other, record("other", "other-message", 7));
+    write(copy, record("copy", "shared", 10));
+
+    const auto account = claude::account_key(profile);
+    std::string error;
+    const auto allocated = addon::allocate_profile_storage_root(
+        fixture / "host-storage", "logonomic.cli.claude", &error, account);
+    check(allocated.has_value(), error);
+    addon::Usage_scan_request request;
+    request.context.launcher = {"claude", addon::k_runner_direct, {}};
+    request.context.launcher_argv = {"claude"};
+    request.context.profile_storage = addon::Profile_storage_context{1, *allocated};
+    request.context.account_context = addon::Account_context{2, account, addon::path_to_utf8(profile)};
+    request.context.launch_environment = addon::Launch_environment{
+        addon::host_platform_id(), addon::Json_value::object(),
+        addon::Environment_bootstrap_evidence{addon::path_to_utf8(profile)}};
+    unsigned generation = 0;
+    const auto select = [&](std::optional<addon::Usage_cache_reference> accepted) {
+        const auto root = addon::path_from_utf8(*allocated) / ("generation-" + std::to_string(++generation));
+        fs::create_directories(root);
+        request.cache_selection = addon::Usage_cache_selection{std::move(accepted), addon::path_to_utf8(root)};
+    };
+    const auto invoke = [&](bool incremental) {
+        test::Throwing_invocation_context context;
+        context.m_request.capability = {incremental ? "usage-incremental" : "usage-scan",
+            static_cast<std::uint16_t>(incremental ? 1 : 3)};
+        context.m_request.operation = "scan";
+        context.m_request.payload = incremental ? addon::encode_usage_incremental_request(request) :
+            addon::encode_usage_scan_request(request, 3);
+        claude::handle_usage(context);
+        check(context.m_result.has_value(), "direct usage invocation finishes");
+        return *context.m_result;
+    };
+    addon::Contract_failure failure;
+    const auto scan = [&] {
+        const auto result = addon::decode_usage_incremental_result(invoke(true), &failure);
+        check(result.has_value(), failure.detail);
+        check(result->baseline == *request.cache_selection->accepted, "unchanged result binds its baseline");
+        return *result;
+    };
+    const auto check_unchanged = [&](const addon::Usage_cache_reference& accepted) {
+        select(accepted);
+        check(!scan().changes && fs::is_empty(addon::path_from_utf8(request.cache_selection->candidate_root)),
+            "unchanged scan neither exports records nor writes a candidate");
+    };
+    select(std::nullopt);
+    const auto first = addon::decode_usage_scan_result(invoke(false), &failure, 3);
+    check(first && first->cache_candidate, "complete scan creates the seed cache");
+    select(first->cache_candidate);
+    const auto adopted = scan();
+    check(adopted.changes && adopted.changes->records.size() == 2 && adopted.changes->cache_candidate,
+        "adoption still publishes the complete deduplicated observations");
+    auto accepted = *adopted.changes->cache_candidate;
+    check_unchanged(accepted);
+
+    // Reseal each altered index so admission reaches semantic ownership checks,
+    // independently of the manifest's file-integrity check.
+    const auto altered_index = [&](std::string_view alteration) {
+        const auto root = addon::path_from_utf8(*allocated) / std::string(alteration);
+        const auto io_root = addon::usage_cache_io_path(root);
+        fs::copy(addon::usage_cache_io_path(addon::path_from_utf8(accepted.root)), io_root,
+            fs::copy_options::recursive);
+        check(fs::remove(io_root / "cache-manifest.json"), "remove copied manifest before resealing");
+        std::ifstream input(io_root / "index.jsonl", std::ios::binary);
+        std::string line;
+        std::string contents;
+        bool changed = false;
+        while (std::getline(input, line)) {
+            auto value = addon::parse_json(line, {}, nullptr);
+            check(value.has_value(), "saved index row parses");
+            const auto* path = value->find("path");
+            const auto target = alteration == "continued-owner" ? source : copy;
+            if (path && fs::equivalent(addon::path_from_utf8(path->as_string()), target)) {
+                changed = true;
+                if (alteration == "continued-owner") {
+                    auto messages = *value->find("messages");
+                    value->set("messages", addon::Json_value::array());
+                    contents += addon::serialize_json(*value) + '\n';
+                    auto continued = addon::Json_value::object();
+                    continued.set("path", *path);
+                    continued.set("messages", std::move(messages));
+                    continued.set("directories", addon::Json_value::array());
+                    continued.set("owners", addon::Json_value::array());
+                    value = std::move(continued);
+                }
+                else {
+                    auto owner = addon::Json_value::array();
+                    owner.push_back(addon::Json_value(alteration == "orphan-owner" ? "absent" : "shared"));
+                    owner.push_back(addon::Json_value("copy"));
+                    auto owners = addon::Json_value::array();
+                    owners.push_back(std::move(owner));
+                    value->set("owners", std::move(owners));
+                }
+            }
+            contents += addon::serialize_json(*value) + '\n';
+        }
+        check(input.eof() && changed, "altered index targets its saved source");
+        input.close();
+        write(io_root / "index.jsonl", contents);
+        const auto sealed = addon::seal_usage_cache_candidate(addon::path_to_utf8(root), *allocated,
+            request.context.account_context, accepted.snapshot_id, "claude-message-pieces@1",
+            [] { return false; }, &failure);
+        check(sealed.has_value(), failure.detail);
+        return *sealed;
+    };
+    for (const auto* alteration : {"orphan-owner", "duplicate-owner"}) {
+        select(altered_index(alteration));
+        bool rejected = false;
+        try {
+            (void)scan();
+        }
+        catch (const std::runtime_error& caught) {
+            rejected = std::string_view(caught.what()) == "usage_cache_invalid";
+        }
+        check(rejected && fs::is_empty(addon::path_from_utf8(request.cache_selection->candidate_root)),
+            "unchanged scan rejects invalid saved ownership without a candidate");
+    }
+    check_unchanged(altered_index("continued-owner"));
+
+    write(profile / "projects/project/0.jsonl", record("earlier-copy", "shared", 10));
+    select(accepted);
+    auto changed = scan();
+    check(changed.changes && changed.changes->records.empty() && changed.changes->cache_candidate,
+        "new duplicate keeps its accepted owner while publishing changed cache metadata");
+    accepted = *changed.changes->cache_candidate;
+    write(source, record("main", "shared", 10) + record("main", "private", 2) + record("main", "append", 3));
+    select(accepted);
+    changed = scan();
+    check(changed.changes && changed.changes->records.size() == 1 &&
+        changed.changes->records.front().record_id == "main" &&
+        changed.changes->records.front().total_tokens == 15, "changed source exports its coherent owned session");
+    accepted = *changed.changes->cache_candidate;
+    check(fs::remove(other), "remove the retained source");
+    check_unchanged(accepted);
+    fs::create_directories(repository / ".git");
+    select(accepted);
+    changed = scan();
+    check(changed.changes && changed.changes->records.size() == 2,
+        "repository-only refresh still exports both live and retained sessions");
+    for (const auto& usage : changed.changes->records) {
+        check(usage.repository_usage && usage.repository_usage->allocations.size() == 1 &&
+            usage.repository_usage->allocations.front().repository_path == addon::path_to_utf8(repository),
+            "repository attribution is refreshed");
+    }
+    accepted = *changed.changes->cache_candidate;
+    check_unchanged(accepted);
+    check(addon::validate_usage_cache_candidate(accepted, *allocated, request.context.account_context,
+        [] { return false; }, &failure).has_value(), "accepted generation remains self-contained");
+}
+
 void incremental_cache_contract(const fs::path& package, const fs::path& fixture)
 {
     const auto profile = fixture / "native-profile";
@@ -987,6 +1152,7 @@ int main(int argc, char** argv)
     const auto package = addon::path_from_utf8(argv[1]);
     run("adapter cache", [&package](const fs::path& fixture) { adapter_cache_contract(package, fixture); });
     run("incremental cache", [&package](const fs::path& fixture) { incremental_cache_contract(package, fixture); });
+    run("unchanged incremental cache", incremental_unchanged_contract);
     run("bounded cache lines", bounded_cache_lines_contract);
     run("live transcript", live_transcript_contract);
     run("cancelled scan", cancelled_scan_contract);
