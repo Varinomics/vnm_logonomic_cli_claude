@@ -691,9 +691,11 @@ void incremental_unchanged_contract(const fs::path& fixture)
     // independently of the manifest's file-integrity check.
     const auto altered_index = [&](std::string_view alteration) {
         const auto root = addon::path_from_utf8(*allocated) / std::string(alteration);
-        fs::copy(addon::path_from_utf8(accepted.root), root, fs::copy_options::recursive);
-        check(fs::remove(root / "cache-manifest.json"), "remove copied manifest before resealing");
-        std::ifstream input(root / "index.jsonl", std::ios::binary);
+        const auto io_root = addon::usage_cache_io_path(root);
+        fs::copy(addon::usage_cache_io_path(addon::path_from_utf8(accepted.root)), io_root,
+            fs::copy_options::recursive);
+        check(fs::remove(io_root / "cache-manifest.json"), "remove copied manifest before resealing");
+        std::ifstream input(io_root / "index.jsonl", std::ios::binary);
         std::string line;
         std::string contents;
         bool changed = false;
@@ -702,14 +704,14 @@ void incremental_unchanged_contract(const fs::path& fixture)
             check(value.has_value(), "saved index row parses");
             const auto* path = value->find("path");
             const auto target = alteration == "continued-owner" ? source : copy;
-            if (path && path->as_string() == addon::path_to_utf8(target)) {
+            if (path && fs::equivalent(addon::path_from_utf8(path->as_string()), target)) {
                 changed = true;
                 if (alteration == "continued-owner") {
                     auto messages = *value->find("messages");
                     value->set("messages", addon::Json_value::array());
                     contents += addon::serialize_json(*value) + '\n';
                     auto continued = addon::Json_value::object();
-                    continued.set("path", addon::Json_value(addon::path_to_utf8(target)));
+                    continued.set("path", *path);
                     continued.set("messages", std::move(messages));
                     continued.set("directories", addon::Json_value::array());
                     continued.set("owners", addon::Json_value::array());
@@ -728,7 +730,7 @@ void incremental_unchanged_contract(const fs::path& fixture)
         }
         check(input.eof() && changed, "altered index targets its saved source");
         input.close();
-        write(root / "index.jsonl", contents);
+        write(io_root / "index.jsonl", contents);
         const auto sealed = addon::seal_usage_cache_candidate(addon::path_to_utf8(root), *allocated,
             request.context.account_context, accepted.snapshot_id, "claude-message-pieces@1",
             [] { return false; }, &failure);
