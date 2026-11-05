@@ -1,4 +1,5 @@
 #include "claude_conversation.h"
+#include "claude_conversation_native.h"
 
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/package_source.h>
@@ -364,7 +365,7 @@ bool source_lookup(const fs::path& root, addon::Conversation_export_request requ
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     // Oracle: Anthropic Agent SDK transcript parent chains and parallel tool
     // recovery. A response has separate UUIDs for blocks sharing message.id.
@@ -372,6 +373,11 @@ int main()
     auto root = fs::temp_directory_path() / ("claude-conversation-" + addon::random_nonce_hex());
     fs::create_directories(root);
     root = fs::canonical(root);
+    if (argc == 3 && std::string_view(argv[1]) == "--export-equivalence") {
+        const bool ok = claude_native_test::export_equivalence(root, addon::path_from_utf8(argv[2]));
+        fs::remove_all(root);
+        return ok ? 0 : 1;
+    }
     const auto profile = root / "profile";
     const auto source = profile / "projects/project-a/session-a.jsonl";
     const std::string body =
@@ -498,6 +504,8 @@ int main()
     ok &= check(!claude::export_conversation(request, {}, &failure) &&
         failure.reason_code == "conversation_source_ambiguous", "ambiguous source is not guessed");
     ok &= source_lookup(root, request);
+    ok &= claude_native_test::filesystem(root);
+    ok &= claude_native_test::export_equivalence(root / "equivalence-profile", root / "equivalence-output");
     fs::remove_all(root);
     return ok ? 0 : 1;
 }
