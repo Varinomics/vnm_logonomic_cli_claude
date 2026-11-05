@@ -10,6 +10,16 @@ The provider uses the original account profile or frozen `CLAUDE_CONFIG_DIR`,
 a nested subagent transcript or another account's history. The host's managed
 profile-storage directory is not Claude's native profile.
 
+Lookup probes `<session-id>.jsonl` in each project without listing unrelated
+transcripts. The ID must form one filename component; path separators and
+Windows drive/stream syntax are refused. Its spelling is preserved. Filename
+resolution follows the filesystem's case rules, while native `sessionId`
+validation remains exact. On a case-insensitive filesystem, a differently cased
+filename may therefore be a candidate; candidates in multiple projects remain
+ambiguous. Regular-file symlinks are followed. Missing or non-regular candidates
+are ignored; genuine status/access errors still fail extraction. A known file
+can be read without requiring permission to list its containing project.
+
 The latest main conversation leaf selects a `parentUuid` chain. Rewinds and
 other leaves remain outside that chain. Forks already contain their copied
 history, so the provider does not follow `forkedFrom` into the parent file.

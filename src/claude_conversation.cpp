@@ -80,8 +80,10 @@ std::optional<fs::path> source_file(const fs::path& profile, std::string_view id
 {
     const auto root = profile / "projects";
     std::optional<fs::path> source;
-    if (fs::is_directory(root)) {
-        const auto name = std::string(id) + ".jsonl";
+    // The request decoder validates text; lookup must also stay within one
+    // filename component, including on Windows (drive and stream syntax).
+    if (id.find_first_of("/\\:") == std::string_view::npos && fs::is_directory(root)) {
+        const auto name = addon::path_from_utf8(std::string(id) + ".jsonl");
         for (const auto& project : fs::directory_iterator(root)) {
             if (cancelled && cancelled()) {
                 fail(failure, "cancelled", "Conversation extraction was cancelled.");
@@ -92,17 +94,16 @@ std::optional<fs::path> source_file(const fs::path& profile, std::string_view id
             }
             // Only the project's own session file is authoritative. Nested
             // subagent files may carry the same sessionId as the parent.
-            for (const auto& entry : fs::directory_iterator(project.path())) {
-                if (addon::path_to_utf8(entry.path().filename()) != name || !entry.is_regular_file()) {
-                    continue;
-                }
-                if (source) {
-                    fail(failure, "conversation_source_ambiguous",
-                        "Several native files name this Claude conversation.");
-                    return {};
-                }
-                source = entry.path();
+            const auto candidate = project.path() / name;
+            if (!fs::is_regular_file(candidate)) {
+                continue;
             }
+            if (source) {
+                fail(failure, "conversation_source_ambiguous",
+                    "Several native files name this Claude conversation.");
+                return {};
+            }
+            source = candidate;
         }
     }
     if (!source) {
