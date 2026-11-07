@@ -20,25 +20,69 @@ function put(value, suffix = 'request') {
     fs.writeFileSync(path.join(directory, value.id + '.' + suffix), JSON.stringify(value));
 }
 async function claim(value) {
-    const received = main(['listen', directory], '');
+    const received = main(['listen', directory], JSON.stringify(registration));
     put(value);
     assert.deepEqual(await received, value);
     return value;
 }
 
 async function run() {
+    // Native registration creates its directory before writing and renaming
+    // registration.json. Allocation alone must leave binding pending.
+    const allocated = path.join(directory, 'a'.repeat(32));
+    fs.mkdirSync(allocated);
+    let settled = false;
+    const publication = main(['binding', allocated], JSON.stringify({ session_id: 'native-root' })).then(
+        value => { settled = true; return { value }; },
+        error => { settled = true; return { error }; });
+    await Promise.resolve();
+    assert.equal(settled, false, 'an allocated directory is not a published registration');
+    const temporary = path.join(allocated, 'c'.repeat(32) + '.registration');
+    fs.writeFileSync(temporary, JSON.stringify(registration));
+    fs.renameSync(temporary, path.join(allocated, 'registration.json'));
+    assert.deepEqual(await publication, { value: registration });
+    await main(['close', allocated], '');
+
     const delayed = path.join(directory, 'd'.repeat(32));
-    const startup = main(['ready', delayed], JSON.stringify({ session_id: 'native-root' }));
+    const startup = main(['binding', delayed], JSON.stringify({ session_id: 'native-root' }));
     assert.equal(fs.existsSync(delayed), false);
     fs.mkdirSync(delayed);
-    assert.deepEqual(await startup, { completed: true });
+    fs.writeFileSync(path.join(delayed, 'registration.json'), JSON.stringify(registration));
+    assert.deepEqual(await startup, registration);
     await main(['close', delayed], '');
     assert.equal(fs.existsSync(delayed), false);
     fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify(registration));
-    assert.deepEqual(await main(['inspect-dispatch', directory], JSON.stringify({ session_id: 'native-root' })), { available: false });
-    await main(['ready', directory], JSON.stringify({ session_id: 'native-root' }));
-    assert.deepEqual(await main(['inspect-dispatch', directory], JSON.stringify({ session_id: 'native-root' })), { available: true });
-    assert.deepEqual(await main(['inspect-dispatch', directory], JSON.stringify({ session_id: 'other-root' })), { available: false });
+    assert.deepEqual(await main(['binding', directory], JSON.stringify({ session_id: 'native-root' })), registration);
+    await assert.rejects(main(['binding', directory], JSON.stringify({ session_id: 'other-root' })), /identity_changed/);
+    assert.deepEqual(await main(['inspect-dispatch', directory], JSON.stringify(registration)), { available: false });
+    await main(['ready', directory], JSON.stringify(registration));
+    assert.deepEqual(await main(['inspect-dispatch', directory], JSON.stringify(registration)), { available: true });
+    assert.deepEqual(await main(['inspect-dispatch', directory], JSON.stringify({ ...registration, provider_session_id: 'other-root' })), { available: false });
+
+    // A live consumer from the departing activation must not claim the next
+    // activation's request, even when the native ID has returned to A.
+    const departed_binding = { ...registration };
+    const departed_listener = main(['listen', directory], JSON.stringify(departed_binding));
+    registration.transition_nonce = 'a'.repeat(32);
+    fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify(registration));
+    assert.deepEqual(await main(['inspect-dispatch', directory], JSON.stringify(registration)), { available: false });
+    await assert.rejects(main(['ready', directory], JSON.stringify(departed_binding)), /identity_changed/);
+    const successor = request('successor');
+    put(successor);
+    await assert.rejects(departed_listener, /identity_changed/);
+    assert.equal(fs.existsSync(path.join(directory, successor.id + '.request')), true);
+    assert.deepEqual(await main(['listen', directory], JSON.stringify(registration)), successor);
+    await main(['reply', directory, successor.id], JSON.stringify({ disposition: 'deferred', reason: 'fixture' }));
+
+    const departed_dispatcher = main(['receive', directory], JSON.stringify(registration));
+    registration.transition_nonce = 'd'.repeat(32);
+    fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify(registration));
+    const next_submission = request('successor-submission');
+    put(next_submission, 'submit');
+    await assert.rejects(departed_dispatcher, /identity_changed/);
+    assert.equal(fs.existsSync(path.join(directory, next_submission.id + '.submit')), true);
+    assert.deepEqual(await main(['receive', directory], JSON.stringify(registration)), next_submission);
+    await main(['native-reply', directory, next_submission.id], JSON.stringify({ drop: 'fixture' }));
 
     const stale = request();
     stale.payload.correlation.transition_nonce = 'c'.repeat(32);
@@ -46,11 +90,11 @@ async function run() {
     const expired = request('expired', -1);
     put(expired);
     const notice = await claim(request('once'));
-    assert.equal(fs.existsSync(path.join(directory, stale.id + '.request')), false);
+    assert.equal(fs.existsSync(path.join(directory, stale.id + '.request')), true, 'a consumer never deletes another activation\'s live request');
     assert.equal(fs.existsSync(path.join(directory, expired.id + '.request')), false);
     assert.deepEqual(await main(['reserve', directory, notice.id], ''), { reserved: true });
     const submitting = main(['submit', directory, notice.id], '');
-    assert.deepEqual(await main(['receive', directory], ''), notice);
+    assert.deepEqual(await main(['receive', directory], JSON.stringify(registration)), notice);
     assert.deepEqual(await main(['activate', directory, notice.id], ''), { available: true });
     assert.deepEqual(await main(['guard-request', directory], ''), notice);
     const native = { text: notice.payload.instruction, origin: { kind: 'plugin', name: 'logonomic-wake-dispatch' } };

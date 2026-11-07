@@ -1,12 +1,28 @@
 // Only public Claude Mods APIs are used here. Claude Code owns submission,
 // attribution, permission prompts and cancellation of the running model turn.
-let active = false;
-let busy = false;
-let paused = true;
 let directory;
-let native_id;
+let interactive = false;
+let activation = { active: false, busy: false, paused: true };
 
-async function report_context($, session_id, payload) {
+function replace_activation(session_id, start_pending = false) {
+    activation.active = false;
+    activation = { session_id, start_pending, active: false, busy: false, paused: true };
+    return activation;
+}
+
+async function matches_activation($, current) {
+    return current === activation && current.session_id &&
+        await $.session.id() === current.session_id && current === activation;
+}
+
+function start_listener($, current) {
+    if (current !== activation || current.start_pending || current.active || !directory || !interactive) return;
+    current.active = true;
+    $.clock.after(0, () => listen($, current));
+}
+
+async function report_context($, current, payload) {
+    if (current !== activation || !current.session_id) return;
     let context_state = { usage_unavailable: true };
     try {
         const usage   = await $.session.usage();
@@ -18,11 +34,11 @@ async function report_context($, session_id, payload) {
         }
     }
     catch { /* A missing native measurement clears the previous reading. */ }
-    if (await $.session.id() !== session_id) {
+    if (!await matches_activation($, current)) {
         return;
     }
     await $.process.run(['node', `${$.plugin.root}/scripts/logonomic-hook-relay.cjs`], {
-        stdin: JSON.stringify({ ...payload, session_id, context_state }),
+        stdin: JSON.stringify({ ...payload, session_id: current.session_id, context_state }),
         timeoutMs: 13000,
     });
 }
@@ -35,9 +51,10 @@ async function bridge($, operation, id, value) {
     return JSON.parse(result.stdout);
 }
 
-async function admission($, request) {
-    if (!active || await $.session.id() !== native_id ||
-        request.payload.session.provider_session_id !== native_id)
+async function admission($, request, current) {
+    if (!current.active || !current.binding || !await matches_activation($, current) ||
+        request.payload.session.provider_session_id !== current.session_id ||
+        request.payload.correlation.transition_nonce !== current.binding.transition_nonce)
     {
         return { disposition: 'unavailable', reason: 'claude_native_session_changed' };
     }
@@ -60,15 +77,18 @@ async function admission($, request) {
         return { disposition: 'unavailable', reason: 'claude_inbound_policy_unknown' };
     }
     if (inbound !== 'accept') return { disposition: 'unavailable', reason: 'claude_inbound_policy_unknown' };
-    if (busy) return { disposition: 'deferred', reason: 'claude_turn_busy' };
-    if (paused) return { disposition: 'deferred', reason: 'claude_session_paused' };
+    if (current.busy) return { disposition: 'deferred', reason: 'claude_turn_busy' };
+    if (current.paused) return { disposition: 'deferred', reason: 'claude_session_paused' };
     if ((await $.prompt.read()).text !== '') return { disposition: 'deferred', reason: 'claude_prompt_draft' };
+    if (!current.active || !await matches_activation($, current)) {
+        return { disposition: 'unavailable', reason: 'claude_native_session_changed' };
+    }
     return null;
 }
 
-async function process_request($, request) {
-    const refused = await admission($, request);
-    const dispatch = refused ? null : await bridge($, 'inspect-dispatch', undefined, { session_id: native_id });
+async function process_request($, request, current) {
+    const refused = await admission($, request, current);
+    const dispatch = refused ? null : await bridge($, 'inspect-dispatch', undefined, current.binding);
     const unavailable = refused ?? (dispatch.available ? null : { disposition: 'unavailable', reason: 'claude_dispatch_not_ready' });
     if (request.operation === 'inspect') {
         return unavailable ? { available: false, reason: unavailable.reason } : { available: true };
@@ -77,6 +97,9 @@ async function process_request($, request) {
     if (unavailable) return unavailable;
     const reserved = await bridge($, 'reserve', request.id);
     if (!reserved.reserved) return reserved;
+    if (current !== activation || !current.active) {
+        return { disposition: 'unavailable', reason: 'claude_native_session_changed' };
+    }
     try {
         // A separate dependent plugin submits, so this plugin's prompt hook
         // participates in native admission instead of being skipped recursively.
@@ -94,22 +117,32 @@ async function process_request($, request) {
     }
 }
 
-async function listen($) {
-    while (active) {
+async function listen($, current) {
+    while (current.active && current === activation) {
         try {
-            const request = await bridge($, 'listen');
-            if (request) await bridge($, 'reply', request.id, await process_request($, request));
+            if (!current.binding) {
+                const binding = await bridge($, 'binding', undefined, { session_id: current.session_id });
+                if (current !== activation || !current.active) return;
+                current.binding = binding;
+            }
+            const request = await bridge($, 'listen', undefined, current.binding);
+            if (current !== activation || !current.active) return;
+            if (request) await bridge($, 'reply', request.id, await process_request($, request, current));
         }
         catch {
             // Process failures disable this registration instead of spinning or
             // claiming the mailbox was read. Ordinary Claude operation continues.
-            active = false;
+            current.active = false;
         }
     }
 }
 
 export function register(on) {
     on('classic.SessionStart', async ($, event, next) => {
+        // Capture the activation before the first asynchronous operation. A
+        // resumed A after B has a different instance from the departing A.
+        const current = !event.agent_id && event.source !== 'compact'
+            ? replace_activation(event.session_id, true) : activation;
         if (!event.agent_id) {
             try {
                 const helper = await $.env.get('VNM_CLAUDE_WAKE_OWNER_HELPER');
@@ -123,9 +156,16 @@ export function register(on) {
             catch { /* An unavailable owner disables wake alone. */ }
         }
         const result = await next(event);
-        if (!event.agent_id && event.source !== 'compact') {
+        if (!event.agent_id && event.source !== 'compact' && !next.signal?.aborted) {
             try {
-                await report_context($, event.session_id, { hook_event_name: 'ModContext' });
+                if (await matches_activation($, current)) {
+                    // Bootstrap may initialize the module while this classic
+                    // start awaits native registration. This completion owns
+                    // permission to start the activation's first consumer.
+                    current.start_pending = false;
+                    start_listener($, current);
+                    await report_context($, current, { hook_event_name: 'ModContext' });
+                }
             }
             catch { /* Context telemetry must not change native startup. */ }
         }
@@ -133,43 +173,50 @@ export function register(on) {
     });
     on('session.start', async ($, event, next) => {
         directory = await $.env.get('VNM_CLAUDE_WAKE_DIRECTORY');
-        if (directory && event.isInteractive) {
-            native_id = await $.session.id();
-            active = true;
+        interactive = event.isInteractive;
+        // A native start may finish while the environment lookup is pending.
+        // Bind bootstrap to that activation after its listener prerequisites.
+        const current = activation;
+        if (directory && interactive) {
+            const session_id = await $.session.id();
             // A reload cannot infer whether a previously interrupted session is
             // paused. An actual composer prompt or completed answer admits it.
-            paused = true;
-            $.clock.after(0, () => listen($));
+            if (current === activation && (!current.session_id || current.session_id === session_id)) {
+                current.session_id = session_id;
+                current.paused = true;
+                start_listener($, current);
+            }
         }
         return next(event);
     });
-    on('session.end', async ($, event, next) => {
-        active = false;
-        if (directory) {
-            try { await bridge($, 'close'); } catch { /* Wake alone is unavailable. */ }
+    on('session.end', ($, event, next) => {
+        if (!event.sessionId || !activation.session_id || event.sessionId === activation.session_id) {
+            replace_activation();
         }
+        // Classic SessionEnd owns authenticated registration cleanup. A Mod
+        // callback must not delete a successor's registration after a switch.
         return next(event);
     });
     on('turn.start', ($, event, next) => {
-        busy = true;
+        if (!event.agentId) activation.busy = true;
         return next(event);
     });
     on('turn.complete', async ($, event, next) => {
-        let completed_id = native_id;
+        const current = activation;
         if (!event.agentId) {
-            try { completed_id ??= await $.session.id(); }
+            try { current.session_id ??= await $.session.id(); }
             catch { /* A missing native identity cannot own a measurement. */ }
-            busy = false;
-            paused = event.reason !== 'answer';
+            current.busy = false;
+            current.paused = event.reason !== 'answer';
         }
         const result = await next(event);
-        if (!event.agentId && completed_id) {
+        if (!event.agentId && current.session_id && !next.signal?.aborted) {
             try {
                 // Classic Stop hooks precede this native completion. Their ACK
                 // may already have retried while we were still busy. Publish a
                 // fresh authenticated event only after native readiness changes.
-                await report_context($, completed_id, {
-                    hook_event_name: event.reason === 'answer' && active && native_id === completed_id
+                await report_context($, current, {
+                    hook_event_name: event.reason === 'answer' && current.active && current === activation
                         ? 'ModTurnComplete' : 'ModContext',
                     reason: event.reason,
                 });
@@ -179,11 +226,12 @@ export function register(on) {
         return result;
     });
     on('prompt.submit', async ($, event, next) => {
-        if (event.origin.kind === 'composer' || event.origin.kind === 'bridge') paused = false;
+        const current = activation;
+        if (event.origin.kind === 'composer' || event.origin.kind === 'bridge') current.paused = false;
         if (event.origin.kind === 'plugin' && event.origin.name === 'logonomic-wake-dispatch') {
             const request = await bridge($, 'guard-request');
             if (event.text !== request.payload.instruction) return { drop: 'Logonomic mailbox notification does not match its request.' };
-            const refused = await admission($, request);
+            const refused = await admission($, request, current);
             if (refused) return { drop: 'Logonomic mailbox notification deferred: ' + refused.reason };
         }
         return next(event);

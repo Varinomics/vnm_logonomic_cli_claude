@@ -3,6 +3,7 @@
 
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/context_state.h>
+#include <logonomic_cli_addon/execution_context.h>
 #include <logonomic_cli_addon/limits.h>
 
 #include <algorithm>
@@ -69,6 +70,28 @@ void classify_context(
     addon::decode_context_updates(payload, result.context_updates, result.context_failure);
 }
 
+void classify_start_directory(
+    const addon::Classify_event_request& request, addon::Classify_event_result& result,
+    const std::string& provider_session_id)
+{
+    if (request.execution_context_version != addon::k_execution_context_version || request.execution_failure) {
+        return;
+    }
+    addon::Execution_context_update update;
+    update.provider_session_id = provider_session_id;
+    update.transition_nonce    = request.transition_nonce;
+    update.source              = "claude.SessionStart";
+    const auto* cwd = request.event.body.find("cwd");
+    if (cwd && cwd->is_string() && addon::is_execution_local_path(cwd->as_string())) {
+        update.status      = addon::Execution_context_status::CONFIRMED;
+        update.environment = "local";
+        update.cwd         = cwd->as_string();
+    }
+    // Missing or unsupported cwd is an independent unknown fact. The native
+    // identity still transitions, and no launch or Git root becomes a fallback.
+    result.execution_updates.push_back(std::move(update));
+}
+
 } // namespace
 
 bool canonical_session_id(std::string_view value)
@@ -99,6 +122,7 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
     if (request.context_failure) {
         result.context_failure = addon::Context_failure{{}, *request.context_failure};
     }
+    result.execution_failure = request.execution_failure;
     const std::array<std::string_view, 13> supported{
         "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "UserPromptSubmit", "Stop",
         "StopFailure", "PermissionRequest", "PreToolUse", "PostToolUse", "PostToolUseFailure", "ModTurnComplete",
@@ -107,10 +131,9 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
     if (std::find(supported.begin(), supported.end(), name) == supported.end()) {
         return result;
     }
-    const bool session = name == "SessionStart" || name == "SessionEnd";
     const bool child = name == "SubagentStart" || name == "SubagentStop";
     const bool tool = name == "PreToolUse" || name == "PostToolUse" || name == "PostToolUseFailure";
-    if ((!session && !child && body.find("agent_id")) ||
+    if ((!child && body.find("agent_id")) ||
         (tool && text(body, "tool_name") != "AskUserQuestion" && text(body, "tool_name") != "ExitPlanMode"))
     {
         return result;
@@ -135,6 +158,7 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
             record.set("provider_session_id", addon::Json_value(observation.provider_session_id));
             observation.resume_record = std::move(record);
         }
+        classify_start_directory(request, result, observation.provider_session_id);
     }
     else
     if (name == "SessionEnd") {

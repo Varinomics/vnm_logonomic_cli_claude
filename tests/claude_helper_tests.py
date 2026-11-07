@@ -82,7 +82,7 @@ class Adapter:
         self.process.stdin.close()
         assert self.process.wait(timeout=10) == 0
 
-    def classify(self, delivery, version, current_session=None, *, attention=False, pending=None):
+    def classify(self, delivery, version, current_session=None, *, attention=False, pending=None, execution=None):
         self.serial += 1
         request_id = "r" + str(self.serial)
         payload = {"event": delivery["event"], "transition_nonce": delivery["transition_nonce"],
@@ -94,6 +94,8 @@ class Adapter:
             payload["context_state_version"] = version
         if pending is not None:
             payload["pending_conversational_request_id"] = pending
+        if execution is not None:
+            payload["execution_context"] = execution
         self.send({"type": "invoke", "request_id": request_id,
             "capability_id": "attention-kind" if attention else "helper-ingress",
             "version": 1 if attention else 2, "operation": "classify_event", "deadline_ms": 5000, "payload": payload})
@@ -208,6 +210,54 @@ def reply_evidence_contract(helper, executable, relay, environment, capture):
         assert resolved["observations"][0]["attention_transition"] == "resolved"
         assert resolved["observations"][0]["attention_request_id"] == request_id
         assert "attention_kind" not in adapter.classify(answer, None, "native-session", attention=True)
+    finally:
+        adapter.close()
+
+
+def execution_context_contract(executable, run, root):
+    adapter = Adapter(executable)
+    session_id = "a375d05e-f6cf-4812-80f5-91b33d24c053"
+    start = {"hook_event_name": "SessionStart", "session_id": session_id, "source": "resume"}
+    cwd = str(root / "uncreated directory" / "nested ")
+
+    def deliver(payload):
+        result, records, _ = run(payload, CLAUDE_TEST_CONTEXT="empty")
+        assert result.returncode == 0 and result.stdout == "", result.stderr
+        return next(record["request"] for record in records if record["operation"] == "provider-event")
+
+    try:
+        assert {"capability_id": "execution-context", "version": 1} in adapter.capabilities["capabilities"]
+        delivery = deliver({**start, "cwd": cwd, "transcript_path": "/private/transcript",
+            "project_dir": "/launch/project", "tool_input": {"command": "cd /not-authoritative"}})
+        body = delivery["event"]["body"]
+        assert body["cwd"] == cwd
+        assert not any(key in body for key in ("transcript_path", "project_dir", "tool_input"))
+        result = adapter.classify(delivery, None, execution={"version": 1})
+        expected = {"version": 1, "updates": [{"provider_session_id": session_id,
+            "transition_nonce": delivery["transition_nonce"], "sequence": "0", "state": "confirmed",
+            "environment": "local", "cwd": cwd, "source": "claude.SessionStart"}]}
+        assert result["execution_context"] == expected
+        assert result["classification"] == "transition" and result["transition"] == {"kind": "resume"}
+        assert result["observations"][0]["resume_record"] == {"provider_session_id": session_id}
+        assert adapter.classify(delivery, None, execution={"version": 1}) == result
+        assert "execution_context" not in adapter.classify(delivery, None)
+        invalid = adapter.classify(delivery, None, execution={"version": "1"})
+        assert invalid["classification"] == "transition" and "failure" in invalid["execution_context"]
+        for malformed in (None, 12, "relative/path", "ssh://remote/work", "/work\nother", "/work\0other", "/" * 4097):
+            delivery = deliver({**start, "cwd": malformed})
+            assert delivery["event"]["body"]["cwd"] is None
+            result = adapter.classify(delivery, None, "different-session", execution={"version": 1})
+            update = result["execution_context"]["updates"][0]
+            assert result["classification"] == "transition" and update["state"] == "unknown"
+            assert update["provider_session_id"] == session_id and update["transition_nonce"] == delivery["transition_nonce"]
+            assert update["cwd"] == "" and update["environment"] == ""
+        delivery = deliver(start)
+        assert "cwd" not in delivery["event"]["body"]
+        assert adapter.classify(delivery, None, execution={"version": 1})["execution_context"]["updates"][0]["state"] == "unknown"
+        delivery = deliver({**start, "cwd": cwd, "agent_id": "child"})
+        assert "cwd" not in delivery["event"]["body"]
+        result = adapter.classify(delivery, None, execution={"version": 1})
+        assert result["classification"] == "ignore" and "execution_context" not in result
     finally:
         adapter.close()
 
@@ -332,6 +382,11 @@ def main():
         if "--reply-only" in sys.argv[5:]:
             reply_evidence_contract(helper, adapter, relay, environment, capture)
             print("Claude helper-to-adapter reply evidence checks passed.")
+            return
+
+        if "--execution-only" in sys.argv[5:]:
+            execution_context_contract(adapter, run, Path(temporary))
+            print("Claude helper-to-adapter execution context checks passed.")
             return
 
         context_adapter = Adapter(adapter)

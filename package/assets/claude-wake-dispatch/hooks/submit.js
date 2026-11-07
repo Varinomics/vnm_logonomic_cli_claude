@@ -1,9 +1,26 @@
 // Native dependencies keep the admission plugin loaded with this dispatcher.
 // Only that plugin creates dispatch requests. The dispatcher has no command,
 // tool, public listener, inbox credentials or independently authored prompts.
-let active = false;
 let directory;
-let native_id;
+let interactive = false;
+let activation = { active: false };
+
+function replace_activation(session_id, start_pending = false) {
+    activation.active = false;
+    activation = { session_id, start_pending, active: false };
+    return activation;
+}
+
+async function matches_activation($, current) {
+    return current === activation && current.session_id &&
+        await $.session.id() === current.session_id && current === activation;
+}
+
+function start_listener($, current) {
+    if (current !== activation || current.start_pending || current.active || !directory || !interactive) return;
+    current.active = true;
+    $.clock.after(0, () => listen($, current));
+}
 
 async function bridge($, operation, id, value) {
     const result = await $.process.run(
@@ -13,15 +30,23 @@ async function bridge($, operation, id, value) {
     return JSON.parse(result.stdout);
 }
 
-async function listen($) {
-    while (active) {
+async function listen($, current) {
+    while (current.active && current === activation) {
         try {
-            await bridge($, 'ready', undefined, { session_id: native_id });
-            const request = await bridge($, 'receive');
+            if (!current.binding) {
+                const binding = await bridge($, 'binding', undefined, { session_id: current.session_id });
+                if (current !== activation || !current.active) return;
+                current.binding = binding;
+            }
+            await bridge($, 'ready', undefined, current.binding);
+            if (current !== activation || !current.active) return;
+            const request = await bridge($, 'receive', undefined, current.binding);
+            if (current !== activation || !current.active) return;
             if (!request) continue;
             let result = { drop: 'Logonomic mailbox notification expired or its session changed.' };
-            if (active && await $.session.id() === native_id && request.payload.session.provider_session_id === native_id &&
-                (await bridge($, 'activate', request.id)).available)
+            if (await matches_activation($, current) && request.payload.session.provider_session_id === current.session_id &&
+                request.payload.correlation.transition_nonce === current.binding.transition_nonce &&
+                (await bridge($, 'activate', request.id)).available && current === activation && current.active)
             {
                 // The dependent guard reads the exact active request at native
                 // admission, after any native queue wait, and may drop it.
@@ -29,22 +54,43 @@ async function listen($) {
             }
             await bridge($, 'native-reply', request.id, result);
         }
-        catch { active = false; }
+        catch { current.active = false; }
     }
 }
 
 export function register(on) {
+    on('classic.SessionStart', async ($, event, next) => {
+        const current = !event.agent_id && event.source !== 'compact'
+            ? replace_activation(event.session_id, true) : activation;
+        const result = await next(event);
+        if (!event.agent_id && event.source !== 'compact' && !next.signal?.aborted) {
+            try {
+                if (await matches_activation($, current)) {
+                    current.start_pending = false;
+                    start_listener($, current);
+                }
+            }
+            catch { /* Missing native identity leaves this activation unavailable. */ }
+        }
+        return result;
+    });
     on('session.start', async ($, event, next) => {
         directory = await $.env.get('VNM_CLAUDE_WAKE_DIRECTORY');
-        if (directory && event.isInteractive) {
-            native_id = await $.session.id();
-            active = true;
-            $.clock.after(0, () => listen($));
+        interactive = event.isInteractive;
+        const current = activation;
+        if (directory && interactive) {
+            const session_id = await $.session.id();
+            if (current === activation && (!current.session_id || current.session_id === session_id)) {
+                current.session_id = session_id;
+                start_listener($, current);
+            }
         }
         return next(event);
     });
     on('session.end', ($, event, next) => {
-        active = false;
+        if (!event.sessionId || !activation.session_id || event.sessionId === activation.session_id) {
+            replace_activation();
+        }
         return next(event);
     });
 }
