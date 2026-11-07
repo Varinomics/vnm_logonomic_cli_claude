@@ -23,7 +23,9 @@ namespace {
 
 namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
+using Json = addon::Json_value;
 using Availability = addon::Resume_availability;
+using Content = addon::Resume_content;
 
 // Inspection is advisory. Reaching a bound leaves the conversation unknown;
 // it never proves that saved data is absent.
@@ -148,18 +150,104 @@ struct transcript_message_t
     bool sidechain;
 };
 
-Availability inspect_transcript(
+class Content_inspection
+{
+public:
+    explicit Content_inspection(std::string_view session_id)
+    :
+        m_session_id(session_id)
+    {}
+
+    void consume(const Json& entry)
+    {
+        if (m_unknown) {
+            return;
+        }
+        const auto type = text(entry, "type");
+        if (type == "custom-title" || type == "tag" || type == "permission-mode") {
+            const char* field = type == "custom-title" ? "customTitle" :
+                type == "tag" ? "tag" : "permissionMode";
+            const auto* value = entry.find(field);
+            const auto* id = entry.find("sessionId");
+            m_unknown |= !value || !value->is_string() ||
+                (type != "permission-mode" && !id) ||
+                (id && (!id->is_string() || id->as_string() != m_session_id));
+            return;
+        }
+        if (type != "user" && type != "assistant" && type != "system" && type != "progress") {
+            m_unknown = true;
+            return;
+        }
+        const auto uuid = text(entry, "uuid");
+        const auto* parent = entry.find("parentUuid");
+        if (text(entry, "sessionId") != m_session_id || !canonical_session_id(uuid) || !parent ||
+            (!parent->is_null() && (!parent->is_string() || !m_seen.contains(parent->as_string()))) ||
+            !m_seen.insert(uuid).second)
+        {
+            m_unknown = true;
+            return;
+        }
+        // A complete append-only chain proves that no omitted parent carries
+        // conversation content. Reordered, repeated and replay-specific rows
+        // remain native authority rather than proving an empty conversation.
+        for (const auto* field : {"isSidechain", "isMeta", "isCompactSummary"}) {
+            if (const auto* value = entry.find(field); value && !value->is_boolean()) {
+                m_unknown = true;
+            }
+        }
+        if (const auto* team = entry.find("teamName"); team && !team->is_string()) {
+            m_unknown = true;
+        }
+        if (const auto* logical_parent = entry.find("logicalParentUuid");
+            logical_parent && !logical_parent->is_null())
+        {
+            m_unknown = true;
+        }
+        m_unknown |= text(entry, "subtype") == "compact_boundary" || flag(entry, "isCompactSummary") ||
+            flag(entry, "isSidechain") || !text(entry, "teamName").empty();
+        if (type == "user" || type == "assistant") {
+            m_conversation = true;
+            m_nonempty |= !flag(entry, "isSidechain") && !flag(entry, "isMeta") && text(entry, "teamName").empty();
+        }
+    }
+
+    Content result() const
+    {
+        if (m_unknown) {
+            return Content::UNKNOWN;
+        }
+        if (m_nonempty) {
+            return Content::NONEMPTY;
+        }
+        return m_conversation ? Content::UNKNOWN : Content::EMPTY;
+    }
+
+private:
+    std::string_view      m_session_id;
+    std::set<std::string> m_seen;
+    bool                 m_unknown = false;
+    bool                 m_conversation = false;
+    bool                 m_nonempty = false;
+};
+
+conversation_state_t inspect_transcript(
     const fs::path& path, std::string_view session_id, addon::Invocation_context& invocation)
 {
     std::ifstream stream(path, std::ios::binary);
     if (!stream) {
-        return Availability::UNKNOWN;
+        return {};
     }
+    std::error_code content_error;
+    const auto size_before = fs::file_size(path, content_error);
+    const bool size_known = !content_error;
+    const auto modified_before = fs::last_write_time(path, content_error);
+    const bool snapshot_known = size_known && !content_error;
     std::array<char, 16384> buffer;
     std::string line;
     std::size_t total = 0;
     std::map<std::string, transcript_message_t> messages;
     std::set<std::string> parents;
+    Content_inspection content(session_id);
     bool uncertain = false;
     const auto consume = [&]() {
         if (line.find_first_not_of(" \t\r") == std::string::npos) {
@@ -173,6 +261,7 @@ Availability inspect_transcript(
             uncertain = true;
             return;
         }
+        content.consume(*entry);
         const auto type = text(*entry, "type");
         if (type == "last-prompt" && (flag(*entry, "explicit") || flag(*entry, "rewound"))) {
             uncertain = true;
@@ -209,13 +298,13 @@ Availability inspect_transcript(
     };
     while (stream) {
         if (invocation.cancel_requested()) {
-            return Availability::UNKNOWN;
+            return {};
         }
         stream.read(buffer.data(), buffer.size());
         const auto count = (std::size_t)stream.gcount();
         total += count;
         if (total > k_max_inspection_bytes) {
-            return Availability::UNKNOWN;
+            return {};
         }
         for (std::size_t index = 0; index < count; ++index) {
             if (buffer[index] == '\n') {
@@ -228,20 +317,33 @@ Availability inspect_transcript(
         }
     }
     if (!stream.eof()) {
-        return Availability::UNKNOWN;
+        return {};
     }
     consume();
     if (uncertain) {
-        return Availability::UNKNOWN;
+        return {};
     }
-    for (const auto& [uuid, message] : messages) {
-        if (message.conversation && !message.sidechain && !parents.contains(uuid)) {
-            return Availability::AVAILABLE;
-        }
-    }
+    conversation_state_t result;
     // Native resume also understands system-only and explicitly cleared logs.
     // Only a genuinely empty transcript is definitely not a conversation.
-    return total == 0 ? Availability::ABSENT : Availability::UNKNOWN;
+    result.availability = total == 0 ? Availability::ABSENT : Availability::UNKNOWN;
+    for (const auto& [uuid, message] : messages) {
+        if (message.conversation && !message.sidechain && !parents.contains(uuid)) {
+            result.availability = Availability::AVAILABLE;
+            break;
+        }
+    }
+    // @3 availability accepts a valid unterminated final record. Content needs
+    // a complete snapshot so an interrupted or concurrent append stays unknown.
+    const auto size_after = fs::file_size(path, content_error);
+    const bool same_size = !content_error && size_after == size_before && total == size_before;
+    const auto modified_after = fs::last_write_time(path, content_error);
+    if (snapshot_known && same_size && !content_error && modified_after == modified_before &&
+        line.find_first_not_of(" \t\r") == std::string::npos)
+    {
+        result.content = content.result();
+    }
+    return result;
 }
 
 std::string project_directory_name(const addon::Session_launch_context& launch)
@@ -265,7 +367,7 @@ std::string project_directory_name(const addon::Session_launch_context& launch)
     return result;
 }
 
-Availability inspect_profile(
+conversation_state_t inspect_profile(
     const addon::Session_launch_context& launch, std::string_view session_id,
     const std::vector<std::string>& command,
     addon::Invocation_context& invocation)
@@ -275,16 +377,16 @@ Availability inspect_profile(
     // Claude NFC-normalizes its config home. Without a shared Unicode
     // normalizer, an alternative spelling cannot establish absence.
     if (std::any_of(profile_text.begin(), profile_text.end(), [](unsigned char ch) { return ch >= 128; })) {
-        return Availability::UNKNOWN;
+        return {};
     }
     if (!resume_context_supported(launch, profile, command)) {
-        return Availability::UNKNOWN;
+        return {};
     }
     std::error_code error;
     if (!fs::is_directory(profile, error) || error ||
         !fs::is_directory(addon::path_from_utf8(launch.working_directory), error) || error)
     {
-        return Availability::UNKNOWN;
+        return {};
     }
     const auto projects = profile / "projects";
     const auto filename = std::string(session_id) + ".jsonl";
@@ -293,22 +395,22 @@ Availability inspect_profile(
         const auto direct = projects / preferred / filename;
         const auto status = fs::status(direct, error);
         if (error && error != std::errc::no_such_file_or_directory) {
-            return Availability::UNKNOWN;
+            return {};
         }
         if (fs::is_regular_file(status)) {
-            const auto availability = inspect_transcript(direct, session_id, invocation);
-            if (availability != Availability::ABSENT) {
-                return availability;
+            const auto state = inspect_transcript(direct, session_id, invocation);
+            if (state.availability != Availability::ABSENT) {
+                return state;
             }
         }
     }
     error.clear();
     fs::directory_iterator entry(projects, error), end;
     if (error == std::errc::no_such_file_or_directory) {
-        return Availability::ABSENT;
+        return {Availability::ABSENT, Content::EMPTY};
     }
     if (error) {
-        return Availability::UNKNOWN;
+        return {};
     }
     std::vector<fs::path> candidates;
     std::size_t visited = 0;
@@ -316,14 +418,14 @@ Availability inspect_profile(
     // project children for a unique transcript. Subagent logs are not roots.
     for (; entry != end && !error; entry.increment(error)) {
         if (++visited > k_max_project_entries || invocation.cancel_requested()) {
-            return Availability::UNKNOWN;
+            return {};
         }
         const auto directory_status = entry->symlink_status(error);
         if (error) {
-            return Availability::UNKNOWN;
+            return {};
         }
         if (fs::is_symlink(directory_status)) {
-            return Availability::UNKNOWN;
+            return {};
         }
         if (!fs::is_directory(directory_status)) {
             continue;
@@ -335,24 +437,24 @@ Availability inspect_profile(
             continue;
         }
         if (error || fs::is_symlink(status)) {
-            return Availability::UNKNOWN;
+            return {};
         }
         if (fs::is_regular_file(status)) {
             candidates.push_back(candidate);
         }
     }
     if (error || candidates.size() > 1) {
-        return Availability::UNKNOWN;
+        return {};
     }
     if (candidates.empty()) {
-        return Availability::ABSENT;
+        return {Availability::ABSENT, Content::EMPTY};
     }
     return inspect_transcript(candidates.front(), session_id, invocation);
 }
 
 } // namespace
 
-Availability saved_conversation_availability(
+conversation_state_t inspect_saved_conversation(
     const addon::Session_launch_context& launch, std::string_view session_id,
     const std::vector<std::string>& command,
     addon::Invocation_context& invocation)
@@ -361,7 +463,7 @@ Availability saved_conversation_availability(
         return inspect_profile(launch, session_id, command, invocation);
     }
     catch (const std::exception&) {
-        return Availability::UNKNOWN;
+        return {};
     }
 }
 

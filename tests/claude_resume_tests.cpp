@@ -33,6 +33,7 @@ namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
 using Json = addon::Json_value;
 using Availability = addon::Resume_availability;
+using Content = addon::Resume_content;
 
 constexpr const char* k_session = "a375d05e-f6cf-4812-80f5-91b33d24c053";
 constexpr const char* k_user = "c8902599-6448-48be-9ca4-d67456950fae";
@@ -170,10 +171,10 @@ public:
         return profile() / "projects" / project / (std::string(k_session) + ".jsonl");
     }
 
-    Context inspect() const
+    Context inspect(std::uint16_t version = 3) const
     {
         Context invocation;
-        invocation.m_request.capability = {"interactive-resume", 3};
+        invocation.m_request.capability = {"interactive-resume", version};
         invocation.m_request.operation = "inspect_resume";
         invocation.m_request.payload = addon::encode_resume_inspect_request(m_request);
         claude::handle_preparation(invocation, m_root);
@@ -191,6 +192,24 @@ public:
         require(result && result->availability == expected, reason + ": wrong availability");
         require(addon::validate_resume_inspection(m_request, *result, &failure),
             reason + ": result does not acknowledge the complete request");
+        require(snapshot(m_root) == before, reason + ": inspection mutated fixture files");
+    }
+
+    void expect_content(Availability availability, Content content, const std::string& reason) const
+    {
+        const auto before = snapshot(m_root);
+        for (const std::uint16_t version : {3, 4}) {
+            const auto invocation = inspect(version);
+            require(invocation.m_finished && invocation.m_status == addon::Result_status::SUCCESS,
+                reason + ": inspection failed: " + invocation.m_reason);
+            addon::Contract_failure failure;
+            const auto result = addon::decode_resume_inspect_result(invocation.m_payload, &failure, version);
+            require(result && result->availability == availability, reason + ": native availability changed");
+            require(result->content == (version == 4 ? content : Content::UNKNOWN), reason + ": wrong content state");
+            require(version == 4 || !invocation.m_payload.find("content"), reason + ": @3 result vocabulary changed");
+            require(addon::validate_resume_inspection(m_request, *result, &failure),
+                reason + ": result does not acknowledge the complete request");
+        }
         require(snapshot(m_root) == before, reason + ": inspection mutated fixture files");
     }
 
@@ -263,6 +282,8 @@ void native_context_contract()
     const auto* unavailable = inspection_unavailable(fixture.root());
     fixture.expect(unavailable ? Availability::UNKNOWN : Availability::ABSENT,
         "empty profile respects native policy authority");
+    fixture.expect_content(unavailable ? Availability::UNKNOWN : Availability::ABSENT,
+        unavailable ? Content::UNKNOWN : Content::EMPTY, "content inspection respects native policy authority");
     write(fixture.transcript(), addon::serialize_json(message("user", k_user)));
     fixture.expect(unavailable ? Availability::UNKNOWN : Availability::AVAILABLE,
         "saved transcript respects native policy authority");
@@ -355,6 +376,91 @@ void lookup_contract()
 #endif
 }
 
+void content_contract()
+{
+    // Oracle: the Agent SDK session reader exposes main user/assistant
+    // messages; its progress-only chain fixture returns no conversation.
+    // Typed title/tag metadata is written separately by session_mutations.py.
+    Fixture fixture;
+    fixture.expect_content(Availability::ABSENT, Content::EMPTY, "missing conversation has no content");
+    write(fixture.transcript(), "");
+    fixture.expect_content(Availability::ABSENT, Content::EMPTY, "zero-byte conversation has no content");
+
+    auto title = claude::object(R"({"type":"custom-title","customTitle":"Planning"})");
+    title.set("sessionId", Json(k_session));
+    const auto metadata = addon::serialize_json(title) + "\n";
+    write(fixture.transcript(), metadata);
+    fixture.expect_content(Availability::UNKNOWN, Content::EMPTY,
+        "a retained title is independent of native availability and conversation content");
+    expect_prepared(fixture, "empty content does not redefine native availability");
+    auto tag = claude::object(R"({"type":"tag","tag":""})");
+    tag.set("sessionId", Json(k_session));
+    write(fixture.transcript(), metadata + addon::serialize_json(tag) + "\n" +
+        R"({"type":"permission-mode","permissionMode":"acceptEdits"})" "\n");
+    fixture.expect_content(Availability::UNKNOWN, Content::EMPTY, "native presentation metadata is not a conversation");
+
+    auto system = message("system", k_user);
+    system.erase("message");
+    system.set("subtype", Json("turn_duration"));
+    system.set("durationMs", Json(2400));
+    auto progress = message("progress", k_assistant, Json(k_user));
+    progress.erase("message");
+    const auto system_rows = addon::serialize_json(system) + "\n" + addon::serialize_json(progress) + "\n";
+    write(fixture.transcript(), system_rows);
+    fixture.expect_content(Availability::UNKNOWN, Content::EMPTY,
+        "a complete system and progress chain has no retained conversation messages");
+
+    auto user = message("user", k_user);
+    const auto user_row = addon::serialize_json(user);
+    write(fixture.transcript(), user_row + "\n");
+    fixture.expect_content(Availability::AVAILABLE, Content::NONEMPTY, "a main user message retains work");
+    auto assistant = message("assistant", k_assistant, Json(k_user));
+    assistant.find("message")->set("content", Json::array());
+    write(fixture.transcript(), user_row + "\n" + addon::serialize_json(assistant) + "\n");
+    fixture.expect_content(Availability::AVAILABLE, Content::NONEMPTY,
+        "conversation content does not depend on the last assistant record's byte length");
+    write(fixture.transcript(), user_row);
+    fixture.expect_content(Availability::AVAILABLE, Content::UNKNOWN,
+        "native resume accepts an unterminated record without certifying a complete content snapshot");
+
+    std::vector<std::pair<std::string, std::string>> uncertain{
+        {addon::serialize_json(title), "unterminated metadata can be an interrupted append"},
+        {metadata + "{unfinished", "partial tail cannot certify empty content"},
+        {metadata + R"({"type":"future-record"})" "\n", "unsupported native records remain unknown"},
+        {R"({"type":"summary","summary":"Retained work"})" "\n", "summary-only replay remains native"},
+        {system_rows + addon::serialize_json(system) + "\n", "repeated graph identities remain unknown"},
+    };
+    system.set("parentUuid", Json(k_assistant));
+    uncertain.emplace_back(addon::serialize_json(system) + "\n", "missing ancestry cannot certify empty content");
+    system.set("parentUuid", Json());
+    system.set("subtype", Json("compact_boundary"));
+    uncertain.emplace_back(addon::serialize_json(system) + "\n", "compaction replay remains native");
+    user.set("isSidechain", Json(true));
+    uncertain.emplace_back(addon::serialize_json(user) + "\n", "sidechain-only history remains unknown");
+    title.set("sessionId", Json("f480fd10-a9dc-4df6-b311-0672d48b8c07"));
+    uncertain.emplace_back(addon::serialize_json(title) + "\n", "metadata for another identity cannot prove emptiness");
+    for (const auto& [bytes, reason] : uncertain) {
+        write(fixture.transcript(), bytes);
+        fixture.expect_content(Availability::UNKNOWN, Content::UNKNOWN, reason);
+    }
+
+    write(fixture.transcript(), metadata);
+    fixture.expect_content(Availability::UNKNOWN, Content::EMPTY, "content inspection can observe empty metadata");
+    {
+        std::ofstream append(fixture.transcript(), std::ios::binary | std::ios::app);
+        append << user_row.substr(0, user_row.size() / 2);
+        require(bool(append), "partial late-write fixture appended");
+    }
+    fixture.expect_content(Availability::UNKNOWN, Content::UNKNOWN, "a late partial write replaces empty evidence");
+    {
+        std::ofstream append(fixture.transcript(), std::ios::binary | std::ios::app);
+        append << user_row.substr(user_row.size() / 2) << '\n';
+        require(bool(append), "completed late-write fixture appended");
+    }
+    fixture.expect_content(Availability::AVAILABLE, Content::NONEMPTY,
+        "a later completed conversation returns without deleting or rewriting native history");
+}
+
 void context_contract()
 {
 #ifndef __APPLE__
@@ -441,9 +547,9 @@ void bounded_inspection_contract()
     }
     const auto size = fs::file_size(path);
     const auto modified = fs::last_write_time(path);
-    const auto bounded_invocation = fixture.inspect();
-    const auto result = addon::decode_resume_inspect_result(bounded_invocation.m_payload, nullptr);
-    require(result && result->availability == Availability::UNKNOWN,
+    const auto bounded_invocation = fixture.inspect(4);
+    const auto result = addon::decode_resume_inspect_result(bounded_invocation.m_payload, nullptr, 4);
+    require(result && result->availability == Availability::UNKNOWN && result->content == Content::UNKNOWN,
         "reaching the read budget cannot certify even a valid conversation prefix");
     require(fs::file_size(path) == size && fs::last_write_time(path) == modified,
         "bounded inspection leaves the source unchanged");
@@ -453,20 +559,22 @@ void bounded_inspection_contract()
 void cancelled_inspection_contract()
 {
     Fixture cancelled;
-    Context invocation;
-    invocation.m_request.capability = {"interactive-resume", 3};
-    invocation.m_request.operation = "inspect_resume";
-    invocation.m_request.payload = addon::encode_resume_inspect_request(cancelled.request());
-    invocation.m_cancelled = true;
-    claude::handle_preparation(invocation, cancelled.root());
-    require(invocation.m_status == addon::Result_status::CANCELLED,
-        "cancelled inspection never publishes availability");
+    for (const std::uint16_t version : {3, 4}) {
+        Context invocation;
+        invocation.m_request.capability = {"interactive-resume", version};
+        invocation.m_request.operation = "inspect_resume";
+        invocation.m_request.payload = addon::encode_resume_inspect_request(cancelled.request());
+        invocation.m_cancelled = true;
+        claude::handle_preparation(invocation, cancelled.root());
+        require(invocation.m_status == addon::Result_status::CANCELLED,
+            "cancelled inspection never publishes availability or content");
+    }
 }
 
 void packaged_contract(const fs::path& package)
 {
     std::optional<Json> preparation_declaration;
-    for (const auto version : {2, 3}) {
+    for (const auto version : {2, 3, 4}) {
         const auto sidecar = addon::parse_sidecar(
             read(package / addon::sidecar_relative_path("interactive-resume", (std::uint16_t)version)), nullptr);
         require(sidecar && sidecar->version == version, "packaged resume capability identity");
@@ -485,10 +593,10 @@ void packaged_contract(const fs::path& package)
     addon::Contract_failure failure;
     require(host.start(&failure), "packaged adapter starts: " + failure.reason_code + ": " + failure.detail);
     const auto live = host.live_capabilities();
-    for (const auto version : {2, 3}) {
+    for (const auto version : {2, 3, 4}) {
         require(std::any_of(live.begin(), live.end(), [version](const auto& pair) {
             return pair.capability_id == "interactive-resume" && pair.version == version;
-        }), "packaged adapter negotiates both preparation and inspection");
+        }), "packaged adapter negotiates preparation and both inspection contracts");
     }
     auto request_id = host.invoke({"interactive-resume", 3}, "inspect_resume",
         addon::encode_resume_inspect_request(fixture.request()), 5000);
@@ -499,6 +607,16 @@ void packaged_contract(const fs::path& package)
         "packaged inspection acknowledges the exact request");
     const auto expected = inspection_unavailable(fixture.root()) ? Availability::UNKNOWN : Availability::ABSENT;
     require(result->availability == expected, "packaged adapter respects native policy authority");
+    require(!outcome->payload.find("content"), "packaged @3 response remains readable by an installed host");
+    request_id = host.invoke({"interactive-resume", 4}, "inspect_resume",
+        addon::encode_resume_inspect_request(fixture.request()), 5000);
+    outcome = host.wait_outcome(request_id, 6000);
+    require(outcome && outcome->status == addon::Host_status::SUCCESS, "packaged content inspection succeeds");
+    const auto content_result = addon::decode_resume_inspect_result(outcome->payload, &failure, 4);
+    require(content_result && content_result->availability == expected &&
+        content_result->content == (expected == Availability::ABSENT ? Content::EMPTY : Content::UNKNOWN) &&
+        addon::validate_resume_inspection(fixture.request(), *content_result, &failure),
+        "packaged @4 content inspection acknowledges the same native scope");
     addon::Resume_prepare_request preparation;
     preparation.context = fixture.request().context;
     preparation.resume_record = fixture.request().resume_record;
@@ -511,6 +629,34 @@ void packaged_contract(const fs::path& package)
     const auto prepared = addon::decode_resume_prepare_result(outcome->payload, &failure, 2);
     require(prepared && addon::validate_resume_acknowledgment(
         preparation.resume_record, prepared->acknowledgment, &failure), "packaged preparation preserves opaque identity");
+}
+
+void installed_host_contract(const fs::path& package)
+{
+    Fixture fixture;
+    addon::Simulator_options options;
+    options.package_directory = package;
+    options.validation.platform_id = addon::host_platform_id();
+    options.scratch_directory = fixture.root() / "adapter-scratch";
+    options.adopted_capabilities = std::vector<addon::Capability_pair>{
+        {"interactive-resume", 2}, {"interactive-resume", 3}};
+    addon::Host_simulator host(options, nullptr);
+    addon::Contract_failure failure;
+    require(host.start(&failure), "installed host starts an upgraded package: " + failure.detail);
+    const auto live = host.live_capabilities();
+    require(std::none_of(live.begin(), live.end(), [](const auto& pair) {
+        return pair.capability_id == "interactive-resume" && pair.version == 4;
+    }), "an installed host does not negotiate content inspection");
+    const auto request_id = host.invoke({"interactive-resume", 3}, "inspect_resume",
+        addon::encode_resume_inspect_request(fixture.request()), 5000);
+    const auto outcome = host.wait_outcome(request_id, 6000);
+    require(outcome && outcome->status == addon::Host_status::SUCCESS && !outcome->payload.find("content"),
+        "an installed host receives the unchanged @3 result shape");
+    const auto result = addon::decode_resume_inspect_result(outcome->payload, &failure, 3);
+    const auto expected = inspection_unavailable(fixture.root()) ? Availability::UNKNOWN : Availability::ABSENT;
+    require(result && result->availability == expected && result->content == Content::UNKNOWN &&
+        addon::validate_resume_inspection(fixture.request(), *result, &failure),
+        "an installed host retains native availability and the exact request acknowledgment");
 }
 
 } // namespace
@@ -526,6 +672,7 @@ int main(int argc, char** argv)
                 return 77;
             }
             transcript_contract();
+            content_contract();
             lookup_contract();
             context_contract();
             inaccessible_transcript_contract();
@@ -535,6 +682,7 @@ int main(int argc, char** argv)
             native_context_contract();
             cancelled_inspection_contract();
             packaged_contract(addon::path_from_utf8(argv[1]));
+            installed_host_contract(addon::path_from_utf8(argv[1]));
         }
         std::cout << "Claude resume inspection and preparation contracts passed.\n";
         return 0;
