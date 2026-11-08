@@ -9,7 +9,13 @@
 
 namespace claude {
 
-logonomic::cli_addon::Resume_availability saved_conversation_availability(
+struct conversation_state_t
+{
+    logonomic::cli_addon::Resume_availability availability = logonomic::cli_addon::Resume_availability::UNKNOWN;
+    logonomic::cli_addon::Resume_content      content = logonomic::cli_addon::Resume_content::UNKNOWN;
+};
+
+conversation_state_t inspect_saved_conversation(
     const logonomic::cli_addon::Session_launch_context& launch,
     std::string_view                                   session_id,
     const std::vector<std::string>&                    command,
