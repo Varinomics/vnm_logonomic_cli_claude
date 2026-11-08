@@ -4,6 +4,7 @@
 
 #include <logonomic_cli_addon/session_wake.h>
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/usage_scan.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -173,6 +174,19 @@ bool is_hex(std::string_view value, std::size_t size)
     });
 }
 
+fs::path canonical_path(const fs::path& path, std::error_code& error)
+{
+    const auto result = fs::canonical(addon::usage_cache_io_path(path), error);
+#ifdef _WIN32
+    // The extended prefix belongs only to I/O; canonical wire identities keep
+    // their ordinary drive or UNC spelling.
+    const auto& native = result.native();
+    if (native.starts_with(L"\\\\?\\UNC\\")) return fs::path(L"\\\\" + native.substr(8));
+    if (native.starts_with(L"\\\\?\\")) return fs::path(native.substr(4));
+#endif
+    return result;
+}
+
 std::optional<fs::path> prospective_directory()
 {
 #ifdef _WIN32
@@ -184,7 +198,7 @@ std::optional<fs::path> prospective_directory()
     const fs::path directory(value);
     std::error_code error;
     if (!directory.is_absolute() || !is_hex(path_string(directory.filename()), 32) ||
-        fs::canonical(directory.parent_path(), error) != directory.parent_path() || error)
+        canonical_path(directory.parent_path(), error) != directory.parent_path() || error)
     {
         return std::nullopt;
     }
@@ -248,7 +262,7 @@ std::optional<Wake_owner> anchored_owner(const fs::path& directory)
 {
     const auto prefix = path_string(directory.filename()) + ".";
     std::optional<Wake_owner> owner;
-    for (const auto& entry : fs::directory_iterator(directory.parent_path())) {
+    for (const auto& entry : fs::directory_iterator(addon::usage_cache_io_path(directory.parent_path()))) {
         const auto name = path_string(entry.path().filename());
         if (!name.starts_with(prefix)) continue;
         const auto marker = marker_owner(name);
@@ -267,7 +281,7 @@ bool publish_owner_marker(const fs::path& directory, const Wake_owner& native, c
     const auto marker = owner_marker(directory, {native, registrar});
     const auto prefix = path_string(directory.filename()) + ".";
     const auto same_native = [&]() {
-        for (const auto& entry : fs::directory_iterator(directory.parent_path())) {
+        for (const auto& entry : fs::directory_iterator(addon::usage_cache_io_path(directory.parent_path()))) {
             const auto name = path_string(entry.path().filename());
             if (!name.starts_with(prefix)) continue;
             const auto existing = marker_owner(name);
@@ -280,7 +294,7 @@ bool publish_owner_marker(const fs::path& directory, const Wake_owner& native, c
     if (!same_native()) return false;
     // Complete identity is in the filename before any directory allocation.
     // The registrar keeps a still-publishing helper protected after native exit.
-    std::ofstream output(marker, std::ios::binary);
+    std::ofstream output(addon::usage_cache_io_path(marker), std::ios::binary);
     output.close();
     return output && same_native();
 }
@@ -294,10 +308,10 @@ bool owner_dead(const Wake_owner& owner)
 bool remove_bridge(const fs::path& directory)
 {
     std::error_code error;
-    const auto status = fs::symlink_status(directory, error);
+    const auto status = fs::symlink_status(addon::usage_cache_io_path(directory), error);
     if (status.type() == fs::file_type::not_found) return true;
-    if (error || !fs::is_directory(status) || fs::canonical(directory, error) != directory || error) return false;
-    for (const auto& entry : fs::directory_iterator(directory)) {
+    if (error || !fs::is_directory(status) || canonical_path(directory, error) != directory || error) return false;
+    for (const auto& entry : fs::directory_iterator(addon::usage_cache_io_path(directory))) {
         auto name = path_string(entry.path().filename());
         const auto temporary = name.rfind('.');
         if (temporary != std::string::npos && is_hex(std::string_view(name).substr(temporary + 1), 32)) {
@@ -317,13 +331,13 @@ bool remove_bridge(const fs::path& directory)
         }
         if (fs::is_regular_file(entry.symlink_status(error)) && !error) fs::remove(entry.path(), error);
     }
-    return fs::remove(directory, error) && !error;
+    return fs::remove(addon::usage_cache_io_path(directory), error) && !error;
 }
 
 void sweep_dead_owners(const fs::path& parent)
 {
     std::map<std::string, std::vector<std::pair<fs::path, std::optional<Wake_marker>>>> owners;
-    for (const auto& entry : fs::directory_iterator(parent)) {
+    for (const auto& entry : fs::directory_iterator(addon::usage_cache_io_path(parent))) {
         if (!fs::is_regular_file(entry.symlink_status())) continue;
         const auto name = path_string(entry.path().filename());
         if (name.size() > 33 && name[32] == '.' && is_hex(name.substr(0, 32), 32) && name.ends_with(".owner")) {
@@ -349,9 +363,10 @@ std::optional<fs::path> bridge_directory(const Json& binding)
         return std::nullopt;
     }
     const auto directory = addon::path_from_utf8(text(binding, "directory"));
+    const auto io_directory = addon::usage_cache_io_path(directory);
     std::error_code error;
-    if (!directory.is_absolute() || !fs::is_directory(fs::symlink_status(directory, error)) || error ||
-        fs::canonical(directory, error) != directory || error)
+    if (!directory.is_absolute() || !fs::is_directory(fs::symlink_status(io_directory, error)) || error ||
+        canonical_path(directory, error) != directory || error)
     {
         return std::nullopt;
     }
@@ -361,12 +376,12 @@ std::optional<fs::path> bridge_directory(const Json& binding)
 std::optional<Json> read_response(const fs::path& path)
 {
     std::error_code error;
-    if (!fs::is_regular_file(fs::symlink_status(path, error)) || error ||
-        fs::file_size(path, error) > 16384 || error)
+    if (!fs::is_regular_file(fs::symlink_status(addon::usage_cache_io_path(path), error)) || error ||
+        fs::file_size(addon::usage_cache_io_path(path), error) > 16384 || error)
     {
         return std::nullopt;
     }
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input(addon::usage_cache_io_path(path), std::ios::binary);
     std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     if (input.bad()) {
         return std::nullopt;
@@ -394,20 +409,20 @@ Exchange_result exchange(
     request.set("payload", payload);
     request.set("expires_at_ms", Json(now_ms() + 5000));
     {
-        std::ofstream output(writing, std::ios::binary | std::ios::trunc);
+        std::ofstream output(addon::usage_cache_io_path(writing), std::ios::binary | std::ios::trunc);
         const auto bytes = addon::serialize_json(request);
         output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         output.close();
         if (!output) {
             std::error_code ignored;
-            fs::remove(writing, ignored);
+            fs::remove(addon::usage_cache_io_path(writing), ignored);
             return {};
         }
     }
     std::error_code error;
-    fs::rename(writing, pending, error);
+    fs::rename(addon::usage_cache_io_path(writing), addon::usage_cache_io_path(pending), error);
     if (error) {
-        fs::remove(writing, error);
+        fs::remove(addon::usage_cache_io_path(writing), error);
         return {};
     }
     const auto deadline = std::chrono::steady_clock::now() + k_bridge_timeout;
@@ -423,11 +438,11 @@ Exchange_result exchange(
     }
     // Removing an unclaimed request revokes it. Once claimed, an absent reply
     // is uncertain: the native scheduler may already have accepted the prompt.
-    const bool revoked = fs::remove(pending, error);
+    const bool revoked = fs::remove(addon::usage_cache_io_path(pending), error);
     result.claimed = !revoked;
-    fs::remove(response, error);
+    fs::remove(addon::usage_cache_io_path(response), error);
     if (result.response) {
-        fs::remove(claimed, error);
+        fs::remove(addon::usage_cache_io_path(claimed), error);
     }
     return result;
 }
@@ -447,11 +462,13 @@ void prepare_wake(
     }
     try {
         const auto parent = addon::path_from_utf8(storage->root) / "wake";
-        fs::create_directories(parent);
+        fs::create_directories(addon::usage_cache_io_path(parent));
 #ifndef _WIN32
         fs::permissions(parent, fs::perms::owner_all, fs::perm_options::replace);
 #endif
-        const auto canonical_parent = fs::canonical(parent);
+        std::error_code error;
+        const auto canonical_parent = canonical_path(parent, error);
+        if (error) throw fs::filesystem_error("canonical", parent, error);
         sweep_dead_owners(canonical_parent);
         const auto canonical = canonical_parent / addon::random_nonce_hex();
         result.available = true;
@@ -506,7 +523,7 @@ void register_wake(const Json& event, const std::string& nonce)
         const auto registrar_status = owner_status(registrar_pid);
         if (registrar_status.birth.empty()) return;
         if (!publish_owner_marker(directory, *owner, {registrar_pid, registrar_status.birth})) return;
-        fs::create_directory(directory);
+        fs::create_directory(addon::usage_cache_io_path(directory));
 #ifndef _WIN32
         fs::permissions(directory, fs::perms::owner_all, fs::perm_options::replace);
 #endif
@@ -519,14 +536,15 @@ void register_wake(const Json& event, const std::string& nonce)
         registration.set("owner_pid", Json(owner->pid));
         registration.set("owner_birth", Json(owner->birth));
         const auto temporary = directory / (addon::random_nonce_hex() + ".registration");
-        std::ofstream output(temporary, std::ios::binary);
+        std::ofstream output(addon::usage_cache_io_path(temporary), std::ios::binary);
         const auto bytes = addon::serialize_json(registration);
         output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         output.close();
         if (!output) return;
         std::error_code ignored;
-        fs::remove(directory / "registration.json", ignored);
-        fs::rename(temporary, directory / "registration.json", ignored);
+        fs::remove(addon::usage_cache_io_path(directory / "registration.json"), ignored);
+        fs::rename(addon::usage_cache_io_path(temporary),
+            addon::usage_cache_io_path(directory / "registration.json"), ignored);
     }
     catch (const std::exception&) {
         // Failure disables wake alone; lifecycle publication already committed.
@@ -553,12 +571,12 @@ void unregister_wake(const Json& event)
         }
         else {
             std::error_code error;
-            if (fs::symlink_status(*directory, error).type() != fs::file_type::not_found) return;
+            if (fs::symlink_status(addon::usage_cache_io_path(*directory), error).type() != fs::file_type::not_found) return;
         }
         if (remove_bridge(*directory)) {
             std::error_code ignored;
             const auto prefix = path_string(directory->filename()) + ".";
-            for (const auto& entry : fs::directory_iterator(directory->parent_path())) {
+            for (const auto& entry : fs::directory_iterator(addon::usage_cache_io_path(directory->parent_path()))) {
                 const auto name = path_string(entry.path().filename());
                 const auto marker = name.starts_with(prefix) ? marker_owner(name) : std::nullopt;
                 if (marker && same_owner(marker->native, *owner)) fs::remove(entry.path(), ignored);
