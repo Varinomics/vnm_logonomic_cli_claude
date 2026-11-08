@@ -65,7 +65,10 @@ export function register(on) {
         const result = await next(event);
         if (!event.agent_id && event.source !== 'compact' && !next.signal?.aborted) {
             try {
-                if (await matches_activation($, current)) {
+                // Native /resume switches $.session.id() after this hook returns.
+                // Startup follows its accepted event; submission retains the
+                // live native-ID and exact binding checks below.
+                if (current === activation) {
                     current.start_pending = false;
                     start_listener($, current);
                 }

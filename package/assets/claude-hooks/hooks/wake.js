@@ -158,7 +158,10 @@ export function register(on) {
         const result = await next(event);
         if (!event.agent_id && event.source !== 'compact' && !next.signal?.aborted) {
             try {
-                if (await matches_activation($, current)) {
+                // Native /resume switches $.session.id() after this hook returns.
+                // The accepted event owns startup; actual admission still checks
+                // the live native ID before submitting a prompt.
+                if (current === activation) {
                     // Bootstrap may initialize the module while this classic
                     // start awaits native registration. This completion owns
                     // permission to start the activation's first consumer.

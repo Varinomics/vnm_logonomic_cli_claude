@@ -56,6 +56,11 @@ async function fixture(source) {
             session_id = id;
             return emit('classic.SessionStart', { source, session_id: id }, next);
         },
+        resume: async id => {
+            const result = await emit('classic.SessionStart', { source: 'resume', session_id: id });
+            session_id = id;
+            return result;
+        },
         end: id => emit('session.end', { sessionId: id }),
     };
 }
@@ -101,6 +106,27 @@ for (const [index, source] of sources.entries()) {
 }
 assert.deepEqual(completed_start_listeners, [1, 1],
     'admission and dispatcher native completion own listeners after bootstrap and late binding failure');
+
+for (const [index, source] of sources.entries()) {
+    const test = await fixture(source);
+    await test.emit('session.start', { isInteractive: true });
+    await test.start('A', 'startup');
+    await test.end('A');
+    await test.start('B', 'clear');
+    await test.end('B');
+    const scheduled = test.scheduled.length;
+    test.events.length = 0;
+    assert.deepEqual(await test.resume('A'), { preserved: true });
+    assert.equal(test.scheduled.length, scheduled + 1,
+        'accepted native resume starts a listener before session.id switches after the hook');
+    assert.deepEqual(test.events, [], 'the departing native session cannot supply returning-A context');
+    for (const callback of test.scheduled.slice(0, -1)) await callback();
+    assert.deepEqual(test.operations, [], 'retired listeners remain fenced during delayed native identity switching');
+    await test.scheduled.at(-1)();
+    assert.deepEqual(test.operations.map(item => item.operation), index === 0
+        ? ['binding', 'listen'] : ['binding', 'ready', 'receive']);
+    assert.deepEqual(test.operations[0].value, { session_id: 'A' });
+}
 
 for (const source of sources) {
     const test = await fixture(source);
