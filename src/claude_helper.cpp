@@ -3,6 +3,7 @@
 #include "claude_wake.h"
 
 #include <logonomic_cli_addon/helper_client.h>
+#include <logonomic_cli_addon/execution_context.h>
 #include <logonomic_cli_addon/ids.h>
 #include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
@@ -91,6 +92,14 @@ std::optional<addon::Json_value> read_event(bool watch_parent)
             "prompt_id", "tool_name", "tool_use_id", "error"})
     {
         if (const auto* value = event->find(key)) sanitized.set(key, *value);
+    }
+    if (name->as_string() == "SessionStart" && !event->find("agent_id")) {
+        // Only the native session boundary supplies this snapshot. Tool input,
+        // transcript paths and the original project directory are not its cwd.
+        if (const auto* cwd = event->find("cwd")) {
+            sanitized.set("cwd", cwd->is_string() && addon::is_execution_local_path(cwd->as_string())
+                ? *cwd : addon::Json_value());
+        }
     }
     if (const auto* context = event->find("context_state")) {
         auto bounded = addon::Json_value::object();

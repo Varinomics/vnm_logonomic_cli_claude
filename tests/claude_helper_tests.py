@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import shutil
@@ -75,14 +76,17 @@ class Adapter:
             if response["type"] == "result":
                 assert response["request_id"] == request_id and response["status"] == "success", response
                 assert response["payload"]["session_wake"]["available"], response
-                return response["payload"]["environment"]["set"]
+                prepared = response["payload"]["environment"]["set"]
+                assert Path(prepared["VNM_CLAUDE_WAKE_DIRECTORY"]).parent == (profile / "wake").resolve()
+                assert response["payload"]["session_wake"]["binding"]["directory"] == prepared["VNM_CLAUDE_WAKE_DIRECTORY"]
+                return prepared
 
     def close(self):
         self.send({"type": "shutdown", "grace_ms": 5000})
         self.process.stdin.close()
         assert self.process.wait(timeout=10) == 0
 
-    def classify(self, delivery, version, current_session=None, *, attention=False, pending=None):
+    def classify(self, delivery, version, current_session=None, *, attention=False, pending=None, execution=None):
         self.serial += 1
         request_id = "r" + str(self.serial)
         payload = {"event": delivery["event"], "transition_nonce": delivery["transition_nonce"],
@@ -94,6 +98,8 @@ class Adapter:
             payload["context_state_version"] = version
         if pending is not None:
             payload["pending_conversational_request_id"] = pending
+        if execution is not None:
+            payload["execution_context"] = execution
         self.send({"type": "invoke", "request_id": request_id,
             "capability_id": "attention-kind" if attention else "helper-ingress",
             "version": 1 if attention else 2, "operation": "classify_event", "deadline_ms": 5000, "payload": payload})
@@ -212,6 +218,54 @@ def reply_evidence_contract(helper, executable, relay, environment, capture):
         adapter.close()
 
 
+def execution_context_contract(executable, run, root):
+    adapter = Adapter(executable)
+    session_id = "a375d05e-f6cf-4812-80f5-91b33d24c053"
+    start = {"hook_event_name": "SessionStart", "session_id": session_id, "source": "resume"}
+    cwd = str(root / "uncreated directory" / "nested ")
+
+    def deliver(payload):
+        result, records, _ = run(payload, CLAUDE_TEST_CONTEXT="empty")
+        assert result.returncode == 0 and result.stdout == "", result.stderr
+        return next(record["request"] for record in records if record["operation"] == "provider-event")
+
+    try:
+        assert {"capability_id": "execution-context", "version": 1} in adapter.capabilities["capabilities"]
+        delivery = deliver({**start, "cwd": cwd, "transcript_path": "/private/transcript",
+            "project_dir": "/launch/project", "tool_input": {"command": "cd /not-authoritative"}})
+        body = delivery["event"]["body"]
+        assert body["cwd"] == cwd
+        assert not any(key in body for key in ("transcript_path", "project_dir", "tool_input"))
+        result = adapter.classify(delivery, None, execution={"version": 1})
+        expected = {"version": 1, "updates": [{"provider_session_id": session_id,
+            "transition_nonce": delivery["transition_nonce"], "sequence": "0", "state": "confirmed",
+            "environment": "local", "cwd": cwd, "source": "claude.SessionStart"}]}
+        assert result["execution_context"] == expected
+        assert result["classification"] == "transition" and result["transition"] == {"kind": "resume"}
+        assert result["observations"][0]["resume_record"] == {"provider_session_id": session_id}
+        assert adapter.classify(delivery, None, execution={"version": 1}) == result
+        assert "execution_context" not in adapter.classify(delivery, None)
+        invalid = adapter.classify(delivery, None, execution={"version": "1"})
+        assert invalid["classification"] == "transition" and "failure" in invalid["execution_context"]
+        for malformed in (None, 12, "relative/path", "ssh://remote/work", "/work\nother", "/work\0other", "/" * 4097):
+            delivery = deliver({**start, "cwd": malformed})
+            assert delivery["event"]["body"]["cwd"] is None
+            result = adapter.classify(delivery, None, "different-session", execution={"version": 1})
+            update = result["execution_context"]["updates"][0]
+            assert result["classification"] == "transition" and update["state"] == "unknown"
+            assert update["provider_session_id"] == session_id and update["transition_nonce"] == delivery["transition_nonce"]
+            assert update["cwd"] == "" and update["environment"] == ""
+        delivery = deliver(start)
+        assert "cwd" not in delivery["event"]["body"]
+        assert adapter.classify(delivery, None, execution={"version": 1})["execution_context"]["updates"][0]["state"] == "unknown"
+        delivery = deliver({**start, "cwd": cwd, "agent_id": "child"})
+        assert "cwd" not in delivery["event"]["body"]
+        result = adapter.classify(delivery, None, execution={"version": 1})
+        assert result["classification"] == "ignore" and "execution_context" not in result
+    finally:
+        adapter.close()
+
+
 def sweep_policy(adapter, profile, parent, pid, birth):
     def marker(directory, native_live, registrar_live):
         file = parent / (directory.name + f".{pid}.{birth}" + ("" if native_live else "0") +
@@ -238,6 +292,47 @@ def sweep_policy(adapter, profile, parent, pid, birth):
     assert not dead.exists() and not dead_marker.exists() and not pending_marker.exists(), "dead ownership leaked"
 
 
+def wake_exchange_contract(adapter, wake, registration):
+    def receive():
+        until = time.monotonic() + 7
+        while time.monotonic() < until:
+            requests = list(wake.glob("*.request"))
+            if requests:
+                request_path = requests[0]
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+                assert request["operation"] == "inspect"
+                assert request["payload"]["session"]["provider_session_id"] == registration["provider_session_id"]
+                assert request["payload"]["correlation"]["transition_nonce"] == registration["transition_nonce"]
+                request_path.rename(request_path.with_suffix(".claimed"))
+                request_path.with_suffix(".response").write_text(json.dumps({"available": True}), encoding="utf-8")
+                return
+            time.sleep(0.01)
+        raise AssertionError("adapter did not publish its wake request")
+
+    adapter.serial += 1
+    request_id = "r" + str(adapter.serial)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        received = executor.submit(receive)
+        adapter.send({"type": "invoke", "request_id": request_id, "capability_id": "session-wake",
+            "version": 1, "operation": "inspect", "deadline_ms": 10000, "payload": {
+                "session": {"provider_session_id": registration["provider_session_id"],
+                    "working_directory": str(wake.parent), "launcher_argv": ["claude"],
+                    "launch_environment": {"platform": "windows-x86_64" if os.name == "nt" else
+                        ("macos-arm64" if sys.platform == "darwin" else "linux-x86_64"),
+                        "effective_environment": {"PATH": os.environ["PATH"]}}},
+                "correlation": {"version": 1, "transition_nonce": registration["transition_nonce"]},
+                "binding": {"directory": str(wake)}}})
+        while True:
+            response = adapter.read()
+            if response["type"] == "result":
+                assert response["request_id"] == request_id and response["status"] == "success", response
+                assert response["payload"] == {"available": True}, response
+                break
+        received.result(timeout=8)
+    assert not any(wake.glob("*.request")) and not any(wake.glob("*.claimed"))
+    assert not any(wake.glob("*.writing")) and not any(wake.glob("*.response"))
+
+
 def wake_owner_contract(helper, executable, relay, environment, root):
     adapter = Adapter(executable)
     environment = {**environment, "LOGONOMIC_PROVIDER_HELPERS_DIR": str(executable.parent.parent / "helpers")}
@@ -261,13 +356,16 @@ def wake_owner_contract(helper, executable, relay, environment, root):
             def event(payload):
                 owner.stdin.write(json.dumps(payload) + "\n")
                 owner.stdin.flush()
-                return json.loads(owner.stdout.readline())
+                line = owner.stdout.readline()
+                assert line, owner.stderr.read()
+                return json.loads(line)
 
             try:
                 launched = event(start)
                 registration = json.loads((wake / "registration.json").read_text(encoding="utf-8"))
                 assert registration["owner_pid"] == owner.pid != launched["launcher_pid"], registration
                 assert owner.poll() is None
+                wake_exchange_contract(adapter, wake, registration)
                 adapter.prepare(profile)
                 assert wake.is_dir(), "an exited intermediate launcher caused live-session cleanup"
                 if crash:
@@ -332,6 +430,11 @@ def main():
         if "--reply-only" in sys.argv[5:]:
             reply_evidence_contract(helper, adapter, relay, environment, capture)
             print("Claude helper-to-adapter reply evidence checks passed.")
+            return
+
+        if "--execution-only" in sys.argv[5:]:
+            execution_context_contract(adapter, run, Path(temporary))
+            print("Claude helper-to-adapter execution context checks passed.")
             return
 
         context_adapter = Adapter(adapter)
@@ -465,6 +568,17 @@ def main():
         run({**end, "session_id": "new-session"}, VNM_CLAUDE_WAKE_DIRECTORY=str(wake_directory))
         assert not wake_directory.exists() and not list(wake_parent.iterdir())
         wake_owner_contract(helper, adapter, relay, environment, Path(temporary).resolve())
+        if os.name == "nt":
+            root = Path(temporary).resolve()
+            for directory_length in (241, 320):
+                component_length = directory_length - len(str(root)) - 47
+                assert 0 < component_length <= 255
+                component = ("é" if directory_length == 320 else "p") + ("p" * (component_length - 1))
+                long_root = root / component
+                long_root.mkdir()
+                wake = long_root / "profile" / "wake" / ("a" * 32)
+                assert len(str(wake)) == directory_length and len(str(wake / (("a" * 32) + ".writing"))) > 260
+                wake_owner_contract(helper, adapter, relay, environment, long_root)
 
         capture.write_text("", encoding="utf-8")
         process = subprocess.Popen([str(helper), "event", "--watch-parent"], stdin=subprocess.PIPE,

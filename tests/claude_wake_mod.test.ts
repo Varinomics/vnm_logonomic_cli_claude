@@ -37,7 +37,8 @@ for (const item of cases) {
         let reply;
         const request = {
             id: 'a'.repeat(32), operation: 'notify', expires_at_ms: item.expired ? 999 : 10000,
-            payload: { session: { provider_session_id: 'native-session' }, notification_id: 'notice-1', instruction: 'Read the Logonomic mailbox.' },
+            payload: { session: { provider_session_id: 'native-session' }, correlation: { transition_nonce: 'b'.repeat(32) },
+                notification_id: 'notice-1', instruction: 'Read the Logonomic mailbox.' },
         };
         on('session.id', () => ({ value: interleaved || item.changed && identity_calls++ > 0 ? 'different-session' : 'native-session' }));
         on('session.usage', () => ({ value: { context: { tokens: 64000, window: 200000 } } }));
@@ -68,7 +69,8 @@ for (const item of cases) {
             }
             const operation = event.argv[2];
             let result;
-            if (operation === 'listen') {
+            if (operation === 'binding') result = { provider_session_id: 'native-session', transition_nonce: 'b'.repeat(32) };
+            else if (operation === 'listen') {
                 if (listened) return { deny: 'test-completed' };
                 listened = true;
                 result = request;

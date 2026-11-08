@@ -73,6 +73,12 @@ After a native root answer completes, the Mod publishes an authenticated
 completion event so pending mail is rechecked after its busy state clears;
 the earlier classic Stop hook alone cannot establish that readiness.
 
+The optional `execution-context@1` companion reports the exact main-session
+`SessionStart` cwd independently of the native conversation identity. Missing or
+unsupported directory evidence is explicit. See
+[conversation history inspection](docs/resume_history.md) for snapshot coverage
+and native resume limits.
+
 The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
 during configuration. `cmake --install` exports a fresh artifact beneath its install-time
 prefix and preserves executable permissions. An existing per-package destination,

@@ -22,13 +22,27 @@ function atomic_json(file, value) {
     fs.renameSync(temporary, file);
 }
 
-function identity_matches(directory, request) {
-    const registered = read_json(path.join(directory, 'registration.json'));
-    return registered.provider_session_id === request.payload.session.provider_session_id &&
-        registered.transition_nonce === request.payload.correlation.transition_nonce;
+function same_binding(left, right) {
+    return typeof left?.provider_session_id === 'string' && left.provider_session_id.length > 0 &&
+        /^[0-9a-f]{32}$/.test(left.transition_nonce) &&
+        left.provider_session_id === right?.provider_session_id && left.transition_nonce === right.transition_nonce;
 }
 
-function claim(directory, suffix) {
+function binding_matches(directory, binding) {
+    return same_binding(read_json(path.join(directory, 'registration.json')), binding);
+}
+
+function identity_matches(directory, request) {
+    return binding_matches(directory, {
+        provider_session_id: request.payload.session.provider_session_id,
+        transition_nonce: request.payload.correlation.transition_nonce,
+    });
+}
+
+function claim(directory, suffix, binding) {
+    // Retired consumers must stop before inspecting, deleting or claiming any
+    // successor files, including a later activation of the same native ID.
+    if (!binding_matches(directory, binding)) throw new Error('identity_changed');
     for (const name of fs.readdirSync(directory)) {
         if (!new RegExp('^[0-9a-f]{32}\\.' + suffix + '$').test(name)) continue;
         const pending = path.join(directory, name);
@@ -36,11 +50,13 @@ function claim(directory, suffix) {
         try {
             request = read_json(pending);
             if (request.id + '.' + suffix !== name || !Number.isSafeInteger(request.expires_at_ms) ||
-                request.expires_at_ms <= Date.now() || !identity_matches(directory, request))
+                request.expires_at_ms <= Date.now())
             {
                 remove(pending);
                 continue;
             }
+            if (!same_binding(binding, { provider_session_id: request.payload.session.provider_session_id,
+                transition_nonce: request.payload.correlation.transition_nonce })) continue;
             fs.renameSync(pending, path.join(directory, request.id + (suffix === 'submit' ? '.submitted' : '.claimed')));
         }
         catch { continue; }
@@ -71,8 +87,13 @@ async function wait_for_directory(directory, deadline) {
     });
 }
 
-async function listen(directory, suffix, timeout_ms) {
-    const first = claim(directory, suffix);
+async function wait_for_registration(directory, deadline) {
+    const read = () => {
+        try { return read_json(path.join(directory, 'registration.json')); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        return null;
+    };
+    const first = read();
     if (first) return first;
     return new Promise((resolve, reject) => {
         let done = false;
@@ -85,7 +106,35 @@ async function listen(directory, suffix, timeout_ms) {
         };
         const scan = () => {
             try {
-                const request = claim(directory, suffix);
+                const registered = read();
+                if (registered) finish(registered);
+            }
+            catch (error) { finish(null, error); }
+        };
+        const watcher = fs.watch(directory, scan);
+        const timer = setTimeout(() => finish(null, new Error('registration_unavailable')), Math.max(0, deadline - Date.now()));
+        watcher.on('error', error => finish(null, error));
+        // Registration publication, not directory allocation, is readiness.
+        // Recheck after installing the watcher to close the publication gap.
+        scan();
+    });
+}
+
+async function listen(directory, suffix, timeout_ms, binding) {
+    const first = claim(directory, suffix, binding);
+    if (first) return first;
+    return new Promise((resolve, reject) => {
+        let done = false;
+        const finish = (value, error) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            watcher.close();
+            if (error) reject(error); else resolve(value);
+        };
+        const scan = () => {
+            try {
+                const request = claim(directory, suffix, binding);
                 if (request) finish(request);
             }
             catch (error) { finish(null, error); }
@@ -141,26 +190,35 @@ async function main(argv, input) {
     const [operation, directory, id] = argv;
     const deadline = Date.now() + 20000;
     if (!path.isAbsolute(directory)) throw new Error('invalid_directory');
-    if (!fs.existsSync(directory) && (operation === 'listen' || operation === 'receive' || operation === 'ready')) {
+    if (!fs.existsSync(directory) && operation === 'binding') {
         // Preparation reserves only a path. The authenticated SessionStart
         // helper creates it after the native process actually starts.
         await wait_for_directory(directory, deadline);
     }
     if (fs.lstatSync(directory).isSymbolicLink() ||
         path.normalize(fs.realpathSync(directory)) !== path.normalize(directory)) throw new Error('invalid_directory');
+    if (operation === 'binding') {
+        const registered = await wait_for_registration(directory, deadline);
+        const binding = { provider_session_id: JSON.parse(input).session_id, transition_nonce: registered.transition_nonce };
+        if (!same_binding(registered, binding)) throw new Error('identity_changed');
+        return binding;
+    }
     if (operation === 'listen' || operation === 'receive') {
-        return listen(directory, operation === 'listen' ? 'request' : 'submit', Math.max(0, deadline - Date.now()));
+        return listen(directory, operation === 'listen' ? 'request' : 'submit', Math.max(0, deadline - Date.now()), JSON.parse(input));
     }
     if (operation === 'ready') {
+        const binding = JSON.parse(input);
+        if (!binding_matches(directory, binding)) throw new Error('identity_changed');
         atomic_json(path.join(directory, 'dispatch-ready.json'), {
-            session_id: JSON.parse(input).session_id, expires_at_ms: Date.now() + 30000,
+            ...binding, expires_at_ms: Date.now() + 30000,
         });
         return { completed: true };
     }
     if (operation === 'inspect-dispatch') {
         try {
             const ready = read_json(path.join(directory, 'dispatch-ready.json'));
-            return { available: ready.session_id === JSON.parse(input).session_id && ready.expires_at_ms > Date.now() };
+            const binding = JSON.parse(input);
+            return { available: binding_matches(directory, binding) && same_binding(ready, binding) && ready.expires_at_ms > Date.now() };
         }
         catch { return { available: false }; }
     }
