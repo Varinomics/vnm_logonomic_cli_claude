@@ -97,7 +97,7 @@ bool resume_context_supported(
     const auto program = addon::resolve_program(command.front(), environment, launch.working_directory);
     if (!program || !native_context::selected_native_program(*program) || !native_context::policy_absent() ||
         !native_context::absent(profile / ".config.json") ||
-        !native_context::absent(profile / "remote-settings.json") ||
+        !settings_preserve_transcript_location(profile / "remote-settings.json") ||
         !settings_preserve_transcript_location(profile / "settings.json") ||
         !settings_preserve_transcript_location(profile / ".claude.json"))
     {
@@ -128,20 +128,9 @@ bool resume_context_supported(
         }
         directory = parent;
     }
-#ifdef _WIN32
-    const auto config = addon::environment_value(environment, "APPDATA");
-    return !config.empty() && native_context::absent(addon::path_from_utf8(config) / "Anthropic");
-#else
-    auto config = addon::environment_value(environment, "XDG_CONFIG_HOME");
-    if (config.empty()) {
-        const auto home = addon::environment_value(environment, "HOME");
-        if (home.empty()) {
-            return false;
-        }
-        config = path_string(addon::path_from_utf8(home) / ".config");
-    }
-    return native_context::absent(addon::path_from_utf8(config) / "anthropic");
-#endif
+    // The Anthropic SDK's separate configuration directory holds authentication
+    // profiles, not Claude transcripts. Its presence does not redirect lookup.
+    return true;
 }
 
 struct transcript_message_t

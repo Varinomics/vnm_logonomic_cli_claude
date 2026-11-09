@@ -465,7 +465,8 @@ void context_contract()
 {
 #ifndef __APPLE__
     Fixture fixture;
-    write(fixture.transcript(), addon::serialize_json(message("assistant", k_assistant)));
+    const auto retained = addon::serialize_json(message("assistant", k_assistant)) + '\n';
+    write(fixture.transcript(), retained);
     // Transcript existence needs no credentials or quota authorization. Those
     // selectors remain owned by native launch and the separate quota contract.
     write(fixture.profile() / ".credentials.json", "not read by resume inspection");
@@ -474,6 +475,33 @@ void context_contract()
     }
     write(fixture.profile() / "settings.json", R"({"env":{"ANTHROPIC_API_KEY":"fixture-value"}})");
     fixture.expect(Availability::AVAILABLE, "resume inspection is independent of quota and authentication scope");
+
+    write(fixture.profile() / "remote-settings.json", "{}");
+#ifdef _WIN32
+    const auto authentication = fixture.root() / "appdata/Anthropic";
+#else
+    const auto authentication = fixture.root() / "appdata/anthropic";
+#endif
+    write(authentication / "active_config", "fixture");
+    write(authentication / "configs/fixture.json", "{}");
+    write(authentication / "credentials/fixture.json", "not read by history inspection");
+    fixture.expect_content(Availability::AVAILABLE, Content::NONEMPTY,
+        "an empty remote settings cache and separate authentication store preserve retained history");
+    fs::remove(fixture.transcript());
+    fixture.expect_content(Availability::ABSENT, Content::EMPTY,
+        "ordinary configuration and authentication files cannot make missing history uncertain");
+    const auto before_absent = snapshot(fixture.root());
+    const auto absent = fixture.prepare(true);
+    require(absent.m_status == addon::Result_status::UNAVAILABLE && absent.m_reason == "conversation_absent",
+        "known missing history with ordinary configuration refuses exact resume");
+    require(snapshot(fixture.root()) == before_absent,
+        "refused resume with ordinary configuration allocates no hook or wake state");
+    auto title = claude::object(R"({"type":"custom-title","customTitle":"Planning"})");
+    title.set("sessionId", Json(k_session));
+    write(fixture.transcript(), addon::serialize_json(title) + '\n');
+    fixture.expect_content(Availability::UNKNOWN, Content::EMPTY,
+        "ordinary configuration also permits known-empty metadata inspection without redefining availability");
+    write(fixture.transcript(), retained);
 
     for (const auto* key : {"CLAUDE_CODE_MANAGED_SETTINGS_PATH", "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
         "CLAUDE_CODE_MOCK_REMOTE_SETTINGS", "USE_STAGING_OAUTH", "USE_LOCAL_OAUTH",
@@ -484,16 +512,22 @@ void context_contract()
         fixture.environment().erase(key);
     }
     for (const auto& path : {fixture.profile() / "settings.json", fixture.profile() / ".claude.json",
+        fixture.profile() / "remote-settings.json",
         fixture.root() / "work/.claude/settings.local.json", fixture.root() / ".claude/settings.json"})
     {
         write(path, R"({"env":{"CLAUDE_CONFIG_DIR":"another-profile"}})");
-        fixture.expect(Availability::UNKNOWN, "settings redirect must retain native authority");
+        fixture.expect_content(Availability::UNKNOWN, Content::UNKNOWN,
+            "settings redirect must retain native authority");
         write(path, "{unfinished");
-        fixture.expect(Availability::UNKNOWN, "unreadable settings cannot prove unchanged lookup scope");
+        fixture.expect_content(Availability::UNKNOWN, Content::UNKNOWN,
+            "malformed settings cannot prove unchanged lookup scope");
+        fs::remove(path);
+        fs::create_directory(path);
+        fixture.expect_content(Availability::UNKNOWN, Content::UNKNOWN,
+            "a settings source that cannot be read as a file retains native authority");
         fs::remove(path);
     }
-    for (const auto& path : {fixture.profile() / ".config.json", fixture.profile() / "remote-settings.json",
-        fixture.root() / "work/.git"})
+    for (const auto& path : {fixture.profile() / ".config.json", fixture.root() / "work/.git"})
     {
         write(path, "{}");
         fixture.expect(Availability::UNKNOWN, "unresolved native settings or linked-worktree scope remains native");
@@ -527,6 +561,18 @@ void inaccessible_transcript_contract()
     const auto result = addon::decode_resume_inspect_result(invocation.m_payload, nullptr);
     require(result && result->availability == Availability::UNKNOWN,
         "inaccessible transcript cannot be reported absent");
+
+    const auto remote_settings = fixture.profile() / "remote-settings.json";
+    write(remote_settings, "{}");
+    const HANDLE settings_handle = CreateFileW(
+        remote_settings.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    require(settings_handle != INVALID_HANDLE_VALUE, "fixture locks remote settings against another reader");
+    const auto settings_invocation = fixture.inspect(4);
+    CloseHandle(settings_handle);
+    const auto settings_result = addon::decode_resume_inspect_result(settings_invocation.m_payload, nullptr, 4);
+    require(settings_result && settings_result->availability == Availability::UNKNOWN &&
+        settings_result->content == Content::UNKNOWN,
+        "unreadable remote settings cannot certify native availability or empty content");
 #endif
 }
 
