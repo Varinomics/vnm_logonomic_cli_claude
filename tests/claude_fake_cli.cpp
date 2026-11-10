@@ -11,8 +11,12 @@
 #include <shellapi.h>
 #endif
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,6 +24,65 @@
 namespace {
 
 namespace addon = logonomic::cli_addon;
+
+std::optional<int> selection_probe(const std::vector<std::string>& arguments)
+{
+    const char* mode = std::getenv("CLAUDE_TEST_SELECTION_PROBE");
+    if (!mode) return std::nullopt;
+    const auto mcp = std::find(arguments.begin(), arguments.end(), "--mcp-config");
+    if (std::find(arguments.begin(), arguments.end(), "--strict-mcp-config") == arguments.end() ||
+        mcp == arguments.end() || std::next(mcp) == arguments.end() || *std::next(mcp) != "{\"mcpServers\":{}}")
+    {
+        return 6;
+    }
+    std::string model = "saved-model";
+    std::string effort = "saved-effort";
+    for (const auto& argument : arguments) {
+        if (argument.starts_with("--model=")) model = argument.substr(8);
+        if (argument.starts_with("--effort=")) effort = argument.substr(9);
+    }
+    if (model == "opus") model = "claude-native-opus";
+    if (std::string_view(mode) == "clamped") effort = "policy-capped-effort";
+    if (std::string_view(mode) == "substituted") model = "substituted-model";
+    const char* expected = std::getenv("CLAUDE_TEST_EXPECTED_PROFILE");
+    const char* selected = std::getenv("CLAUDE_CONFIG_DIR");
+    if (expected && (!selected || std::string_view(expected) != selected)) return 3;
+    for (std::string line; std::getline(std::cin, line);) {
+        const auto request = addon::parse_json(line, addon::Json_parse_limits{}, nullptr);
+        if (!request || !request->find("request") || !request->find("request_id")) return 4;
+        const auto* subtype = request->find("request")->find("subtype");
+        if (!subtype || !subtype->is_string()) return 4;
+        auto payload = addon::Json_value::object();
+        if (subtype->as_string() == "initialize") {
+            auto entry = addon::Json_value::object();
+            entry.set("value", addon::Json_value("opus"));
+            entry.set("resolvedModel", addon::Json_value("claude-native-opus"));
+            auto models = addon::Json_value::array();
+            models.push_back(std::move(entry));
+            payload.set("models", std::move(models));
+        }
+        else
+        if (subtype->as_string() == "get_settings") {
+            if (std::string_view(mode) != "missing") {
+                auto applied = addon::Json_value::object();
+                applied.set("model", addon::Json_value(model));
+                applied.set("effort", addon::Json_value(effort));
+                payload.set("applied", std::move(applied));
+            }
+            payload.set("effective", addon::Json_value("private-settings-secret-canary"));
+        }
+        else return 5;   // The probe may neither prompt the model nor start Task MCP discovery.
+        auto response = addon::Json_value::object();
+        response.set("subtype", addon::Json_value(std::string_view(mode) == "unsupported" ? "error" : "success"));
+        response.set("request_id", *request->find("request_id"));
+        response.set("response", std::move(payload));
+        auto frame = addon::Json_value::object();
+        frame.set("type", addon::Json_value("control_response"));
+        frame.set("response", std::move(response));
+        std::cout << addon::serialize_json(frame) << '\n' << std::flush;
+    }
+    return 0;
+}
 
 bool write_record(std::string_view capture, const addon::Json_value& record)
 {
@@ -60,6 +123,9 @@ addon::Json_value arguments(int argc, wchar_t** argv)
 #ifdef _WIN32
 int wmain(int argc, wchar_t** argv)
 {
+    std::vector<std::string> probe_arguments;
+    for (int index = 1; index < argc; ++index) probe_arguments.push_back(utf8(argv[index]));
+    if (const auto result = selection_probe(probe_arguments)) return *result;
     std::vector<wchar_t> capture(32768);
     const DWORD length = GetEnvironmentVariableW(L"CLAUDE_TEST_ARGV_CAPTURE", capture.data(),
         static_cast<DWORD>(capture.size()));
@@ -81,6 +147,7 @@ int wmain(int argc, wchar_t** argv)
 #else
 int main(int argc, char** argv)
 {
+    if (const auto result = selection_probe(std::vector<std::string>(argv + 1, argv + argc))) return *result;
     const char* capture = std::getenv("CLAUDE_TEST_ARGV_CAPTURE");
     if (capture == nullptr || *capture == '\0') {
         return 2;

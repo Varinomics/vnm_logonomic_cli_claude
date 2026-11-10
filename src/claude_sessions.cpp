@@ -4,6 +4,7 @@
 #include "claude_support.h"
 
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/launcher_utilities.h>
 
 #include <algorithm>
 #include <chrono>
@@ -150,13 +151,40 @@ std::string join(const std::vector<std::string>& items)
     return result;
 }
 
+bool apply_model_selection(
+    const addon::Session_launch_context& context,
+    const addon::Delegated_model_selection& selection,
+    addon::Process_proposal& process)
+{
+    const auto& source = context.launcher_argv;
+    for (std::size_t index = *cli_argument_index(source) + 1; index < source.size(); ++index) {
+        const auto& argument = source[index];
+        if (argument == "--") {
+            return false;
+        }
+        index += claude_option_value_words(source, index);
+    }
+    // Native scalar options use the last occurrence. Appending retains every
+    // saved argument, including option-looking values owned by other flags.
+    if (selection.model) {
+        process.argv.push_back("--model=" + *selection.model);
+        // An empty CLI fallback overrides saved fallback settings for this
+        // process, so overload cannot select a different configured model.
+        process.argv.push_back("--fallback-model=");
+    }
+    if (selection.reasoning_effort) {
+        process.argv.push_back("--effort=" + *selection.reasoning_effort);
+    }
+    return true;
+}
+
 std::string control_request(Json& state, const std::string& phase)
 {
     const auto id = addon::random_nonce_hex();
     state.set("mcp_phase", Json(phase));
     state.set("mcp_request_id", Json(id));
     Json request = Json::object();
-    request.set("subtype", Json(phase == "initialize" ? "initialize" : "mcp_status"));
+    request.set("subtype", Json(phase == "status" ? "mcp_status" : phase));
     Json frame = Json::object();
     frame.set("type", Json("control_request"));
     frame.set("request_id", Json(id));
@@ -233,7 +261,23 @@ std::optional<std::string> advance_readiness(
     const auto phase = text(state, "mcp_phase");
     if (text(*response, "subtype") != "success" || !payload || !payload->is_object())
     {
-        return "mcp_control_unavailable";
+        return phase == "get_settings" ? "model_selection_unavailable" : "mcp_control_unavailable";
+    }
+    if (phase == "get_settings") {
+        const auto* applied = payload->find("applied");
+        if (!applied || !applied->is_object()) {
+            return "model_selection_unavailable";
+        }
+        const auto model = text(state, "selected_model");
+        const auto effort = text(state, "selected_effort");
+        if (!model.empty() && text(*applied, "model") != model) {
+            return "model_selection_unavailable";
+        }
+        if (!effort.empty() && text(*applied, "effort") != effort) {
+            return "reasoning_effort_unavailable";
+        }
+        result.stdin_bytes = control_request(state, "status");
+        return std::nullopt;
     }
     if (phase == "status") {
         const auto ready = required_catalog_ready(*payload, state);
@@ -268,7 +312,120 @@ std::optional<std::string> advance_readiness(
         return "invalid_protocol_state";
     }
     state.set("mcp_deadline_ms", Json(readiness_clock_ms() + 30000.0));
-    result.stdin_bytes = control_request(state, "status");
+    if (state.find("selected_model") || state.find("selected_effort")) {
+        // Native metadata resolves aliases without constraining custom model
+        // IDs to the menu. get_settings reports the applied value after policy
+        // caps and model support, which --effort alone does not attest.
+        const auto model = text(state, "selected_model");
+        const auto* models = payload->find("models");
+        if (!model.empty() && models && models->is_array()) {
+            for (const auto& entry : models->as_array()) {
+                if (text(entry, "value") == model && !text(entry, "resolvedModel").empty()) {
+                    state.set("selected_model", Json(text(entry, "resolvedModel")));
+                    break;
+                }
+            }
+        }
+        result.stdin_bytes = control_request(state, "get_settings");
+    }
+    else {
+        result.stdin_bytes = control_request(state, "status");
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> verify_model_selection(
+    const addon::Session_launch_context& context,
+    const addon::Delegated_model_selection& selection,
+    const std::filesystem::path& package_root,
+    addon::Invocation_context& invocation,
+    std::string& selected_model)
+{
+    // A native settings reply includes raw settings and may contain secrets.
+    // Keep it inside a private, prompt-free probe, outside host task stdout and
+    // its failure diagnostics. The actual task retains its normal MCP startup.
+    for (std::size_t index = *cli_argument_index(context.launcher_argv) + 1;
+         index < context.launcher_argv.size(); ++index)
+    {
+        const auto& argument = context.launcher_argv[index];
+        if (argument == "--mcp-config" || argument.starts_with("--mcp-config=")) {
+            return "model_selection_unavailable";
+        }
+        index += claude_option_value_words(context.launcher_argv, index);
+    }
+    auto process = cli_process(context, true);
+    apply_account(context, process);
+    if (!apply_model_selection(context, selection, process)) {
+        return "model_selection_unavailable";
+    }
+    process.argv.insert(process.argv.end(), {"-p", "--input-format", "stream-json", "--output-format",
+        "stream-json", "--verbose", "--no-session-persistence", "--strict-mcp-config", "--mcp-config",
+        "{\"mcpServers\":{}}", "--tools", ""});
+    auto environment = addon::environment_pairs(context.launch_environment->effective_environment);
+    for (const auto& [name, value] : process.environment) {
+        addon::set_environment(environment, name, value);
+    }
+    const auto program = addon::resolve_program(context.launcher_argv.front(), environment,
+        context.working_directory, addon::Launcher_whitespace::ASCII);
+    if (!program) {
+        return "model_selection_unavailable";
+    }
+    std::vector<std::string> argv{path_string(*program)};
+    if (!addon::native_image(*program)) {
+#ifdef _WIN32
+        argv.insert(argv.begin(), path_string(package_root / "helpers/claude_launch_bridge.exe"));
+#else
+        argv.insert(argv.begin(), path_string(package_root / "helpers/claude_launch_bridge"));
+#endif
+    }
+    argv.insert(argv.end(), process.argv.begin(), process.argv.end());
+    Json state = Json::object();
+    if (selection.model) state.set("selected_model", Json(*selection.model));
+    if (selection.reasoning_effort) state.set("selected_effort", Json(*selection.reasoning_effort));
+    addon::Probe_exchange exchange;
+    exchange.initial_input = control_request(state, "initialize");
+    std::size_t consumed = 0;
+    bool pending_before_input = false;
+    std::string refusal = "model_selection_unavailable";
+    exchange.on_output = [&](std::string_view output) -> std::optional<std::string> {
+        std::string input;
+        try {
+            if (pending_before_input) return std::nullopt;
+            for (std::size_t end; (end = output.find('\n', consumed)) != std::string_view::npos;) {
+                const auto line = output.substr(consumed, end - consumed);
+                consumed = end + 1;
+                if (line.find_first_not_of(" \t\r") == std::string_view::npos) continue;
+                if (!input.empty() || exchange.complete) return std::nullopt;
+                const auto event = object(line);
+                if (text(event, "type") != "control_response") return std::nullopt;
+                addon::Structured_inspect_result next;
+                if (const auto failure = advance_readiness(event, state, next)) {
+                    refusal = *failure == "reasoning_effort_unavailable"
+                        ? *failure : "model_selection_unavailable";
+                    return std::nullopt;
+                }
+                if (text(state, "mcp_phase") == "status") {
+                    selected_model = text(state, "selected_model");
+                    exchange.complete = true;
+                }
+                else
+                if (next.stdin_bytes) {
+                    input = std::move(*next.stdin_bytes);
+                }
+            }
+            pending_before_input = !input.empty() &&
+                output.substr(consumed).find_first_not_of(" \t\r\n") != std::string_view::npos;
+        }
+        catch (const std::exception&) {
+            return std::nullopt;
+        }
+        return input;
+    };
+    if (!addon::probe(argv, environment, context.working_directory, 10000, invocation, &exchange) ||
+        !exchange.complete)
+    {
+        return refusal;
+    }
     return std::nullopt;
 }
 
@@ -425,6 +582,13 @@ addon::Structured_inspect_result inspect_session(
             }
             pending_before_input = false;
             const auto phase = text(state, "mcp_phase");
+            const bool session_fallback = subtype == "model_fallback" || subtype == "model_consent_fallback" ||
+                (subtype == "model_refusal_fallback" && (!event.find("scope") || text(event, "scope") == "session"));
+            if (state.find("verified_model") && type == "system" && session_fallback &&
+                (root_session.empty() || text(event, "session_id") == root_session))
+            {
+                return failed("model_selection_unavailable");
+            }
             if (!phase.empty() && phase != "released") {
                 if (type != "control_response") {
                     return failed("unexpected_preprompt_output");
@@ -438,6 +602,10 @@ addon::Structured_inspect_result inspect_session(
                 return failed("mcp_control_response_mismatch");
             }
             if (type == "system" && subtype == "init") {
+                const auto model = text(state, "verified_model");
+                if (!model.empty() && text(event, "model") != model) {
+                    return failed("model_selection_unavailable");
+                }
                 const auto id = text(event, "session_id");
                 if (id.empty() || (!root_session.empty() && id != root_session)) {
                     return failed("session_provenance_mismatch");
@@ -619,10 +787,30 @@ void handle_sessions(addon::Invocation_context& invocation, const std::filesyste
     result.private_artifacts.push_back({relative, addon::serialize_json(config)});
     auto prepared = prepare(input->context, input->purpose, input->prompt,
         path_string(addon::path_from_utf8(input->control.private_artifact_root) / relative), tools, names, required_servers);
+    if (input->model_selection && !apply_model_selection(input->context, *input->model_selection, prepared.process)) {
+        invocation.fail(addon::Result_status::UNAVAILABLE, "model_selection_unavailable");
+        return;
+    }
+    if (input->model_selection) {
+        std::string selected_model;
+        if (const auto failure = verify_model_selection(input->context, *input->model_selection,
+                package_root, invocation, selected_model))
+        {
+            invocation.fail(invocation.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::UNAVAILABLE,
+                invocation.cancel_requested() ? "cancelled" : *failure);
+            return;
+        }
+        auto state = object(prepared.inspection.protocol_state);
+        if (input->model_selection->model) {
+            state.set("verified_model", Json(std::move(selected_model)));
+        }
+        prepared.inspection.protocol_state = addon::serialize_json(state);
+    }
     result.process         = std::move(prepared.process);
     result.inspection      = std::move(prepared.inspection);
     result.profile_storage = input->context.profile_storage;
     result.account_context = input->context.account_context;
+    result.model_selection = input->model_selection;
     invocation.succeed(addon::encode_delegated_prepare_result(result));
 }
 

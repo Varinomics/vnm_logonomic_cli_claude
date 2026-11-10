@@ -161,6 +161,20 @@ and root-result provenance still apply. Task-server children remain
 within the host-owned process lifetime.
 Non-delegated sessions retain their one-shot input behavior.
 
+The optional `delegated-model-selection@1` capability accepts native model and
+effort strings for one task. It appends session-only `--model` and `--effort`
+options after saved launcher options. A private, prompt-free native
+`get_settings` probe must acknowledge the applied selection before preparation
+succeeds; initialization metadata resolves
+model aliases without restricting custom model IDs to the model menu. A native
+policy cap, substituted model, or unavailable settings response refuses the
+explicit selection. The probe uses strict empty MCP configuration so it starts
+no saved external servers; an explicit saved `--mcp-config` is outside this
+selection path. Raw native settings stay inside the provider and never enter
+task diagnostics. Explicit model requests disable configured fallback models.
+Saved launcher defaults, account selection and permissions
+remain in force, and a task without a selection keeps its existing startup path.
+
 A structured or delegated implementation keeps the launcher's permission
 posture: the launcher's own options, such as `--permission-mode` or
 `--allowedTools`, and the user's Claude settings. The package adds no

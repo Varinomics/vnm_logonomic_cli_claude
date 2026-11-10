@@ -139,6 +139,7 @@ int main()
         {"accounts", 2}, {"launch-preparation", 3}, {"interactive-resume", 2}, {"interactive-resume", 3},
         {"interactive-resume", addon::k_interactive_resume_content_version},
         {"structured-session", 3}, {"delegated-session", 3}, {"auth-status", 2}, {"quota", 3},
+        {addon::k_delegated_model_selection_capability_id, addon::k_delegated_model_selection_version},
         {"usage-scan", 3}, {"lifecycle-events", 2}, {"helper-ingress", 2},
         {"usage-lifetime-summary", 1},
         {"usage-saved-daily-tokens", 1},

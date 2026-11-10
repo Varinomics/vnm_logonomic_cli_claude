@@ -1867,6 +1867,175 @@ bool has_option(const Claude_reading& reading, std::string_view name)
         [name](const auto& option) { return option.first == name; });
 }
 
+void delegated_model_selection_contract()
+{
+    using Purpose = addon::Structured_purpose;
+    const auto probe_root = fs::temp_directory_path() / ("claude-selection-" + addon::random_nonce_hex());
+    fs::create_directories(probe_root);
+#ifdef _WIN32
+    const auto probe_program = probe_root / "claude.exe";
+#else
+    const auto probe_program = probe_root / "claude";
+#endif
+    fs::copy_file(addon::path_from_utf8(CLAUDE_SELECTION_PROBE_PROGRAM), probe_program);
+    const auto use_probe = [&](addon::Delegated_prepare_request& request) {
+        request.context.launcher_argv.front() = claude::path_string(probe_program);
+        request.context.launcher.script_body.replace(0, 6, claude::path_string(probe_program));
+        request.context.launch_environment->effective_environment.set("CLAUDE_TEST_SELECTION_PROBE", Json("exact"));
+    };
+    for (const auto purpose : {Purpose::READ_ONLY_REVIEW, Purpose::IMPLEMENTATION}) {
+        auto request = posture_request(purpose, {
+            "--model", "sonnet", "--model=opus", "--effort", "medium", "--effort=high",
+            "--fallback-model=sonnet",
+            "--settings", "--model", "--disallowedTools", "Read(private/**)",
+        });
+        const auto account_path = fs::current_path() / ".claude-selected";
+        request.context.account_context = addon::Account_context{
+            2, claude::account_key(account_path), claude::path_string(account_path)};
+        request.context.profile_storage = addon::Profile_storage_context{
+            addon::k_profile_storage_version, claude::path_string(fs::current_path() / "managed-profile")};
+        use_probe(request);
+        request.context.launch_environment->effective_environment.set(
+            "CLAUDE_TEST_EXPECTED_PROFILE", Json(claude::path_string(account_path)));
+        const auto original = addon::encode_delegated_prepare_request(request);
+        const auto unchanged = posture_prepare(request, true);
+        addon::Contract_failure failure;
+        const auto baseline = addon::decode_delegated_prepare_result(unchanged.m_payload, &failure);
+        require(baseline && !baseline->model_selection, "omitted selection retains the native defaults");
+        for (const auto selection : {
+                addon::Delegated_model_selection{"future-model", std::nullopt},
+                addon::Delegated_model_selection{std::nullopt, "future-effort"},
+                addon::Delegated_model_selection{"future-model", "future-effort"}})
+        {
+            request.model_selection = selection;
+            const auto invocation = posture_prepare(request, true);
+            require(invocation.m_status == addon::Result_status::SUCCESS, "delegated selection is prepared");
+            const auto prepared = addon::decode_delegated_prepare_result(invocation.m_payload, &failure);
+            require(prepared && prepared->model_selection == request.model_selection,
+                "preparation acknowledges the exact requested selection");
+            const auto reading = prepared_reading(invocation, true);
+            require(reading.values("--model") == (selection.model
+                    ? std::vector<std::string>{"sonnet", "opus", *selection.model}
+                    : std::vector<std::string>{"sonnet", "opus"}) &&
+                reading.values("--effort") == (selection.reasoning_effort
+                    ? std::vector<std::string>{"medium", "high", *selection.reasoning_effort}
+                    : std::vector<std::string>{"medium", "high"}),
+                "requested scalar selections take native last-occurrence precedence");
+            require(reading.values("--fallback-model") == (selection.model
+                    ? std::vector<std::string>{"sonnet", ""} : std::vector<std::string>{"sonnet"}),
+                "an explicit model disables configured native fallback for only this task");
+            require(reading.values("--settings") == std::vector<std::string>{"--model"} &&
+                reading.values("--disallowedTools") == std::vector<std::string>{"Read(private/**)"},
+                "unrelated option operands and deny rules survive model selection");
+            require(prepared->process.environment == baseline->process.environment &&
+                prepared->process.environment_names == baseline->process.environment_names &&
+                !addon::profile_storage_acknowledgment_failure(*request.context.profile_storage, invocation.m_payload) &&
+                !addon::account_context_acknowledgment_failure(*request.context.account_context, invocation.m_payload),
+                "model selection retains the selected account and profile environment");
+            require(reading.values("--tools") == prepared_reading(unchanged, true).values("--tools") &&
+                reading.values("--allowedTools") == prepared_reading(unchanged, true).values("--allowedTools"),
+                "model selection preserves the review ceiling and Task permissions");
+            const auto initial = prepared->inspection.protocol_state;
+            const auto checking = inspect_readiness(purpose, initial, control_reply(initial));
+            require(checking.stdin_bytes && !checking.close_stdin && !checking.failure_reason &&
+                claude::text(*claude::object(*checking.stdin_bytes).find("request"), "subtype") == "mcp_status",
+                "private settings attestation leaves the main native Task permission gate unchanged");
+            require(addon::serialize_json(invocation.m_payload).find("private-settings-secret-canary") == std::string::npos,
+                "native settings secrets never enter the host's process, state or failure diagnostics");
+        }
+        request.model_selection.reset();
+        require(addon::encode_delegated_prepare_request(request) == original,
+            "preparation never mutates saved launcher defaults");
+    }
+    auto terminated = posture_request(Purpose::IMPLEMENTATION, {"--", "saved-prompt"});
+    terminated.model_selection = addon::Delegated_model_selection{"opus", std::nullopt};
+    const auto refused = posture_prepare(terminated, true);
+    require(refused.m_status == addon::Result_status::UNAVAILABLE && refused.m_reason == "model_selection_unavailable",
+        "an option terminator cannot silently turn requested model selection into prompt text");
+    auto external_mcp = posture_request(Purpose::IMPLEMENTATION, {"--mcp-config", "saved-mcp.json"});
+    external_mcp.model_selection = addon::Delegated_model_selection{"opus", std::nullopt};
+    require(posture_prepare(external_mcp, true).m_reason == "model_selection_unavailable",
+        "selection cannot start saved external MCP servers during private attestation");
+
+    // Native initialize metadata resolves aliases, while get_settings.applied
+    // reports the policy-capped model and effort (Claude Code 2.1.322).
+    auto alias = posture_request(Purpose::IMPLEMENTATION, {});
+    use_probe(alias);
+    alias.model_selection = addon::Delegated_model_selection{"opus", "high"};
+    const auto invocation = posture_prepare(alias, true);
+    const auto prepared = addon::decode_delegated_prepare_result(invocation.m_payload, nullptr);
+    require(prepared && claude::text(claude::object(prepared->inspection.protocol_state), "verified_model") ==
+            "claude-native-opus",
+        "native alias resolution is used without constraining custom IDs to menu models");
+    for (const auto mode : {"clamped", "substituted", "missing", "unsupported"}) {
+        alias.context.launch_environment->effective_environment.set("CLAUDE_TEST_SELECTION_PROBE", Json(mode));
+        const auto failure = posture_prepare(alias, true);
+        require(failure.m_status == addon::Result_status::UNAVAILABLE &&
+            failure.m_reason == (std::string_view(mode) == "clamped"
+                ? "reasoning_effort_unavailable" : "model_selection_unavailable"),
+            "native policy caps, substitutions or missing settings support refuse explicit selection");
+        require(addon::serialize_json(failure.m_payload).find("private-settings-secret-canary") == std::string::npos,
+            "failed settings attestation never returns raw native settings");
+    }
+    auto active = protocol(false);
+    active.set("initialized", Json(true));
+    active.set("root_session_id", Json("root"));
+    active.set("verified_model", Json("claude-native-opus"));
+    // Native 2.1.322's installed emitters and wire schema establish the refusal
+    // and consent shapes. The ordinary configured fallback was also observed
+    // against an isolated endpoint; no live refusal/consent flow was invoked.
+    for (const auto output : {
+            R"({"type":"system","subtype":"model_fallback","session_id":"root","trigger":"model_not_found","original_model":"claude-native-opus","fallback_model":"other"})",
+            R"({"type":"system","subtype":"model_refusal_fallback","session_id":"root","trigger":"refusal","direction":"retry","scope":"session","original_model":"claude-native-opus","fallback_model":"other","request_id":null})",
+            R"({"type":"system","subtype":"model_refusal_fallback","session_id":"root","trigger":"refusal","direction":"retry","original_model":"claude-native-opus","fallback_model":"other","request_id":null})",
+            R"({"type":"system","subtype":"model_consent_fallback","session_id":"root","choice":"cancelled","original_model":"claude-native-opus","fallback_model":"other","persisted_as_default":false})"})
+    {
+        for (const auto purpose : {Purpose::IMPLEMENTATION, Purpose::READ_ONLY_REVIEW}) {
+            const auto fallback = inspect_readiness(purpose, addon::serialize_json(active), std::string(output) + '\n');
+            require(fallback.failure_reason == "model_selection_unavailable",
+                "a native root model fallback cannot silently satisfy an explicit model task");
+        }
+        auto unspecified = active;
+        unspecified.erase("verified_model");
+        const auto unchanged = inspect_readiness(Purpose::IMPLEMENTATION,
+            addon::serialize_json(unspecified), std::string(output) + '\n');
+        require(!unchanged.failure_reason,
+            "native fallback behavior remains unchanged without an explicit model request");
+        auto other_session = claude::object(output);
+        other_session.set("session_id", Json("child"));
+        const auto child_fallback = inspect_readiness(Purpose::IMPLEMENTATION,
+            addon::serialize_json(active), addon::serialize_json(other_session) + '\n');
+        require(!child_fallback.failure_reason,
+            "a different session's native fallback is not attributed to the delegated root");
+    }
+    const auto local_fallback = inspect_readiness(Purpose::IMPLEMENTATION, addon::serialize_json(active),
+        R"({"type":"system","subtype":"model_refusal_fallback","session_id":"root","trigger":"refusal","direction":"retry","scope":"local","original_model":"claude-native-opus","fallback_model":"other","request_id":"side-question"})" "\n");
+    require(!local_fallback.failure_reason,
+        "a local subagent or side-question fallback does not change the root's selected model");
+    // Native 2.1.322 forwards backend model metadata unchanged; an honored
+    // custom request can return a different canonical backend model name.
+    const auto metadata_alias = inspect_readiness(Purpose::IMPLEMENTATION, addon::serialize_json(active),
+        R"({"type":"assistant","session_id":"root","message":{"model":"canonical-backend-model"}})" "\n"
+        R"({"type":"result","session_id":"root","subtype":"success","is_error":false,"result":"Done"})" "\n");
+    require(!metadata_alias.failure_reason, "backend response metadata does not replace native model selection evidence");
+    addon::Structured_inspection finished;
+    finished.protocol_state = metadata_alias.protocol_state;
+    finished.final = true;
+    require(claude::inspect_session(Purpose::IMPLEMENTATION, finished).result_bytes == "Done",
+        "a valid result remains authenticated when backend model metadata uses an alias");
+    const auto synthetic = inspect_readiness(Purpose::IMPLEMENTATION, addon::serialize_json(active),
+        R"({"type":"assistant","session_id":"root","message":{"model":"<synthetic>"}})" "\n"
+        R"({"type":"result","session_id":"root","subtype":"success","is_error":true,"result":"API error"})" "\n");
+    require(synthetic.failure_reason == "invalid_final_result",
+        "a native synthetic error remains a failed result without misreporting model selection");
+    const auto child = inspect_readiness(Purpose::IMPLEMENTATION, addon::serialize_json(active),
+        R"({"type":"assistant","session_id":"root","parent_tool_use_id":"child-tool","message":{"model":"other"}})" "\n");
+    require(!child.failure_reason,
+        "a native child agent's model is outside the delegated root's selection");
+    std::error_code cleanup_error;
+    fs::remove_all(probe_root, cleanup_error);
+}
+
 // Oracle: the owner's rule for delegated runs (2026-09-28): a run gets the
 // permission posture its launcher specifies, its options and the user's own
 // Claude settings, and the package pre-approves only its own Task tools.
@@ -2703,6 +2872,7 @@ int main(int argc, char** argv)
         declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
         structured_contract();
         delegated_readiness_contract();
+        delegated_model_selection_contract();
         permission_posture_contract();
         probe_contract();
         quota_failure_contract();
