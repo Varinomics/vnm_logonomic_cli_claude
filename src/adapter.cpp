@@ -13,6 +13,7 @@
 #include <logonomic_cli_addon/adapter_runtime.h>
 #include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/profile_storage.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 #include <logonomic_cli_addon/package_source.h>
 
 #ifdef _WIN32
@@ -117,10 +118,17 @@ void invoke(addon::Invocation_context& context, const fs::path& package_root)
             capability == addon::k_attention_kind_capability_id) claude::handle_lifecycle(context);
         else claude::handle_preparation(context, package_root);
     }
+    catch (const addon::Provider_event_error& error) {
+        const bool cancelled = context.cancel_requested();
+        context.fail(cancelled ? addon::Result_status::CANCELLED : addon::Result_status::FAILED,
+            cancelled ? "cancelled" : "invalid_provider_event",
+            cancelled ? std::string{} : addon::encode_provider_event_diagnostic(error.diagnostic()));
+    }
     catch (const std::exception&) {
         // Provider config, credentials and filesystem paths stay out of diagnostics.
-        context.fail(context.cancel_requested() ? addon::Result_status::CANCELLED : addon::Result_status::FAILED,
-            context.cancel_requested() ? "cancelled" : "claude_operation_failed");
+        const bool cancelled = context.cancel_requested();
+        context.fail(cancelled ? addon::Result_status::CANCELLED : addon::Result_status::FAILED,
+            cancelled ? "cancelled" : "claude_operation_failed");
     }
 }
 

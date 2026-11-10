@@ -234,6 +234,9 @@ if(BUILD_TESTING)
     claude_target(claude_contract_tests)
     add_dependencies(claude_contract_tests claude_package)
     add_test(NAME claude_contract_tests COMMAND claude_contract_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    add_test(NAME claude_event_diagnostic_tests
+        COMMAND claude_contract_tests "${CLAUDE_PACKAGE_DIRECTORY}" --event-diagnostics)
+    set_tests_properties(claude_event_diagnostic_tests PROPERTIES TIMEOUT 60)
     add_test(NAME claude_reply_contract_tests
         COMMAND claude_contract_tests "${CLAUDE_PACKAGE_DIRECTORY}" --reply-evidence)
     add_test(NAME claude_launcher_approval_tests COMMAND claude_contract_tests --launcher-approval)

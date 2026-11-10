@@ -15,10 +15,12 @@
 #include <logonomic_cli_addon/launch_preparation.h>
 #include <logonomic_cli_addon/accounts.h>
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/host_simulator.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/package_source.h>
 #include <logonomic_cli_addon/probe_contracts.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 #include <logonomic_cli_addon/session_contracts.h>
 #include <logonomic_cli_addon/session_wake.h>
 #include <logonomic_cli_addon/sidecar.h>
@@ -1219,6 +1221,80 @@ void wake_binding_contract()
         fs::remove_all(root);
         throw;
     }
+    fs::remove_all(root);
+}
+
+void classification_diagnostic_contract(const fs::path& package)
+{
+    const auto root = fs::temp_directory_path() / ("claude-event-diagnostics-" + addon::random_nonce_hex());
+    addon::Simulator_options options;
+    options.package_directory = package;
+    options.profile_storage_root = root;
+    addon::Host_simulator host(options, nullptr);
+    addon::Contract_failure failure;
+    require(host.start(&failure), "the packaged Claude adapter starts for event diagnostics");
+    const auto classify = [&](const char* name, Json body) {
+        addon::Attention_classification_request request;
+        request.base.event = {name, std::move(body)};
+        request.base.transition_nonce = std::string(32, 'a');
+        const auto id = host.invoke({addon::k_attention_kind_capability_id, addon::k_attention_kind_version},
+            addon::k_classify_event_operation, addon::encode_attention_classification_request(request), 5000);
+        const auto outcome = host.wait_outcome(id, 6000);
+        require(outcome.has_value(), "a packaged Claude classification produces a terminal result");
+        return *outcome;
+    };
+    const auto rejected = [&](Json body, addon::Provider_event_problem problem,
+        const char* name = "Stop", const char* field = "prompt_id")
+    {
+        const auto outcome = classify(name, std::move(body));
+        require(outcome.status == addon::Host_status::FAILED && outcome.reason_code == "invalid_provider_event",
+            "a malformed Claude field remains a failed event classification");
+        const auto diagnostic = addon::decode_provider_event_diagnostic(outcome.message);
+        require(diagnostic && diagnostic->event_name == name && diagnostic->field == field &&
+            diagnostic->problem == problem && diagnostic->rule == "nonempty_single_line_identity",
+            "Claude classification failure identifies its exact event, field and rejected validation rule");
+        require(outcome.message.find("private_value_sentinel") == std::string::npos,
+            "Claude event diagnostics do not contain the rejected native field value");
+        return diagnostic;
+    };
+    const auto null_id = rejected(claude::object(R"({"hook_event_name":"Stop","session_id":"session","prompt_id":null})"),
+        addon::Provider_event_problem::WRONG_TYPE);
+    require(null_id->actual_type == addon::Json_type::NULL_VALUE && !null_id->actual_size,
+        "a null Claude prompt identity retains its type without inventing a value or size");
+    const auto empty_id = rejected(claude::object(R"({"hook_event_name":"Stop","session_id":"session","prompt_id":""})"),
+        addon::Provider_event_problem::EMPTY);
+    require(empty_id->actual_type == addon::Json_type::STRING && empty_id->actual_size == 0,
+        "an empty Claude identity is distinguished from a wrong JSON type");
+    rejected(claude::object(R"({"hook_event_name":"StopFailure","session_id":"session","prompt_id":"turn",
+        "error":"private_value_sentinel\nsecond line"})"), addon::Provider_event_problem::CONTROL_CHARACTER,
+        "StopFailure", "error");
+    auto oversized = claude::object(R"({"hook_event_name":"StopFailure","session_id":"session","prompt_id":"turn"})");
+    oversized.set("error", Json(std::string(257, 'x')));
+    const auto size = rejected(std::move(oversized), addon::Provider_event_problem::TOO_LARGE, "StopFailure", "error");
+    require(size->actual_size == 257 && size->limit == addon::limits::k_max_lifecycle_identity_bytes,
+        "an oversized Claude field retains its measured size and rejecting bound");
+    const auto missing_id = rejected(claude::object(R"({"hook_event_name":"Stop"})"),
+        addon::Provider_event_problem::MISSING, "Stop", "session_id");
+    require(!missing_id->actual_type && !missing_id->actual_size,
+        "a missing Claude field is distinguished from an explicit JSON null");
+    for (const auto& event_name : {std::string("Stop event"),
+             std::string(addon::limits::k_max_provider_event_name_bytes, '\1')})
+    {
+        const auto outcome = classify(event_name.c_str(),
+            claude::object(R"({"hook_event_name":"Stop","session_id":"session"})"));
+        require(outcome.status == addon::Host_status::FAILED && outcome.reason_code == "invalid_provider_event",
+            "a diagnostic for an accepted unusual event name preserves its ordinary failed result");
+        const auto diagnostic = addon::decode_provider_event_diagnostic(outcome.message);
+        require(diagnostic && diagnostic->event_name == event_name && diagnostic->field == "hook_event_name" &&
+            diagnostic->problem == addon::Provider_event_problem::MISMATCH && diagnostic->rule == "matches_event_name",
+            "an unusual native event name survives its safe diagnostic without changing the mismatch cause");
+        require(outcome.message.size() <= addon::limits::k_max_result_message_bytes,
+            "an escaped native event name fits the existing failure-message transport bound");
+    }
+    const auto valid = classify("Stop", claude::object(R"({"hook_event_name":"Stop","session_id":"session"})"));
+    require(valid.status == addon::Host_status::SUCCESS,
+        "Claude still serves a valid Stop after unusual event failures without losing its adapter generation");
+    require(host.shutdown(1000, nullptr), "the diagnostic Claude adapter exits cleanly");
     fs::remove_all(root);
 }
 
@@ -2828,12 +2904,20 @@ void account_name_contract()
 
 int main(int argc, char** argv)
 {
-    if (argc != 2 && !(argc == 3 && std::string_view(argv[2]) == "--reply-evidence")) {
-        std::cerr << "usage: claude_contract_tests <package directory> [--reply-evidence] | --launcher-approval | --context-state | --quota\n";
+    if (argc != 2 && !(argc == 3 && (std::string_view(argv[2]) == "--reply-evidence" ||
+        std::string_view(argv[2]) == "--event-diagnostics")))
+    {
+        std::cerr << "usage: claude_contract_tests <package directory> [--reply-evidence|--event-diagnostics]\n"
+            "       claude_contract_tests --launcher-approval | --context-state | --quota\n";
         return 2;
     }
     try {
         if (argc == 3) {
+            if (std::string_view(argv[2]) == "--event-diagnostics") {
+                classification_diagnostic_contract(addon::path_from_utf8(argv[1]));
+                std::cout << "Claude event diagnostic checks passed.\n";
+                return 0;
+            }
             lifecycle_contract();
             declared_profile_admits_every_shape(addon::path_from_utf8(argv[1]));
             std::cout << "Claude reply evidence contract checks passed.\n";
