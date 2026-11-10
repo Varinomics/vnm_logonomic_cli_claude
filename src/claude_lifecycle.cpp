@@ -5,10 +5,12 @@
 #include <logonomic_cli_addon/context_state.h>
 #include <logonomic_cli_addon/execution_context.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/provider_event_diagnostic.h>
 
 #include <algorithm>
 #include <array>
-#include <stdexcept>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -18,18 +20,34 @@ namespace {
 
 namespace addon = logonomic::cli_addon;
 
-std::string metadata(const addon::Json_value& body, std::string_view field)
+std::string metadata(const addon::Provider_event& event, std::string_view field)
 {
-    auto value = text(body, field);
+    const auto* member = event.body.find(field);
+    const auto reject = [&](addon::Provider_event_problem problem, std::optional<std::uint64_t> limit = {}) {
+        return addon::Provider_event_error(addon::make_provider_event_diagnostic(
+            event.name, std::string(field), problem, member, limit, "nonempty_single_line_identity"));
+    };
+    if (!member) {
+        throw reject(addon::Provider_event_problem::MISSING);
+    }
+    if (!member->is_string()) {
+        throw reject(addon::Provider_event_problem::WRONG_TYPE);
+    }
+    auto value = member->as_string();
     const auto begin = value.find_first_not_of(" \t\r\n");
     if (begin == std::string::npos) {
-        throw std::runtime_error("invalid_provider_event");
+        throw reject(addon::Provider_event_problem::EMPTY);
     }
     value = value.substr(begin, value.find_last_not_of(" \t\r\n") - begin + 1);
-    if (value.size() > addon::limits::k_max_lifecycle_identity_bytes ||
-        value.find_first_of(std::string_view("\0\r\n", 3)) != std::string::npos)
-    {
-        throw std::runtime_error("invalid_provider_event");
+    if (value.size() > addon::limits::k_max_lifecycle_identity_bytes) {
+        auto diagnostic = addon::make_provider_event_diagnostic(
+            event.name, std::string(field), addon::Provider_event_problem::TOO_LARGE, member,
+            addon::limits::k_max_lifecycle_identity_bytes, "nonempty_single_line_identity");
+        diagnostic.actual_size = value.size();
+        throw addon::Provider_event_error(std::move(diagnostic));
+    }
+    if (value.find_first_of(std::string_view("\0\r\n", 3)) != std::string::npos) {
+        throw reject(addon::Provider_event_problem::CONTROL_CHARACTER);
     }
     return value;
 }
@@ -114,9 +132,11 @@ bool canonical_session_id(std::string_view value)
 addon::Classify_event_result classify_event(const addon::Classify_event_request& request)
 {
     const auto& body = request.event.body;
-    const auto name = metadata(body, "hook_event_name");
+    const auto name = metadata(request.event, "hook_event_name");
     if (name != request.event.name) {
-        throw std::runtime_error("invalid_provider_event");
+        throw addon::Provider_event_error(addon::make_provider_event_diagnostic(
+            request.event.name, "hook_event_name", addon::Provider_event_problem::MISMATCH,
+            body.find("hook_event_name"), {}, "matches_event_name"));
     }
     addon::Classify_event_result result;
     if (request.context_failure) {
@@ -146,10 +166,10 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
     }
     addon::Lifecycle_observation observation;
     observation.provider_event_name = name;
-    observation.provider_session_id = metadata(body, "session_id");
+    observation.provider_session_id = metadata(request.event, "session_id");
     result.classification = addon::Classification::EVENT;
     if (name == "SessionStart") {
-        observation.session_source = metadata(body, "source");
+        observation.session_source = metadata(request.event, "source");
         observation.session_transition = addon::Session_transition::STARTED;
         result.classification = addon::Classification::TRANSITION;
         result.transition = observation.session_source == "resume" ? addon::Transition_kind::RESUME : addon::Transition_kind::START;
@@ -163,12 +183,12 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
     else
     if (name == "SessionEnd") {
         observation.session_transition = addon::Session_transition::ENDED;
-        observation.session_end_reason = metadata(body, "reason");
+        observation.session_end_reason = metadata(request.event, "reason");
     }
     else
     if (child) {
-        observation.agent_id = metadata(body, "agent_id");
-        observation.agent_label = metadata(body, "agent_type");
+        observation.agent_id = metadata(request.event, "agent_id");
+        observation.agent_label = metadata(request.event, "agent_type");
         observation.subagent_transition = name == "SubagentStart" ? addon::Subagent_transition::STARTED : addon::Subagent_transition::STOPPED;
     }
     else {
@@ -178,12 +198,12 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
             result.observations.push_back(std::move(observation));
             return result;
         }
-        if (body.find("prompt_id")) observation.provider_turn_id = metadata(body, "prompt_id");
+        if (body.find("prompt_id")) observation.provider_turn_id = metadata(request.event, "prompt_id");
         if (name == "UserPromptSubmit" || name == "Stop" || name == "StopFailure") {
             observation.phase_transition = name == "UserPromptSubmit" ? addon::Phase_transition::WORKING : addon::Phase_transition::AWAITING_INPUT;
             observation.phase_evidence = addon::Evidence::INFERRED;
             if (name == "StopFailure" && !observation.provider_turn_id.empty()) {
-                (void)metadata(body, "error");
+                (void)metadata(request.event, "error");
                 observation.outcome_transition = addon::Outcome_transition::FAILED;
                 observation.outcome_evidence = addon::Evidence::CONFIRMED;
             }
@@ -192,7 +212,7 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
             observation.attention_transition = name == "PostToolUse" || name == "PostToolUseFailure"
                 ? addon::Attention_transition::RESOLVED : addon::Attention_transition::REQUESTED;
             observation.attention_evidence = addon::Evidence::INFERRED;
-            if (tool) observation.attention_request_id = metadata(body, "tool_use_id");
+            if (tool) observation.attention_request_id = metadata(request.event, "tool_use_id");
         }
     }
     result.observations.push_back(std::move(observation));
@@ -241,7 +261,7 @@ void handle_lifecycle(addon::Invocation_context& context)
     if (context.request().capability.capability_id == addon::k_attention_kind_capability_id) {
         const auto request = addon::decode_attention_classification_request(context.request().payload, &failure);
         if (!request) {
-            context.fail(addon::Result_status::FAILED, failure.reason_code);
+            context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         }
         else {
             context.succeed(addon::encode_attention_classification_result(classify_attention(*request)));
@@ -250,7 +270,7 @@ void handle_lifecycle(addon::Invocation_context& context)
     }
     const auto request = addon::decode_classify_event_request(context.request().payload, &failure);
     if (!request) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        context.fail(addon::Result_status::FAILED, failure.reason_code, failure.detail);
         return;
     }
     context.succeed(addon::encode_classify_event_result(classify_event(*request)));
