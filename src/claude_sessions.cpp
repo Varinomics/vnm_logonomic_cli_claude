@@ -442,7 +442,7 @@ addon::Structured_prepare_result prepare(
         throw std::runtime_error("unsupported_launcher");
     }
     const bool review = purpose == addon::Structured_purpose::READ_ONLY_REVIEW;
-    const auto command = recognize_launcher(context.launcher.script_body);
+    const auto command = recognize_launcher(context.launcher.script_body, context.launcher.runner_key);
     if (!command || !direct_implementation_arguments(context)) {
         throw std::runtime_error("unsupported_launcher");
     }

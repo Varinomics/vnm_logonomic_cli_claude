@@ -280,12 +280,16 @@ void launcher_approval_contract()
 
 void launcher_contract()
 {
+    require(claude::recognize_launcher(R"cmd($env:CLAUDE_CONFIG_DIR="D:\profiles\work\"; claude)cmd",
+        "powershell").has_value(), "PowerShell quoted trailing profile path retains Claude recognition");
+    require(claude::recognize_launcher(R"cmd(claude --add-dir D:\notes\)cmd", "cmd").has_value(),
+        "cmd trailing argument path retains Claude recognition");
     // Native recognition accepts executable/package identity, never a mention.
-    require(claude::recognize_launcher("claude --model sonnet").has_value(), "direct Claude recognition");
-    require(claude::recognize_launcher("npx --yes @anthropic-ai/claude-code@2.1.0").has_value(), "npx recognition");
-    require(claude::recognize_launcher("bunx @anthropic-ai/claude-code").has_value(), "bunx recognition");
-    require(!claude::recognize_launcher("echo claude"), "a mention is not a launcher");
-    require(!claude::recognize_launcher("npx --package other @anthropic-ai/claude-code"), "unknown runner option");
+    require(claude::recognize_launcher("claude --model sonnet", "bash").has_value(), "direct Claude recognition");
+    require(claude::recognize_launcher("npx --yes @anthropic-ai/claude-code@2.1.0", "bash").has_value(), "npx recognition");
+    require(claude::recognize_launcher("bunx @anthropic-ai/claude-code", "bash").has_value(), "bunx recognition");
+    require(!claude::recognize_launcher("echo claude", "bash"), "a mention is not a launcher");
+    require(!claude::recognize_launcher("npx --package other @anthropic-ai/claude-code", "bash"), "unknown runner option");
     require(claude::interactive_resume_arguments({"claude", "--model", "sonnet"}), "stock resume flags");
     require(!claude::interactive_resume_arguments({"claude", "--resume", "already-selected"}), "resume cannot overwrite existing selector");
     require(!claude::interactive_resume_arguments({"claude", "-p", "existing prompt"}), "resume cannot steal print input");

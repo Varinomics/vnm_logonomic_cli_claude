@@ -84,7 +84,7 @@ void invoke(addon::Invocation_context& context, const fs::path& package_root)
                 if (!input) context.fail(addon::Result_status::FAILED, failure.reason_code);
                 else {
                     addon::Launcher_recognition result;
-                    result.recognized = claude::recognize_launcher(input->launcher.script_body).has_value();
+                    result.recognized = claude::recognize_launcher(input->launcher.script_body, input->launcher.runner_key).has_value();
                     if (result.recognized) result.display_name = "Claude";
                     context.succeed(addon::encode_recognition(result));
                 }
