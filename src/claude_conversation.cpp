@@ -1,6 +1,7 @@
 #include "claude_conversation.h"
 
 #include "claude_accounts.h"
+#include "claude_filesystem.h"
 
 #include <logonomic_cli_addon/json_utilities.h>
 #include <logonomic_cli_addon/package_source.h>
@@ -82,9 +83,9 @@ std::optional<fs::path> source_file(const fs::path& profile, std::string_view id
     std::optional<fs::path> source;
     // The request decoder validates text; lookup must also stay within one
     // filename component, including on Windows (drive and stream syntax).
-    if (id.find_first_of("/\\:") == std::string_view::npos && fs::is_directory(root)) {
+    if (id.find_first_of("/\\:") == std::string_view::npos && fs::is_directory(native_io_path(root))) {
         const auto name = addon::path_from_utf8(std::string(id) + ".jsonl");
-        for (const auto& project : fs::directory_iterator(root)) {
+        for (const auto& project : fs::directory_iterator(native_io_path(root))) {
             if (cancelled && cancelled()) {
                 fail(failure, "cancelled", "Conversation extraction was cancelled.");
                 return {};
@@ -94,8 +95,8 @@ std::optional<fs::path> source_file(const fs::path& profile, std::string_view id
             }
             // Only the project's own session file is authoritative. Nested
             // subagent files may carry the same sessionId as the parent.
-            const auto candidate = project.path() / name;
-            if (!fs::is_regular_file(candidate)) {
+            const auto candidate = root / project.path().filename() / name;
+            if (!fs::is_regular_file(native_io_path(candidate))) {
                 continue;
             }
             if (source) {
@@ -419,7 +420,7 @@ std::optional<addon::Conversation_export_result> export_conversation(
     }
     Entries entries;
     Index by_id;
-    const auto snapshot = addon::read_conversation_jsonl(*source,
+    const auto snapshot = addon::read_conversation_jsonl(native_io_path(*source),
         [&](const Json& row, addon::Contract_failure* error) {
             const auto type = json::text(row, "type");
             const auto id = json::text(row, "uuid");

@@ -1,4 +1,5 @@
 #include "claude_native_context.h"
+#include "claude_filesystem.h"
 #include "claude_support.h"
 
 #include <logonomic_cli_addon/launcher_utilities.h>
@@ -34,9 +35,10 @@ std::string upper(std::string value)
 std::optional<std::string> read_file(const fs::path& path)
 {
     std::error_code error;
-    const auto size = fs::file_size(path, error);
+    const auto io_path = native_io_path(path);
+    const auto size = fs::file_size(io_path, error);
     if (error || size > addon::Json_parse_limits{}.max_bytes) return std::nullopt;
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input(io_path, std::ios::binary);
     std::string bytes(static_cast<std::size_t>(size), '\0');
     input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     if (!input || input.peek() != std::char_traits<char>::eof()) return std::nullopt;
@@ -48,7 +50,7 @@ std::optional<std::string> read_file(const fs::path& path)
 bool absent(const fs::path& path)
 {
     std::error_code error;
-    const bool present = fs::exists(path, error);
+    const bool present = fs::exists(native_io_path(path), error);
     return !error && !present;
 }
 
@@ -70,7 +72,7 @@ bool native_image(const fs::path& path)
 #ifdef __APPLE__
     return addon::native_image(path);
 #else
-    std::ifstream input(path, std::ios::binary);
+    std::ifstream input(native_io_path(path), std::ios::binary);
     std::array<unsigned char, 4> magic{};
     input.read(reinterpret_cast<char*>(magic.data()), magic.size());
 #ifdef _WIN32

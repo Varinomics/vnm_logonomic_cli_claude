@@ -1,5 +1,6 @@
 #include "claude_resume.h"
 #include "claude_accounts.h"
+#include "claude_filesystem.h"
 #include "claude_lifecycle.h"
 #include "claude_launcher.h"
 #include "claude_native_context.h"
@@ -113,7 +114,7 @@ bool resume_context_supported(
     for (auto directory = working_directory; !directory.empty();) {
         if (!native_context::absent(directory / ".git")) {
             std::error_code error;
-            if (!fs::is_directory(fs::symlink_status(directory / ".git", error)) || error) {
+            if (!fs::is_directory(fs::symlink_status(native_io_path(directory / ".git"), error)) || error) {
                 return false;
             }
         }
@@ -222,14 +223,15 @@ private:
 conversation_state_t inspect_transcript(
     const fs::path& path, std::string_view session_id, addon::Invocation_context& invocation)
 {
-    std::ifstream stream(path, std::ios::binary);
+    const auto io_path = native_io_path(path);
+    std::ifstream stream(io_path, std::ios::binary);
     if (!stream) {
         return {};
     }
     std::error_code content_error;
-    const auto size_before = fs::file_size(path, content_error);
+    const auto size_before = fs::file_size(io_path, content_error);
     const bool size_known = !content_error;
-    const auto modified_before = fs::last_write_time(path, content_error);
+    const auto modified_before = fs::last_write_time(io_path, content_error);
     const bool snapshot_known = size_known && !content_error;
     std::array<char, 16384> buffer;
     std::string line;
@@ -324,9 +326,9 @@ conversation_state_t inspect_transcript(
     }
     // @3 availability accepts a valid unterminated final record. Content needs
     // a complete snapshot so an interrupted or concurrent append stays unknown.
-    const auto size_after = fs::file_size(path, content_error);
+    const auto size_after = fs::file_size(io_path, content_error);
     const bool same_size = !content_error && size_after == size_before && total == size_before;
-    const auto modified_after = fs::last_write_time(path, content_error);
+    const auto modified_after = fs::last_write_time(io_path, content_error);
     if (snapshot_known && same_size && !content_error && modified_after == modified_before &&
         line.find_first_not_of(" \t\r") == std::string::npos)
     {
@@ -372,8 +374,8 @@ conversation_state_t inspect_profile(
         return {};
     }
     std::error_code error;
-    if (!fs::is_directory(profile, error) || error ||
-        !fs::is_directory(addon::path_from_utf8(launch.working_directory), error) || error)
+    if (!fs::is_directory(native_io_path(profile), error) || error ||
+        !fs::is_directory(native_io_path(addon::path_from_utf8(launch.working_directory)), error) || error)
     {
         return {};
     }
@@ -382,7 +384,7 @@ conversation_state_t inspect_profile(
     const auto preferred = project_directory_name(launch);
     if (!preferred.empty()) {
         const auto direct = projects / preferred / filename;
-        const auto status = fs::status(direct, error);
+        const auto status = fs::status(native_io_path(direct), error);
         if (error && error != std::errc::no_such_file_or_directory) {
             return {};
         }
@@ -394,7 +396,7 @@ conversation_state_t inspect_profile(
         }
     }
     error.clear();
-    fs::directory_iterator entry(projects, error), end;
+    fs::directory_iterator entry(native_io_path(projects), error), end;
     if (error == std::errc::no_such_file_or_directory) {
         return {Availability::ABSENT, Content::EMPTY};
     }
@@ -419,8 +421,8 @@ conversation_state_t inspect_profile(
         if (!fs::is_directory(directory_status)) {
             continue;
         }
-        const auto candidate = entry->path() / filename;
-        const auto status = fs::symlink_status(candidate, error);
+        const auto candidate = projects / entry->path().filename() / filename;
+        const auto status = fs::symlink_status(native_io_path(candidate), error);
         if (error == std::errc::no_such_file_or_directory) {
             error.clear();
             continue;

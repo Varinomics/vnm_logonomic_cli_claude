@@ -1,5 +1,6 @@
 #include "claude_usage.h"
 #include "claude_accounts.h"
+#include "claude_filesystem.h"
 #include "claude_support.h"
 
 #include <logonomic_cli_addon/ids.h>
@@ -71,7 +72,7 @@ class Line_reader
 public:
     explicit Line_reader(const fs::path& path)
     :
-        m_stream(path, std::ios::binary)
+        m_stream(native_io_path(path), std::ios::binary)
     {}
 
     bool is_open() const { return m_stream.is_open(); }
@@ -132,9 +133,10 @@ struct file_fingerprint_t
 
 file_fingerprint_t fingerprint(const fs::path& path)
 {
+    const auto io_path = native_io_path(path);
     return {
-        static_cast<std::int64_t>(fs::file_size(path)),
-        static_cast<std::int64_t>(fs::last_write_time(path).time_since_epoch().count()),
+        static_cast<std::int64_t>(fs::file_size(io_path)),
+        static_cast<std::int64_t>(fs::last_write_time(io_path).time_since_epoch().count()),
     };
 }
 
@@ -302,10 +304,10 @@ std::optional<std::string> repository(const std::string& cwd)
     auto path = addon::path_from_utf8(cwd);
     if (!path.is_absolute()) return std::nullopt;
     std::error_code error;
-    if (!fs::is_directory(path, error) || error) return std::nullopt;
+    if (!fs::is_directory(native_io_path(path), error) || error) return std::nullopt;
     path = path.lexically_normal();
     while (!path.empty()) {
-        if (fs::exists(path / ".git", error) && !error) return path_string(path);
+        if (fs::exists(native_io_path(path / ".git"), error) && !error) return path_string(path);
         const auto parent = path.parent_path();
         if (parent == path) break;
         path = parent;
@@ -1029,24 +1031,27 @@ std::vector<Usage_session> aggregate_usage(
 std::vector<fs::path> transcript_files(const fs::path& profile, addon::Invocation_context& context)
 {
     const auto projects = profile / "projects";
+    const auto io_projects = native_io_path(projects);
     std::error_code filesystem_error;
-    if (!fs::is_directory(profile, filesystem_error) || filesystem_error) {
+    if (!fs::is_directory(native_io_path(profile), filesystem_error) || filesystem_error) {
         throw std::runtime_error("usage_projects_unavailable");
     }
-    const bool projects_present = fs::exists(projects, filesystem_error);
+    const bool projects_present = fs::exists(io_projects, filesystem_error);
     if (filesystem_error) {
         throw std::runtime_error("usage_projects_unavailable");
     }
-    if (projects_present && !fs::is_directory(projects, filesystem_error)) {
+    if (projects_present && !fs::is_directory(io_projects, filesystem_error)) {
         throw std::runtime_error("usage_projects_unavailable");
     }
     if (filesystem_error) {
         throw std::runtime_error("usage_projects_unavailable");
     }
     std::vector<fs::path> files;
-    if (projects_present) for (const auto& entry : fs::recursive_directory_iterator(projects)) {
+    if (projects_present) for (const auto& entry : fs::recursive_directory_iterator(io_projects)) {
         if (context.cancel_requested()) throw std::runtime_error("cancelled");
-        if (entry.is_regular_file() && entry.path().extension() == ".jsonl") files.push_back(entry.path());
+        if (entry.is_regular_file() && entry.path().extension() == ".jsonl") {
+            files.push_back(projects / entry.path().lexically_relative(io_projects));
+        }
     }
     std::sort(files.begin(), files.end());
     return files;

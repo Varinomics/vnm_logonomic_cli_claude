@@ -375,6 +375,21 @@ if(BUILD_TESTING AND LOGONOMIC_CLI_ADDON_RECIPE_TESTS)
         TIMEOUT 1800 RESOURCE_LOCK cli_addon_recipe_rebuild LABELS "cli-addon;delivery;recipe;owning-path")
 endif()
 # Contract and recipe tests must not be confused with real native qualification.
+if(WIN32 AND BUILD_TESTING)
+    add_executable(claude_native_path_tests tests/claude_native_path_tests.cpp)
+    target_link_libraries(claude_native_path_tests PRIVATE
+        claude_provider logonomic_cli_addon_sdk::test_support advapi32)
+    claude_target(claude_native_path_tests)
+    add_dependencies(claude_native_path_tests claude_package)
+    add_test(NAME claude_native_path_tests COMMAND claude_native_path_tests "${CLAUDE_PACKAGE_DIRECTORY}")
+    add_test(NAME claude_native_resume_path_tests
+        COMMAND claude_native_path_tests "${CLAUDE_PACKAGE_DIRECTORY}" --resume)
+    add_test(NAME claude_native_export_path_tests
+        COMMAND claude_native_path_tests "${CLAUDE_PACKAGE_DIRECTORY}" --export)
+    set_tests_properties(claude_native_path_tests PROPERTIES TIMEOUT 120 LABELS "usage;filesystem;packaged-adapter")
+    set_tests_properties(claude_native_resume_path_tests claude_native_export_path_tests PROPERTIES
+        TIMEOUT 60 LABELS "resume;export;filesystem;packaged-adapter")
+endif()
 get_directory_property(_provider_tests TESTS)
 if(_provider_tests)
     set_property(TEST ${_provider_tests} APPEND PROPERTY LABELS "cli-addon;provider-contract")
