@@ -1978,7 +1978,7 @@ void delegated_model_selection_contract()
         addon::Contract_failure failure;
         const auto baseline = addon::decode_delegated_prepare_result(unchanged.m_payload, &failure);
         require(baseline && !baseline->model_selection, "omitted selection retains the native defaults");
-        for (const auto selection : {
+        for (const auto& selection : {
                 addon::Delegated_model_selection{"future-model", std::nullopt},
                 addon::Delegated_model_selection{std::nullopt, "future-effort"},
                 addon::Delegated_model_selection{"future-model", "future-effort"}})
