@@ -1,4 +1,5 @@
 #include "claude_accounts.h"
+#include "claude_filesystem.h"
 #include "claude_native_context_fixture.h"
 #include "windows_filesystem_test_support.h"
 
@@ -31,6 +32,21 @@ void require(bool condition, const std::string& message)
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+void native_io_path_contract()
+{
+    for (const auto* spelling : {
+        LR"(\\?\C:\cache\MiXeD .jsonl)",
+        LR"(\\?\UNC\server\share\cache\MiXeD .jsonl)"})
+    {
+        require(claude::native_io_path(spelling).native() == spelling,
+            "an extended I/O path retains its exact namespace spelling");
+    }
+    require(claude::native_io_path(LR"(C:\cache\unused\..\MiXeD.jsonl)").native() ==
+        LR"(\\?\C:\cache\MiXeD.jsonl)", "ordinary drive paths resolve dot segments before prefixing");
+    require(claude::native_io_path(LR"(\\server\share\cache\unused\..\MiXeD.jsonl)").native() ==
+        LR"(\\?\UNC\server\share\cache\MiXeD.jsonl)", "ordinary UNC paths resolve dot segments before prefixing");
 }
 
 fs::path io_path(const fs::path& path)
@@ -294,6 +310,7 @@ int main(int argc, char** argv)
     const auto root = fs::temp_directory_path() / ("claude-native-paths-" + addon::random_nonce_hex());
     int result = 0;
     try {
+        native_io_path_contract();
         require(argc == 2 || argc == 3, "expected built package directory [--resume|--export|-unc variant]");
         fs::create_directories(root);
         const auto fixture = fs::canonical(root);
