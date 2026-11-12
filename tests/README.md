@@ -21,3 +21,14 @@ ctest --test-dir <build-dir> -C Release --output-on-failure
 With that option enabled, add `-L large-data` to the CTest command to run only
 the large-data tier, or add `-LE large-data` to run only the ordinary tier.
 The embedded package build does not register these standalone test suites.
+
+On Windows, the standalone build also registers `claude_native_path_tests`,
+`claude_native_resume_path_tests` and `claude_native_export_path_tests`, which
+run the packaged adapter against long and extended-length Windows paths.
+`claude_resume_filesystem_tests` returns 77 and prints the reason when its
+filesystem fixtures are unavailable on the host; CTest reports that entry as
+skipped, and a skip is not a pass. The `claude_native_path_tests` executable
+also has manual `--resume-unc` and `--export-unc` modes, which are not
+registered with CTest: pass the mode after the package directory that the
+registered entries use. These modes need the `\\localhost\<drive>$`
+administrative share of the drive that holds the temporary directory.
