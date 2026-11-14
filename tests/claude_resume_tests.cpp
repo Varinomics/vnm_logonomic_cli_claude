@@ -86,10 +86,11 @@ public:
     bool wait_for_cancel(int) override { return m_cancelled; }
     void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
     void succeed(Json payload) override { m_payload = std::move(payload); m_finished = true; }
-    void fail(addon::Result_status status, std::string reason, std::string) override
+    void fail(addon::Result_status status, std::string reason, std::string description) override
     {
         m_status = status;
         m_reason = std::move(reason);
+        m_description = std::move(description);
         m_finished = true;
     }
     bool finished() const override { return m_finished; }
@@ -98,6 +99,7 @@ public:
     Json m_payload;
     addon::Result_status m_status = addon::Result_status::SUCCESS;
     std::string m_reason;
+    std::string m_description;
     bool m_cancelled = false;
     bool m_finished = false;
 };
@@ -301,6 +303,9 @@ void transcript_contract()
     const auto absent = fixture.prepare(true);
     require(absent.m_status == addon::Result_status::UNAVAILABLE && absent.m_reason == "conversation_absent",
         "definite absence refuses preparation before hooks or wake setup");
+    require(absent.m_description ==
+        "This session cannot be resumed: its saved conversation was not found in Claude's profile folder.",
+        "missing conversation supplies the user-facing resume sentence");
     require(snapshot(fixture.root()) == before, "absent preparation allocated hook or wake state");
 
     write(fixture.transcript(), "");

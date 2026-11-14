@@ -394,15 +394,45 @@ std::optional<std::vector<std::string>> initial_prompt_argv(
     return carried_argv(argv, std::move(command));
 }
 
-std::optional<std::vector<std::string>> exact_resume_command(
-    const addon::Session_launch_context& launch, const addon::Json_value& record)
+constexpr const char* k_unsupported_launcher_description =
+    "This session cannot be resumed: the launcher's command is not a plain \"claude\" command, "
+    "so the resume option cannot be added to it.";
+
+struct Resume_failure
 {
-    auto literal = literal_command(launch.launcher_argv);
+    addon::Result_status status;
+    std::string reason;
+    std::string description;
+};
+
+std::optional<std::vector<std::string>> exact_resume_command(
+    const addon::Session_launch_context& launch, const addon::Json_value& record, Resume_failure& failure)
+{
     if (!record.is_object() || record.as_object().size() != 1 ||
-        !canonical_session_id(text(record, "provider_session_id")) ||
-        !literal || !interactive_resume_arguments(*literal) || !launch.launch_environment ||
-        !canonical_resume_directory(launch.working_directory))
+        !canonical_session_id(text(record, "provider_session_id")))
     {
+        failure = {addon::Result_status::UNAVAILABLE, "invalid_resume_record",
+            "This session cannot be resumed: Logonomic's saved reference to the Claude conversation is not valid."};
+        return std::nullopt;
+    }
+    auto literal = literal_command(launch.launcher_argv);
+    if (!literal) {
+        failure = {addon::Result_status::UNAVAILABLE, "unsupported_launcher", k_unsupported_launcher_description};
+        return std::nullopt;
+    }
+    std::string option;
+    if (!interactive_resume_arguments(*literal, &option)) {
+        if (option.empty()) {
+            failure = {addon::Result_status::UNAVAILABLE, "unsupported_launcher", k_unsupported_launcher_description};
+            return std::nullopt;
+        }
+        failure = {addon::Result_status::UNAVAILABLE, "unsupported_resume_option",
+            "This session cannot be resumed: the launcher's Claude option \"" + option +
+                "\" does not allow resuming a session."};
+        return std::nullopt;
+    }
+    if (!canonical_resume_directory(launch.working_directory)) {
+        failure = {addon::Result_status::FAILED, "invalid_resume_directory", {}};
         return std::nullopt;
     }
     return literal;
@@ -510,7 +540,8 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
         }
         addon::Resume_inspect_result result;
         result.request_digest_hex = addon::resume_inspect_request_digest_hex(*input);
-        if (const auto command = exact_resume_command(input->context, input->resume_record)) {
+        Resume_failure command_failure;
+        if (const auto command = exact_resume_command(input->context, input->resume_record, command_failure)) {
             const auto state = inspect_saved_conversation(
                 input->context, text(input->resume_record, "provider_session_id"), *command, context);
             result.availability = state.availability;
@@ -531,15 +562,23 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
     }
     const auto input = addon::decode_resume_prepare_request(context.request().payload, &failure, 2);
     if (!input) {
-        context.fail(addon::Result_status::FAILED, failure.reason_code);
+        const auto& payload = context.request().payload;
+        context.fail(addon::Result_status::FAILED,
+            payload.is_object() && !payload.find("launch_environment")
+                ? "missing_launch_environment" : failure.reason_code);
         return;
     }
     const auto session = text(input->resume_record, "provider_session_id");
-    const auto command = exact_resume_command(input->context, input->resume_record);
-    if (!command ||
-        !node_available(*input->context.launch_environment, input->context.working_directory))
-    {
-        context.fail(addon::Result_status::UNAVAILABLE, "exact_resume_unavailable");
+    Resume_failure command_failure;
+    const auto command = exact_resume_command(input->context, input->resume_record, command_failure);
+    if (!command) {
+        context.fail(command_failure.status, command_failure.reason, command_failure.description);
+        return;
+    }
+    if (!node_available(*input->context.launch_environment, input->context.working_directory)) {
+        context.fail(addon::Result_status::UNAVAILABLE, "node_not_found",
+            "This session cannot be resumed: Node.js (\"node\") was not found on the PATH of the launcher's environment. "
+            "Logonomic's Claude integration needs it to resume.");
         return;
     }
     const auto state = inspect_saved_conversation(input->context, session, *command, context);
@@ -548,7 +587,8 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
         return;
     }
     if (state.availability == addon::Resume_availability::ABSENT) {
-        context.fail(addon::Result_status::UNAVAILABLE, "conversation_absent");
+        context.fail(addon::Result_status::UNAVAILABLE, "conversation_absent",
+            "This session cannot be resumed: its saved conversation was not found in Claude's profile folder.");
         return;
     }
     std::vector<std::string> plugins{path_string(package_root / "assets/claude-hooks")};
@@ -558,7 +598,7 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
     const auto argv = prepared_argv(input->context.launcher_argv, input->title_instruction,
         plugins, {"--resume", session});
     if (!argv) {
-        context.fail(addon::Result_status::UNAVAILABLE, "unsupported_launcher");
+        context.fail(addon::Result_status::UNAVAILABLE, "unsupported_launcher", k_unsupported_launcher_description);
         return;
     }
     addon::Resume_prepare_result result;

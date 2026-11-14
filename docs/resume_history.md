@@ -96,6 +96,12 @@ environment, working directory and exact transcript lookup. A natively
 resumable transcript can still have no conversation content. Content never
 changes the version 2 availability predicate or the stored resume record.
 
+Resume preparation reports a distinct reason and a complete user-facing sentence
+for an invalid saved reference, an unsupported launcher command or Claude option,
+missing Node.js, and an absent saved conversation. The option sentence names the
+option without including its value. Missing launch environment or an invalid
+request directory remains a developer failure without a user-facing description.
+
 ## Evidence for empty and nonempty content
 
 Content inspection follows the Agent SDK's main user/assistant conversation

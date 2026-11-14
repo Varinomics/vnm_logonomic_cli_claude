@@ -68,10 +68,11 @@ public:
     bool wait_for_cancel(int) override { return m_cancelled; }
     void report_progress(std::uint64_t, std::optional<std::uint64_t>, std::string) override {}
     void succeed(Json payload) override { m_payload = std::move(payload); m_finished = true; }
-    void fail(addon::Result_status status, std::string reason, std::string) override
+    void fail(addon::Result_status status, std::string reason, std::string description) override
     {
         m_status = status;
         m_reason = std::move(reason);
+        m_description = std::move(description);
         m_finished = true;
     }
     bool finished() const override { return m_finished; }
@@ -79,6 +80,7 @@ public:
     Json m_payload;
     addon::Result_status m_status = addon::Result_status::SUCCESS;
     std::string m_reason;
+    std::string m_description;
     bool m_cancelled = false;
     bool m_finished = false;
 };
@@ -661,6 +663,63 @@ void launcher_directory_contract()
         };
         require(resumed->patch.set == expected_environment,
             "resume patch retains the frozen profile and hook timeout");
+        const auto expect_failure = [&](const addon::Resume_prepare_request& request,
+                                        std::string_view reason, std::string_view description,
+                                        addon::Result_status status = addon::Result_status::UNAVAILABLE) {
+            Context refused;
+            refused.m_request = invocation.m_request;
+            refused.m_request.payload = addon::encode_resume_prepare_request(request, 2);
+            claude::handle_preparation(refused, root);
+            if (refused.m_status != status || refused.m_reason != reason || refused.m_description != description) {
+                std::cerr << "Expected " << reason << ": " << description << "\nActual " << refused.m_reason
+                    << ": " << refused.m_description << '\n';
+            }
+            require(refused.m_finished && refused.m_status == status && refused.m_reason == reason &&
+                refused.m_description == description, "resume failure identifies its cause and supplies its sentence");
+        };
+        for (const auto& record : {
+            claude::object(R"({})"),
+            claude::object(R"({"provider_session_id":"a375d05e-f6cf-4812-80f5-91b33d24c053","extra":true})"),
+            claude::object(R"({"provider_session_id":"A375D05E-F6CF-4812-80F5-91B33D24C053"})"),
+            claude::object(R"({"provider_session_id":"not-a-session"})"),
+            claude::object(R"({"provider_session_id":42})"),
+        }) {
+            auto invalid = resume;
+            invalid.resume_record = record;
+            expect_failure(invalid, "invalid_resume_record",
+                "This session cannot be resumed: Logonomic's saved reference to the Claude conversation is not valid.");
+        }
+        for (const auto& script : {std::string("claude && echo done"), std::string("claude 'saved prompt'"),
+            "'" + directory + "/tools with space/claude'"})
+        {
+            auto unsupported = resume;
+            unsupported.context.launcher.script_body = script;
+            unsupported.context.launcher_argv = {"bash", "-c", script};
+            expect_failure(unsupported, "unsupported_launcher",
+                "This session cannot be resumed: the launcher's command is not a plain \"claude\" command, "
+                "so the resume option cannot be added to it.");
+        }
+        for (const auto& [argument, option] : std::vector<std::pair<std::string, std::string>>{
+            {"-p", "-p"}, {"--resume", "--resume"}, {"--prompt-suggestions=on", "--prompt-suggestions"},
+            {"-rVALUE", "-r"},
+        }) {
+            auto unsupported = resume;
+            unsupported.context.launcher_argv = {"claude", argument};
+            expect_failure(unsupported, "unsupported_resume_option",
+                "This session cannot be resumed: the launcher's Claude option \"" + option +
+                    "\" does not allow resuming a session.");
+        }
+        auto missing_node = resume;
+        missing_node.context.launch_environment->effective_environment.set("PATH", Json("missing-tools"));
+        expect_failure(missing_node, "node_not_found",
+            "This session cannot be resumed: Node.js (\"node\") was not found on the PATH of the launcher's environment. "
+            "Logonomic's Claude integration needs it to resume.");
+        auto missing_environment = resume;
+        missing_environment.context.launch_environment.reset();
+        expect_failure(missing_environment, "missing_launch_environment", {}, addon::Result_status::FAILED);
+        auto relative_directory = resume;
+        relative_directory.context.working_directory = "relative-folder";
+        expect_failure(relative_directory, "invalid_resume_directory", {}, addon::Result_status::FAILED);
         require(!claude::canonical_resume_directory(directory + "/."), "dot resume directory refused");
         require(!claude::canonical_resume_directory(directory + "/tools/.."), "parent traversal resume directory refused");
         require(!claude::canonical_resume_directory(directory + "/"), "non-root trailing separator refused");
@@ -2912,7 +2971,7 @@ int main(int argc, char** argv)
         std::string_view(argv[2]) == "--event-diagnostics")))
     {
         std::cerr << "usage: claude_contract_tests <package directory> [--reply-evidence|--event-diagnostics]\n"
-            "       claude_contract_tests --launcher-approval | --context-state | --quota\n";
+            "       claude_contract_tests --launcher-approval | --context-state | --quota | --resume-preparation\n";
         return 2;
     }
     try {
@@ -2943,6 +3002,11 @@ int main(int argc, char** argv)
             quota_failure_contract();
             quota_reset_label_contract();
             std::cout << "Claude quota contract checks passed.\n";
+            return 0;
+        }
+        if (std::string_view(argv[1]) == "--resume-preparation") {
+            launcher_directory_contract();
+            std::cout << "Claude resume preparation checks passed.\n";
             return 0;
         }
         review_contract();

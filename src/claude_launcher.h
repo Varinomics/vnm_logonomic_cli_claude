@@ -24,7 +24,8 @@ std::optional<std::size_t> cli_argument_index(const std::vector<std::string>& ar
 // the options an interactive launch may carry: one after an option that takes
 // a value, none after a switch, an option=value word or an unknown option.
 std::size_t claude_option_value_words(const std::vector<std::string>& argv, std::size_t index);
-bool interactive_resume_arguments(const std::vector<std::string>& argv);
+// On refusal, reports the option name without an inline value when requested.
+bool interactive_resume_arguments(const std::vector<std::string>& argv, std::string* refused_option = nullptr);
 bool direct_implementation_arguments(const logonomic::cli_addon::Session_launch_context& context);
 logonomic::cli_addon::Process_proposal cli_process(
     const logonomic::cli_addon::Session_launch_context& context, bool preserve_arguments);

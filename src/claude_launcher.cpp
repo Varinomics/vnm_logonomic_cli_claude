@@ -202,8 +202,16 @@ std::size_t claude_option_value_words(const std::vector<std::string>& argv, std:
     return argument == k_prompt_suggestions && !argv[index + 1].starts_with('-') ? 1 : 0;
 }
 
-bool interactive_resume_arguments(const std::vector<std::string>& argv)
+bool interactive_resume_arguments(const std::vector<std::string>& argv, std::string* refused_option)
 {
+    if (refused_option) refused_option->clear();
+    const auto refuse = [refused_option](const std::string& argument) {
+        if (refused_option && argument.size() > 1 && argument.front() == '-') {
+            *refused_option = argument.starts_with("--")
+                ? argument.substr(0, argument.find('=')) : argument.substr(0, 2);
+        }
+        return false;
+    };
     const auto cli_index = cli_argument_index(argv);
     if (!cli_index) {
         return false;
@@ -225,19 +233,19 @@ bool interactive_resume_arguments(const std::vector<std::string>& argv)
         const auto& argument = argv[index];
         if (argument == k_prompt_suggestions) {
             if (claude_option_value_words(argv, index) == 0 || !suggestions_off(argv[++index])) {
-                return false;
+                return refuse(argument);
             }
             continue;
         }
         if (argument.starts_with(std::string(k_prompt_suggestions) + '=')) {
             if (!suggestions_off(std::string_view(argument).substr(k_prompt_suggestions.size() + 1))) {
-                return false;
+                return refuse(argument);
             }
             continue;
         }
         if (claude_option_value_words(argv, index) == 1) {
             if (argv[++index].empty()) {
-                return false;
+                return refuse(argument);
             }
             continue;
         }
@@ -250,7 +258,7 @@ bool interactive_resume_arguments(const std::vector<std::string>& argv)
             continue;
         }
         if (std::find(switches.begin(), switches.end(), argument) == switches.end()) {
-            return false;
+            return refuse(argument);
         }
     }
     return true;

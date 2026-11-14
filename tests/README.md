@@ -22,6 +22,10 @@ With that option enabled, add `-L large-data` to the CTest command to run only
 the large-data tier, or add `-LE large-data` to run only the ordinary tier.
 The embedded package build does not register these standalone test suites.
 
+`claude_resume_preparation_tests` exercises the actual resume producer, including
+the distinct failure codes and complete descriptions. The filesystem resume
+entry also checks the missing-conversation description.
+
 On Windows, the standalone build also registers `claude_native_path_tests`,
 `claude_native_resume_path_tests` and `claude_native_export_path_tests`, which
 run the packaged adapter against long and extended-length Windows paths.
