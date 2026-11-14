@@ -406,7 +406,7 @@ struct Resume_failure
 };
 
 std::optional<std::vector<std::string>> exact_resume_command(
-    const addon::Session_launch_context& launch, const addon::Json_value& record, Resume_failure& failure)
+    addon::Session_launch_context& launch, const addon::Json_value& record, Resume_failure& failure)
 {
     if (!record.is_object() || record.as_object().size() != 1 ||
         !canonical_session_id(text(record, "provider_session_id")))
@@ -431,10 +431,12 @@ std::optional<std::vector<std::string>> exact_resume_command(
                 "\" does not allow resuming a session."};
         return std::nullopt;
     }
-    if (!canonical_resume_directory(launch.working_directory)) {
+    const auto directory = addon::normalized_resume_directory(launch.working_directory);
+    if (!directory) {
         failure = {addon::Result_status::FAILED, "invalid_resume_directory", {}};
         return std::nullopt;
     }
+    launch.working_directory = path_string(*directory);
     return literal;
 }
 
@@ -453,16 +455,6 @@ bool node_available(const addon::Launch_environment& launch, const std::string& 
         if (fs::is_regular_file(path / (windows ? "node.exe" : "node"), error) && !error) return true;
     }
     return false;
-}
-
-bool canonical_resume_directory(const std::string& directory)
-{
-    const auto path = addon::path_from_utf8(directory);
-    if (!path.is_absolute()) return false;
-    auto normalized = path.lexically_normal();
-    if (normalized != normalized.root_path() && normalized.filename().empty()) normalized = normalized.parent_path();
-    const auto bytes = normalized.generic_u8string();
-    return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()) == directory;
 }
 
 std::optional<std::vector<std::string>> prepared_argv(
@@ -540,10 +532,11 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
         }
         addon::Resume_inspect_result result;
         result.request_digest_hex = addon::resume_inspect_request_digest_hex(*input);
+        auto launch = input->context;
         Resume_failure command_failure;
-        if (const auto command = exact_resume_command(input->context, input->resume_record, command_failure)) {
+        if (const auto command = exact_resume_command(launch, input->resume_record, command_failure)) {
             const auto state = inspect_saved_conversation(
-                input->context, text(input->resume_record, "provider_session_id"), *command, context);
+                launch, text(input->resume_record, "provider_session_id"), *command, context);
             result.availability = state.availability;
             result.content      = state.content;
         }
@@ -569,19 +562,20 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
         return;
     }
     const auto session = text(input->resume_record, "provider_session_id");
+    auto launch = input->context;
     Resume_failure command_failure;
-    const auto command = exact_resume_command(input->context, input->resume_record, command_failure);
+    const auto command = exact_resume_command(launch, input->resume_record, command_failure);
     if (!command) {
         context.fail(command_failure.status, command_failure.reason, command_failure.description);
         return;
     }
-    if (!node_available(*input->context.launch_environment, input->context.working_directory)) {
+    if (!node_available(*launch.launch_environment, launch.working_directory)) {
         context.fail(addon::Result_status::UNAVAILABLE, "node_not_found",
             "This session cannot be resumed: Node.js (\"node\") was not found on the PATH of the launcher's environment. "
             "Logonomic's Claude integration needs it to resume.");
         return;
     }
-    const auto state = inspect_saved_conversation(input->context, session, *command, context);
+    const auto state = inspect_saved_conversation(launch, session, *command, context);
     if (context.cancel_requested()) {
         context.fail(addon::Result_status::CANCELLED, "cancelled");
         return;
@@ -592,10 +586,10 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
         return;
     }
     std::vector<std::string> plugins{path_string(package_root / "assets/claude-hooks")};
-    if (input->context.session_wake) {
+    if (launch.session_wake) {
         plugins.push_back(path_string(package_root / "assets/claude-wake-dispatch"));
     }
-    const auto argv = prepared_argv(input->context.launcher_argv, input->title_instruction,
+    const auto argv = prepared_argv(launch.launcher_argv, input->title_instruction,
         plugins, {"--resume", session});
     if (!argv) {
         context.fail(addon::Result_status::UNAVAILABLE, "unsupported_launcher", k_unsupported_launcher_description);
@@ -605,10 +599,10 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
     result.process.executable = addon::Process_executable::launcher_program();
     result.process.argv.assign(argv->begin() + 1, argv->end());
     result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
-    result.patch.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(input->context)));
-    result.patch.profile_storage = input->context.profile_storage;
-    result.patch.account_context = input->context.account_context;
-    if (input->context.session_wake) prepare_wake(result.patch, input->context.profile_storage, true, package_root);
+    result.patch.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(launch)));
+    result.patch.profile_storage = launch.profile_storage;
+    result.patch.account_context = launch.account_context;
+    if (launch.session_wake) prepare_wake(result.patch, launch.profile_storage, true, package_root);
     result.patch.set.emplace_back("CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS", "5000");
     result.acknowledgment.record_digest_hex = addon::resume_record_digest_hex(input->resume_record);
     context.succeed(addon::encode_resume_prepare_result(result, 2));

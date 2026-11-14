@@ -102,6 +102,13 @@ missing Node.js, and an absent saved conversation. The option sentence names the
 option without including its value. Missing launch environment or an invalid
 request directory remains a developer failure without a user-facing description.
 
+Resume preparation and inspection normalize a separate launch-context copy
+through the SDK's `normalized_resume_directory`. Windows backslashes, either
+separator spelling and lexical dot segments therefore reach the same native
+lookup and Node search. Normalization never resolves links, junctions or
+substituted drives: Claude derives its project folder from the launch spelling.
+The original request continues to bind inspection digests.
+
 ## Evidence for empty and nonempty content
 
 Content inspection follows the Agent SDK's main user/assistant conversation

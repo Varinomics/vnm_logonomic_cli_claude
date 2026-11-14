@@ -240,7 +240,7 @@ void conversation_contract(
     addon::Resume_inspect_request inspection;
     inspection.context.launcher = {"claude", addon::k_runner_direct, {}};
     inspection.context.launcher_argv = {addon::path_to_utf8(program)};
-    inspection.context.working_directory = working_directory.generic_string();
+    inspection.context.working_directory = addon::path_to_utf8(working_directory);
     addon::Launch_environment environment;
     environment.platform_id = addon::host_platform_id();
     environment.effective_environment = Json::object();
@@ -259,18 +259,29 @@ void conversation_contract(
         require(result && result->availability == availability && result->content == content,
             "long native transcript has the expected availability and content: " +
                 addon::serialize_json(outcome->payload));
+        require(result->request_digest_hex == addon::resume_inspect_request_digest_hex(inspection),
+            "native folder normalization preserves the original inspection request acknowledgment");
     };
     if (resume) {
-        inspect(addon::Resume_availability::AVAILABLE, addon::Resume_content::NONEMPTY);
-        addon::Resume_prepare_request preparation;
-        preparation.context = inspection.context;
-        preparation.resume_record = inspection.resume_record;
-        preparation.title_instruction = "Set the session title.";
-        const auto prepared_id = host.invoke({"interactive-resume", 2}, "prepare_resume",
-            addon::encode_resume_prepare_request(preparation, 2), 5000);
-        const auto prepared = host.wait_outcome(prepared_id, 6000);
-        require(prepared && prepared->status == addon::Host_status::SUCCESS,
-            "long native transcript permits exact-session resume preparation");
+        const auto native = addon::path_to_utf8(working_directory);
+        for (const auto& spelling : {native, native + "\\.\\", native + "\\..\\work\\\\"}) {
+            inspection.context.working_directory = spelling;
+            inspect(addon::Resume_availability::AVAILABLE, addon::Resume_content::NONEMPTY);
+            addon::Resume_prepare_request preparation;
+            preparation.context = inspection.context;
+            preparation.resume_record = inspection.resume_record;
+            preparation.title_instruction = "Set the session title.";
+            const auto prepared_id = host.invoke({"interactive-resume", 2}, "prepare_resume",
+                addon::encode_resume_prepare_request(preparation, 2), 5000);
+            const auto prepared = host.wait_outcome(prepared_id, 6000);
+            require(prepared && prepared->status == addon::Host_status::SUCCESS,
+                "backslash-spelled native folder permits exact-session resume preparation");
+            const auto result = addon::decode_resume_prepare_result(prepared->payload, &failure, 2);
+            require(result && result->process.argv.size() >= 2 &&
+                result->process.argv[result->process.argv.size() - 2] == "--resume" &&
+                result->process.argv.back() == session,
+                "native folder spelling retains the selected Claude conversation");
+        }
         {
             filesystem_test::Access_denial denial(io_path(source), FILE_READ_DATA);
             inspect(addon::Resume_availability::UNKNOWN, addon::Resume_content::UNKNOWN);

@@ -634,7 +634,6 @@ void launcher_directory_contract()
         require(claude::node_available(*windows_spelling.launch_environment, directory),
             "the Windows Path spelling finds Node for hooks and resume");
 #endif
-        require(claude::canonical_resume_directory(directory), "clean absolute resume directory admitted");
         addon::Resume_prepare_request resume;
         resume.context = launch;
         resume.context.launch_environment->effective_environment.set(
@@ -720,14 +719,28 @@ void launcher_directory_contract()
         auto relative_directory = resume;
         relative_directory.context.working_directory = "relative-folder";
         expect_failure(relative_directory, "invalid_resume_directory", {}, addon::Result_status::FAILED);
-        require(!claude::canonical_resume_directory(directory + "/."), "dot resume directory refused");
-        require(!claude::canonical_resume_directory(directory + "/tools/.."), "parent traversal resume directory refused");
-        require(!claude::canonical_resume_directory(directory + "/"), "non-root trailing separator refused");
+        std::vector<std::string> spellings{directory + "/.", directory + "/tools/..", directory + "///"};
 #ifdef _WIN32
         auto native = directory;
         for (char& ch : native) if (ch == '/') ch = '\\';
-        require(!claude::canonical_resume_directory(native), "resume requires native oracle forward-separator spelling");
+        spellings.push_back(native);
+        spellings.push_back(native + "\\tools\\..\\.\\");
 #endif
+        for (const auto& spelling : spellings) {
+            resume.context.working_directory = spelling;
+            Context normalized;
+            normalized.m_request = invocation.m_request;
+            normalized.m_request.payload = addon::encode_resume_prepare_request(resume, 2);
+            claude::handle_preparation(normalized, root);
+            if (normalized.m_status != addon::Result_status::SUCCESS) {
+                std::cerr << "Resume folder " << spelling << ": " << normalized.m_reason << '\n';
+            }
+            require(normalized.m_status == addon::Result_status::SUCCESS,
+                "an existing folder in native or decorated spelling prepares the exact resume");
+            const auto result = addon::decode_resume_prepare_result(normalized.m_payload, &failure, 2);
+            require(result && result->process.argv == resumed->process.argv && result->patch.set == expected_environment,
+                "normalizing the folder retains the exact session selector and launch environment");
+        }
     }
     catch (...) {
         fs::remove_all(root);

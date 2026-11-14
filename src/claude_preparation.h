@@ -11,7 +11,6 @@
 namespace claude {
 
 bool node_available(const logonomic::cli_addon::Launch_environment& launch, const std::string& working_directory);
-bool canonical_resume_directory(const std::string& directory);
 
 std::optional<std::vector<std::string>> prepared_argv(
     const std::vector<std::string>& argv, const std::string& instruction,
