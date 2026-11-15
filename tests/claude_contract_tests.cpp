@@ -2119,6 +2119,35 @@ void delegated_model_selection_contract()
     require(prepared && claude::text(claude::object(prepared->inspection.protocol_state), "verified_model") ==
             "claude-native-opus",
         "native alias resolution is used without constraining custom IDs to menu models");
+    // Native Claude Code 2.1.323 emits these session-bound startup hooks
+    // before initialize completes; they are administration, not model output.
+    for (const auto purpose : {Purpose::READ_ONLY_REVIEW, Purpose::IMPLEMENTATION}) {
+        auto hooked = alias;
+        hooked.purpose = purpose;
+        hooked.model_selection = addon::Delegated_model_selection{"claude-fable-5-2", "xhigh"};
+        for (const auto framing : {"hooks", "hooks_split"}) {
+            hooked.context.launch_environment->effective_environment.set("CLAUDE_TEST_SELECTION_FRAMING", Json(framing));
+            const auto accepted = posture_prepare(hooked, true);
+            const auto result = addon::decode_delegated_prepare_result(accepted.m_payload, nullptr);
+            require(accepted.m_status == addon::Result_status::SUCCESS && result &&
+                result->model_selection == hooked.model_selection &&
+                claude::text(claude::object(result->inspection.protocol_state), "verified_model") == "claude-fable-5-2",
+                "startup hooks around replies and across a control write preserve exact selection attestation");
+            require(addon::serialize_json(accepted.m_payload).find("private-settings-secret-canary") == std::string::npos,
+                "hook administration never exposes private settings");
+        }
+    }
+    for (const auto framing : {"unknown_system", "assistant_hook", "empty_session", "foreign_session",
+             "foreign_settings_session", "wrong_initialize_id", "wrong_settings_id",
+             "premature_reply", "premature_reply_split"})
+    {
+        alias.context.launch_environment->effective_environment.set("CLAUDE_TEST_SELECTION_FRAMING", Json(framing));
+        const auto rejected = posture_prepare(alias, true);
+        require(rejected.m_status == addon::Result_status::UNAVAILABLE &&
+            rejected.m_reason == "model_selection_unavailable",
+            (std::string("private selection rejects invalid startup framing: ") + framing).c_str());
+    }
+    alias.context.launch_environment->effective_environment.set("CLAUDE_TEST_SELECTION_FRAMING", Json("hooks"));
     for (const auto mode : {"clamped", "substituted", "missing", "unsupported"}) {
         alias.context.launch_environment->effective_environment.set("CLAUDE_TEST_SELECTION_PROBE", Json(mode));
         const auto failure = posture_prepare(alias, true);
@@ -2984,7 +3013,8 @@ int main(int argc, char** argv)
         std::string_view(argv[2]) == "--event-diagnostics")))
     {
         std::cerr << "usage: claude_contract_tests <package directory> [--reply-evidence|--event-diagnostics]\n"
-            "       claude_contract_tests --launcher-approval | --context-state | --quota | --resume-preparation\n";
+            "       claude_contract_tests --launcher-approval | --context-state | --quota | --resume-preparation\n"
+            "       claude_contract_tests --session-readiness\n";
         return 2;
     }
     try {
@@ -3020,6 +3050,14 @@ int main(int argc, char** argv)
         if (std::string_view(argv[1]) == "--resume-preparation") {
             launcher_directory_contract();
             std::cout << "Claude resume preparation checks passed.\n";
+            return 0;
+        }
+        if (std::string_view(argv[1]) == "--session-readiness") {
+            structured_contract();
+            delegated_readiness_contract();
+            delegated_model_selection_contract();
+            permission_posture_contract();
+            std::cout << "Claude session readiness checks passed.\n";
             return 0;
         }
         review_contract();

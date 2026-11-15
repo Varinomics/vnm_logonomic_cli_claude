@@ -25,6 +25,15 @@ namespace {
 
 namespace addon = logonomic::cli_addon;
 
+std::string hook_frame(std::string_view subtype, std::string_view session = "selection-session")
+{
+    auto frame = addon::Json_value::object();
+    frame.set("type", addon::Json_value("system"));
+    frame.set("subtype", addon::Json_value(std::string(subtype)));
+    frame.set("session_id", addon::Json_value(std::string(session)));
+    return addon::serialize_json(frame) + '\n';
+}
+
 std::optional<int> selection_probe(const std::vector<std::string>& arguments)
 {
     const char* mode = std::getenv("CLAUDE_TEST_SELECTION_PROBE");
@@ -47,6 +56,9 @@ std::optional<int> selection_probe(const std::vector<std::string>& arguments)
     const char* expected = std::getenv("CLAUDE_TEST_EXPECTED_PROFILE");
     const char* selected = std::getenv("CLAUDE_CONFIG_DIR");
     if (expected && (!selected || std::string_view(expected) != selected)) return 3;
+    const char* framing_value = std::getenv("CLAUDE_TEST_SELECTION_FRAMING");
+    const std::string_view framing = framing_value ? framing_value : "";
+    std::string pending_output;
     for (std::string line; std::getline(std::cin, line);) {
         const auto request = addon::parse_json(line, addon::Json_parse_limits{}, nullptr);
         if (!request || !request->find("request") || !request->find("request_id")) return 4;
@@ -74,12 +86,51 @@ std::optional<int> selection_probe(const std::vector<std::string>& arguments)
         else return 5;   // The probe may neither prompt the model nor start Task MCP discovery.
         auto response = addon::Json_value::object();
         response.set("subtype", addon::Json_value(std::string_view(mode) == "unsupported" ? "error" : "success"));
-        response.set("request_id", *request->find("request_id"));
+        const bool initialize = subtype->as_string() == "initialize";
+        const bool wrong_id = framing == (initialize ? "wrong_initialize_id" : "wrong_settings_id");
+        response.set("request_id", wrong_id ? addon::Json_value("foreign-request") : *request->find("request_id"));
         response.set("response", std::move(payload));
         auto frame = addon::Json_value::object();
         frame.set("type", addon::Json_value("control_response"));
         frame.set("response", std::move(response));
-        std::cout << addon::serialize_json(frame) << '\n' << std::flush;
+        const auto reply = addon::serialize_json(frame) + '\n';
+        std::string output = std::move(pending_output);
+        pending_output.clear();
+        if (!framing.empty()) {
+            output += hook_frame(initialize ? "hook_started" : "hook_response");
+        }
+        if (initialize) {
+            if (framing == "unknown_system") output += hook_frame("informational");
+            if (framing == "empty_session")  output += hook_frame("hook_progress", "");
+            if (framing == "foreign_session") output += hook_frame("hook_progress", "other-session");
+            if (framing == "assistant_hook") {
+                output += "{\"type\":\"assistant\",\"subtype\":\"hook_started\","
+                    "\"session_id\":\"selection-session\"}\n";
+            }
+        }
+        else
+        if (framing == "foreign_settings_session") {
+            output += hook_frame("hook_response", "other-session");
+        }
+        output += reply;
+        if (framing == "hooks" || framing == "hooks_split") {
+            const auto hook = hook_frame("hook_progress");
+            if (initialize && framing == "hooks_split") {
+                // Waiting for get_settings makes the hook straddle the probe's
+                // control write without relying on pipe scheduling or sleeps.
+                output += hook.substr(0, hook.size() / 2);
+                pending_output = hook.substr(hook.size() / 2);
+            }
+            else {
+                output += hook;
+            }
+        }
+        if (initialize && framing == "premature_reply") output += reply;
+        if (initialize && framing == "premature_reply_split") {
+            output += reply.substr(0, reply.size() / 2);
+            pending_output = reply.substr(reply.size() / 2);
+        }
+        std::cout << output << std::flush;
     }
     return 0;
 }

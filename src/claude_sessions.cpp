@@ -44,6 +44,22 @@ bool same_strings(std::vector<std::string> left, std::vector<std::string> right)
     return left == right;
 }
 
+bool startup_hook(const std::string& type, const std::string& subtype)
+{
+    return type == "system" &&
+        (subtype == "hook_started" || subtype == "hook_progress" || subtype == "hook_response");
+}
+
+bool bind_session(const Json& event, std::string& root_session)
+{
+    const auto id = text(event, "session_id");
+    if (id.empty() || (!root_session.empty() && id != root_session)) {
+        return false;
+    }
+    root_session = id;
+    return true;
+}
+
 bool same_directory(std::string left, std::string right)
 {
     left  = path_string(addon::path_from_utf8(left).lexically_normal());
@@ -386,17 +402,24 @@ std::optional<std::string> verify_model_selection(
     exchange.initial_input = control_request(state, "initialize");
     std::size_t consumed = 0;
     bool pending_before_input = false;
+    std::string root_session;
     std::string refusal = "model_selection_unavailable";
     exchange.on_output = [&](std::string_view output) -> std::optional<std::string> {
         std::string input;
         try {
-            if (pending_before_input) return std::nullopt;
             for (std::size_t end; (end = output.find('\n', consumed)) != std::string_view::npos;) {
                 const auto line = output.substr(consumed, end - consumed);
                 consumed = end + 1;
                 if (line.find_first_not_of(" \t\r") == std::string_view::npos) continue;
-                if (!input.empty() || exchange.complete) return std::nullopt;
                 const auto event = object(line);
+                if (startup_hook(text(event, "type"), text(event, "subtype"))) {
+                    if (!bind_session(event, root_session)) return std::nullopt;
+                    pending_before_input = false;
+                    continue;
+                }
+                // Hooks can cross a control write; a reply cannot acknowledge
+                // input this callback has not returned to the probe yet.
+                if (!input.empty() || pending_before_input || exchange.complete) return std::nullopt;
                 if (text(event, "type") != "control_response") return std::nullopt;
                 addon::Structured_inspect_result next;
                 if (const auto failure = advance_readiness(event, state, next)) {
@@ -413,8 +436,9 @@ std::optional<std::string> verify_model_selection(
                     input = std::move(*next.stdin_bytes);
                 }
             }
-            pending_before_input = !input.empty() &&
-                output.substr(consumed).find_first_not_of(" \t\r\n") != std::string_view::npos;
+            if (!input.empty() && output.substr(consumed).find_first_not_of(" \t\r\n") != std::string_view::npos) {
+                pending_before_input = true;
+            }
         }
         catch (const std::exception&) {
             return std::nullopt;
@@ -561,16 +585,12 @@ addon::Structured_inspect_result inspect_session(
             const auto type = text(event, "type");
             const auto subtype = text(event, "subtype");
             if (type.empty() || (review && !answer.empty())) return failed("invalid_structured_output");
-            const bool hook = subtype == "hook_started" || subtype == "hook_progress" || subtype == "hook_response";
-            const bool administrative = type == "system" &&
-                ((review && (hook || subtype == "commands_changed" || subtype == "informational")) ||
-                 (!review && !initialized && hook));
+            const bool administrative = ((review || !initialized) && startup_hook(type, subtype)) ||
+                (review && type == "system" && (subtype == "commands_changed" || subtype == "informational"));
             if (administrative) {
-                const auto id = text(event, "session_id");
-                if (id.empty() || (!root_session.empty() && id != root_session)) {
+                if (!bind_session(event, root_session)) {
                     return failed("session_provenance_mismatch");
                 }
-                root_session = id;
                 pending_before_input = false;
                 record(addon::Presentation_event_kind::REASONING);
                 continue;
