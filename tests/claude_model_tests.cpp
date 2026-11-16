@@ -154,7 +154,7 @@ void structured_model()
     require(result.complete && !result.failure_reason && result.result_bytes == "done" && !result.model_observation &&
         result.model_failure, "Malformed optional native model preserves authenticated completion");
     auto envelope = addon::encode_structured_inspect_result(result);
-    auto decoded = addon::decode_structured_inspect_result(envelope, nullptr);
+    auto decoded = addon::decode_structured_inspect_result(envelope, true, nullptr);
     require(decoded && decoded->model_failure && decoded->result_bytes == "done",
         "Optional model failure survives the actual structured carrier");
 }
