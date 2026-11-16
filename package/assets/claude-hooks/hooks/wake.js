@@ -2,11 +2,22 @@
 // attribution, permission prompts and cancellation of the running model turn.
 let directory;
 let interactive = false;
-let activation = { active: false, busy: false, paused: true, model_sequence: 0n };
+let activation = { active: false, busy: false, paused: true };
+// Native session state for model sequencing. A module reload keeps the native
+// session and its accepted transition nonce, so a counter held only by this
+// module would restart below the host's sequence barrier. /clear, /resume and
+// /branch reset the state with the activation.
+// - module_load: each module copy writes it once as it loads. The version of
+//   that write orders the copies, also after such a reset.
+// - model_sequence: { owner, sequence }, the load version of the copy that owns
+//   sequencing and the highest sequence published.
+const module_load    = { plugin: 'logonomic-claude-hooks', key: 'module_load' };
+const model_sequence = { plugin: 'logonomic-claude-hooks', key: 'model_sequence' };
+let load_version;
 
 function replace_activation(session_id, start_pending = false) {
     activation.active = false;
-    activation = { session_id, start_pending, active: false, busy: false, paused: true, model_sequence: 0n };
+    activation = { session_id, start_pending, active: false, busy: false, paused: true };
     return activation;
 }
 
@@ -51,9 +62,49 @@ async function bridge($, operation, id, value) {
     return JSON.parse(result.stdout);
 }
 
+// The write is issued synchronously; a failure, including session state the
+// engine does not provide, rejects only model sequencing and leaves wake intact.
+async function write_load($) {
+    return (await $.state.set(module_load, true)).version;
+}
+
+// Once its binding is known, a module copy takes over model sequencing for that
+// activation and counts on from the highest sequence published. Native events
+// reach only the newest copy, but a replaced copy's listener may still finish
+// its binding afterwards; its earlier load cannot take ownership back.
+async function claim_model_sequence($, current) {
+    try {
+        const load = await load_version;
+        for (;;) {
+            const held = await $.state.get(model_sequence);
+            if (held.value?.owner > load) return;
+            const claimed = { owner: load, sequence: held.value?.sequence ?? '0' };
+            if ((await $.state.set(model_sequence, claimed, { ifVersion: held.version })).isSet) {
+                current.model_sequence = BigInt(claimed.sequence);
+                current.model_owner    = load;
+                return;
+            }
+        }
+    }
+    catch { /* Without session state this activation reports no model observations. */ }
+}
+
 function capture_model(current) {
-    if (!current.binding || current.binding.provider_session_id !== current.session_id) return;
-    return { ...current.binding, sequence: String(++current.model_sequence) };
+    if (!current.model_owner || current.binding.provider_session_id !== current.session_id) return;
+    return { ...current.binding, owner: current.model_owner, sequence: String(++current.model_sequence) };
+}
+
+// Publication requires the capturing copy to still own sequencing and the
+// published sequence to cover the observation, so the next owner continues
+// above it. A request captured by a module copy that a reload replaced is omitted.
+async function commit_model_sequence($, captured) {
+    for (;;) {
+        const held = await $.state.get(model_sequence);
+        if (held.value?.owner !== captured.owner) return false;
+        if (BigInt(captured.sequence) <= BigInt(held.value.sequence)) return true;
+        const committed = { owner: captured.owner, sequence: captured.sequence };
+        if ((await $.state.set(model_sequence, committed, { ifVersion: held.version })).isSet) return true;
+    }
 }
 
 async function report_model($, current, captured, agent_id, model, source) {
@@ -65,6 +116,7 @@ async function report_model($, current, captured, agent_id, model, source) {
         const agents = await $.agent.list();
         if (!agents.some(agent => agent.id === agent_id) || !await matches_activation($, current)) return;
     }
+    if (!await commit_model_sequence($, captured)) return;
     await $.process.run(['node', `${$.plugin.root}/scripts/logonomic-hook-relay.cjs`], {
         stdin: JSON.stringify({
             hook_event_name: 'ModModel', session_id: captured.provider_session_id, agent_id,
@@ -151,6 +203,7 @@ async function listen($, current) {
                 const binding = await bridge($, 'binding', undefined, { session_id: current.session_id });
                 if (current !== activation || !current.active) return;
                 current.binding = binding;
+                await claim_model_sequence($, current);
             }
             const request = await bridge($, 'listen', undefined, current.binding);
             if (current !== activation || !current.active) return;
@@ -229,6 +282,10 @@ export function register(on) {
         return result;
     });
     on('session.start', async ($, event, next) => {
+        // Each fresh copy runs this once as it loads. Issued before anything
+        // else is awaited, after every earlier copy's load write.
+        load_version = write_load($);
+        load_version.catch(() => { /* A listener's claim observes the failure. */ });
         directory = await $.env.get('VNM_CLAUDE_WAKE_DIRECTORY');
         interactive = event.isInteractive;
         // A native start may finish while the environment lookup is pending.

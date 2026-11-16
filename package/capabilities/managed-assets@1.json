@@ -6,6 +6,7 @@
       "assets/claude-hooks/.claude-plugin/plugin.json",
       "assets/claude-hooks/hooks/hooks.json",
       "assets/claude-hooks/hooks/wake.js",
+      "assets/claude-hooks/types/index.d.ts",
       "assets/claude-hooks/scripts/logonomic-wake.cjs",
       "assets/claude-wake-dispatch/.claude-plugin/plugin.json",
       "assets/claude-wake-dispatch/hooks/hooks.json",

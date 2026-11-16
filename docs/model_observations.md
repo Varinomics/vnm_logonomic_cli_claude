@@ -41,17 +41,34 @@ source sequence synchronously before awaiting the native request or switch.
 The helper transports that captured nonce and sequence without replacing either
 with its own delivery nonce or the host's current ledger state.
 
+A Mods reload evaluates a new copy of the module while the session keeps its
+accepted registration and transition nonce, so the sequence cannot restart with
+the module. As its `session.start` begins, each copy writes a load marker in
+native session state (`$.state`); the version of that write orders the copies.
+Claude Code keeps state versions increasing when `/clear`, `/resume` and
+`/branch` reset that state together with the activation.
+
+When a copy obtains the binding, it takes over sequencing with a
+compare-and-set write, unless a later copy already owns it, and counts on from
+the highest sequence published. Native events reach only the newest copy, but a
+replaced copy's listener can still finish its binding afterwards; its earlier
+load cannot take ownership back. An observation is published only after another
+compare-and-set confirms that its copy still owns sequencing and records its
+sequence. A request captured by the copy that a reload replaced is therefore
+omitted rather than published at or above its successor's sequences.
+
 The source checks the same activation again after asynchronous work. Retired
 activations, including an earlier A after A → B → A, cannot publish into the
 returning session. An out-of-order completion retains its earlier sequence so
 the host can reject stale evidence. A child roster read is also fenced against
 an activation change.
 
-A step that begins before the binding is available is omitted; a later binding
-cannot retroactively authenticate it. The native SessionStart snapshot can still
-supply the root model. A child with no later eligible response remains
-unconfirmed. Absence of a native model is not replaced with a parent or launcher
-value.
+A step that begins before the binding and its ownership are available is
+omitted; a later binding cannot retroactively authenticate it. Without native
+session state, the activation reports no model observations. The native
+SessionStart snapshot can still supply the root model. A child with no later
+eligible response remains unconfirmed. Absence of a native model is not replaced
+with a parent or launcher value.
 
 `ModModel` uses the existing provider-event transport but is classified as
 ignored for lifecycle purposes. It adds no lifecycle observation, attention
@@ -67,8 +84,8 @@ the same session before initialization; it never supplies model evidence.
 
 `claude_model_tests` checks the classifier, structured parser, and actual SDK
 carriers. `claude_model_hook_tests.mjs` checks the in-process source against
-controlled activation and completion races. The existing continuation, context,
-and activation tests cover neighboring behavior.
+controlled activation, module reload and completion races. The existing
+continuation, context, and activation tests cover neighboring behavior.
 
 `claude_model_mod.test.ts` runs in Claude's actual plugin engine with scripted
 native response, roster, and subprocess boundaries. Copy it beside the candidate

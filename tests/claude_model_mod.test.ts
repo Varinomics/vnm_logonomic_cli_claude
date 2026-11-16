@@ -85,3 +85,39 @@ test('model evidence: resolved native session switch', async ($, on) => {
             model: 'native-resolved', source: 'claude.PostModelSwitch',
         }] } }]);
 });
+
+// Each report commits through the engine's own $.state, so successive sources
+// write against the versions the binding's claim and earlier commits produced.
+test('model evidence: successive sources publish through session state', async ($, on) => {
+    const clock = mock.clock(on, { now: 1000 });
+    mock.env(on, { VNM_CLAUDE_WAKE_DIRECTORY: '/private/wake/test' });
+    const reports = [];
+    on('session.id', () => ({ value: 'native-session' }));
+    on('session.start', () => ({ cwd: '/work' }));
+    on('process.run', ($, event) => {
+        if (event.argv[1].endsWith('/logonomic-hook-relay.cjs')) {
+            reports.push(JSON.parse(event.init.stdin));
+            return { value: { exitCode: 0, stdout: '', stderr: '' } };
+        }
+        if (event.argv[2] === 'binding') return { value: { exitCode: 0,
+            stdout: JSON.stringify({ provider_session_id: 'native-session', transition_nonce: 'b'.repeat(32) }),
+            stderr: '' } };
+        return { deny: 'fixture-listener-stopped' };
+    });
+    on('turn.step', async function* () {
+        yield { kind: 'text', index: 0, text: 'unchanged' };
+        return { turnId: 'turn', index: 0, answer: 'unchanged', toolUses: [], stopReason: 'end_turn', usage: {
+            model: 'root-served', input_tokens: 1, output_tokens: 1,
+            cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+        } };
+    });
+    on('classic.PostModelSwitch', () => ({}));
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true });
+    await clock.settle();
+    const stream = $.turn.step({ turnId: 'turn', index: 0, messageCount: 1, model: 'launcher-only' });
+    while (!(await stream.next()).done) {}
+    await $.classic.PostModelSwitch({ session_id: 'native-session',
+        from_model: 'root-served', to_model: 'native-resolved', requested_model: 'opus', source: 'command' });
+    expect(reports.map(report => [report.model_state.updates[0].model, report.model_state.updates[0].sequence]))
+        .toEqual([['root-served', '1'], ['native-resolved', '2']]);
+});
