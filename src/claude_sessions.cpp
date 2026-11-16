@@ -46,10 +46,15 @@ bool same_strings(std::vector<std::string> left, std::vector<std::string> right)
     return left == right;
 }
 
-bool startup_hook(const std::string& type, const std::string& subtype)
+bool startup_administration(const Json& event)
 {
+    const auto type = text(event, "type");
+    const auto subtype = text(event, "subtype");
+    // Native 2.1.325 invalidates its UI surface before emitting system/init,
+    // including in headless mode. It still has to bind the same native session.
     return type == "system" &&
-        (subtype == "hook_started" || subtype == "hook_progress" || subtype == "hook_response");
+        (subtype == "hook_started" || subtype == "hook_progress" || subtype == "hook_response" ||
+            (subtype == "ui_invalidate" && text(event, "event") == "ui.render"));
 }
 
 bool bind_session(const Json& event, std::string& root_session)
@@ -406,7 +411,7 @@ std::optional<std::string> verify_model_selection(
                 consumed = end + 1;
                 if (line.find_first_not_of(" \t\r") == std::string_view::npos) continue;
                 const auto event = object(line);
-                if (startup_hook(text(event, "type"), text(event, "subtype"))) {
+                if (startup_administration(event)) {
                     if (!bind_session(event, root_session)) return std::nullopt;
                     pending_before_input = false;
                     continue;
@@ -607,7 +612,7 @@ addon::Structured_inspect_result inspect_session(
             const auto type = text(event, "type");
             const auto subtype = text(event, "subtype");
             if (type.empty() || (review && !answer.empty())) return failed("invalid_structured_output");
-            const bool administrative = ((review || !initialized) && startup_hook(type, subtype)) ||
+            const bool administrative = ((review || !initialized) && startup_administration(event)) ||
                 (review && type == "system" && (subtype == "commands_changed" || subtype == "informational"));
             if (administrative) {
                 if (!bind_session(event, root_session)) {

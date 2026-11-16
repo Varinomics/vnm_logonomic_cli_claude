@@ -112,10 +112,10 @@ void structured_model()
     // Oracle: Claude stream-json init and root assistant messages are native
     // sources. Result.modelUsage is an aggregate and cannot identify an actor.
     const std::string init = R"({"type":"system","subtype":"init","session_id":"root","model":"native-live"})" "\n";
-    const std::string answer = R"({"type":"result","subtype":"success","session_id":"root",
-        "is_error":false,"result":"done","modelUsage":{"aggregate-only":{}}})" "\n";
-    const std::string assistant = R"({"type":"assistant","session_id":"root","parent_tool_use_id":null,
-        "message":{"role":"assistant","model":"native-served"}})" "\n";
+    const std::string answer = addon::serialize_json(claude::object(R"({"type":"result","subtype":"success",
+        "session_id":"root","is_error":false,"result":"done","modelUsage":{"aggregate-only":{}}})")) + '\n';
+    const std::string assistant = addon::serialize_json(claude::object(R"({"type":"assistant","session_id":"root",
+        "parent_tool_use_id":null,"message":{"role":"assistant","model":"native-served"}})")) + '\n';
     auto result = inspect(initial_state(), init + assistant + answer, true, false);
     require(result.complete && !result.failure_reason && result.result_bytes == "done" && !result.model_observation,
         "Legacy inspection remains independent of model capability");
@@ -149,6 +149,13 @@ void structured_model()
     result = inspect(initial_state(), init + assistant + answer, true, true, 7);
     require(result.failure_reason == "process_failed" && result.model_observation &&
         result.model_observation->model == "native-served", "A later process failure does not erase observed native evidence");
+    const std::string native_ui = R"({"type":"system","subtype":"ui_invalidate","event":"ui.render","session_id":"root"})" "\n";
+    result = inspect(initial_state(), native_ui + init + assistant + answer, true);
+    require(!result.failure_reason && result.model_observation && result.model_observation->model == "native-served",
+        "Native pre-init UI administration retains its session provenance without supplying a model");
+    result = inspect(initial_state(), native_ui + R"({"type":"system","subtype":"init","session_id":"other","model":"other"})" "\n", true);
+    require(result.failure_reason == "session_provenance_mismatch" && !result.model_observation,
+        "UI administration cannot authorize a different native session's model");
     const std::string malformed = R"({"type":"assistant","session_id":"root","message":{"role":"assistant","model":17}})" "\n";
     result = inspect(initial_state(), init + malformed + answer, true);
     require(result.complete && !result.failure_reason && result.result_bytes == "done" && !result.model_observation &&
