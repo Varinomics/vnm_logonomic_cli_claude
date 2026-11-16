@@ -2,11 +2,11 @@
 // attribution, permission prompts and cancellation of the running model turn.
 let directory;
 let interactive = false;
-let activation = { active: false, busy: false, paused: true };
+let activation = { active: false, busy: false, paused: true, model_sequence: 0n };
 
 function replace_activation(session_id, start_pending = false) {
     activation.active = false;
-    activation = { session_id, start_pending, active: false, busy: false, paused: true };
+    activation = { session_id, start_pending, active: false, busy: false, paused: true, model_sequence: 0n };
     return activation;
 }
 
@@ -49,6 +49,33 @@ async function bridge($, operation, id, value) {
         { stdin: value === undefined ? '' : JSON.stringify(value), timeoutMs: 25000 });
     if (result.exitCode !== 0) throw new Error('bridge_unavailable');
     return JSON.parse(result.stdout);
+}
+
+function capture_model(current) {
+    if (!current.binding || current.binding.provider_session_id !== current.session_id) return;
+    return { ...current.binding, sequence: String(++current.model_sequence) };
+}
+
+async function report_model($, current, captured, agent_id, model, source) {
+    if (!captured || typeof model !== 'string' || !model || model === '<synthetic>' ||
+        !await matches_activation($, current)) return;
+    if (agent_id) {
+        // Native compaction/memory forks have loop IDs absent from the agent
+        // roster. Only the real child whose step supplied this model qualifies.
+        const agents = await $.agent.list();
+        if (!agents.some(agent => agent.id === agent_id) || !await matches_activation($, current)) return;
+    }
+    await $.process.run(['node', `${$.plugin.root}/scripts/logonomic-hook-relay.cjs`], {
+        stdin: JSON.stringify({
+            hook_event_name: 'ModModel', session_id: captured.provider_session_id, agent_id,
+            model_state: { version: 1, updates: [{
+                provider_session_id: captured.provider_session_id,
+                transition_nonce: captured.transition_nonce, sequence: captured.sequence,
+                agent_id, state: 'confirmed', model, source,
+            }] },
+        }),
+        timeoutMs: 13000,
+    });
 }
 
 async function admission($, request, current) {
@@ -138,6 +165,33 @@ async function listen($, current) {
 }
 
 export function register(on) {
+    on('turn.step', async function* ($, event, next) {
+        // Source order and activation precede the request. A slow old request
+        // cannot adopt a later activation or overwrite a newer model switch.
+        const current = activation;
+        const captured = capture_model(current);
+        const result = yield* next(event);
+        if (!next.signal?.aborted && result.stopReason !== 'compaction') {
+            try {
+                await report_model($, current, captured, event.agentId ?? '', result.usage?.model,
+                    'claude.turn.step.usage');
+            }
+            catch { /* Optional model evidence cannot change the native response. */ }
+        }
+        return result;
+    });
+    on('classic.PostModelSwitch', async ($, event, next) => {
+        const current = activation;
+        const captured = capture_model(current);
+        const result = await next(event);
+        if (!event.agent_id && !next.signal?.aborted && event.session_id === current.session_id) {
+            try {
+                await report_model($, current, captured, '', event.to_model, 'claude.PostModelSwitch');
+            }
+            catch { /* The native model switch has already succeeded. */ }
+        }
+        return result;
+    });
     on('classic.SessionStart', async ($, event, next) => {
         // Capture the activation before the first asynchronous operation. A
         // resumed A after B has a different instance from the departing A.

@@ -4,7 +4,9 @@
 #include "claude_support.h"
 
 #include <logonomic_cli_addon/ids.h>
+#include <logonomic_cli_addon/capability_ids.h>
 #include <logonomic_cli_addon/launcher_utilities.h>
+#include <logonomic_cli_addon/model_state.h>
 
 #include <algorithm>
 #include <chrono>
@@ -147,14 +149,6 @@ bool task_tool_denied(const Json& result, const Json& state)
     return std::any_of(denials->as_array().begin(), denials->as_array().end(), [&required](const Json& denial) {
         return std::find(required.begin(), required.end(), text(denial, "tool_name")) != required.end();
     });
-}
-
-addon::Structured_inspect_result failed(std::string reason)
-{
-    addon::Structured_inspect_result result;
-    result.complete = true;
-    result.failure_reason = std::move(reason);
-    return result;
 }
 
 std::string join(const std::vector<std::string>& items)
@@ -540,12 +534,41 @@ addon::Structured_prepare_result prepare(
 } // namespace
 
 addon::Structured_inspect_result inspect_session(
-    addon::Structured_purpose purpose, const addon::Structured_inspection& inspection)
+    addon::Structured_purpose purpose, const addon::Structured_inspection& inspection, bool observe_model)
 {
+    addon::Structured_inspect_result result;
+    const auto failed = [&result](std::string reason) {
+        addon::Structured_inspect_result failure;
+        failure.complete          = true;
+        failure.failure_reason    = std::move(reason);
+        failure.model_observation = result.model_observation;
+        failure.model_failure     = result.model_failure;
+        return failure;
+    };
     try {
         auto parsed = addon::parse_exchange_protocol_state(inspection.protocol_state);
         if (!parsed || !parsed->is_object()) return failed("invalid_structured_output");
         Json state = std::move(*parsed);
+        if (observe_model) {
+            addon::decode_structured_model_observation(state, result.model_observation, result.model_failure);
+        }
+        const auto observe = [&result, observe_model](const Json* model, const char* source) {
+            if (!observe_model || !model) {
+                return;
+            }
+            addon::Structured_model_observation observation;
+            observation.model  = model->is_string() ? model->as_string() : std::string{};
+            observation.source = source;
+            if (addon::is_valid_structured_model_observation(observation)) {
+                result.model_observation = std::move(observation);
+                result.model_failure.reset();
+            }
+            else {
+                result.model_observation.reset();
+                result.model_failure = addon::Contract_failure{
+                    "invalid_model_observation", "Claude structured model is malformed"};
+            }
+        };
         const auto* initialized_value = state.find("initialized");
         auto pending_value = addon::decode_base64(text(state, "pending_base64"));
         auto result_value  = addon::decode_base64(text(state, "result_base64"));
@@ -566,7 +589,6 @@ addon::Structured_inspect_result inspect_session(
         if ((initialized && root_session.empty()) || (!answer.empty() && !initialized)) {
             return failed("invalid_protocol_state");
         }
-        addon::Structured_inspect_result result;
         auto record = [&result](addon::Presentation_event_kind kind) {
             result.presentation_state = addon::Presentation_state::AVAILABLE;
             if (!result.presentation.empty() && result.presentation.back().kind == kind) {
@@ -642,6 +664,7 @@ addon::Structured_inspect_result inspect_session(
                 }
                 root_session = id;
                 initialized = true;
+                observe(event.find("model"), "claude.system.init");
                 continue;
             }
             if (!review && !initialized) {
@@ -680,7 +703,17 @@ addon::Structured_inspect_result inspect_session(
                 record(addon::Presentation_event_kind::REASONING);
             }
             else
-            if (type == "assistant") record(addon::Presentation_event_kind::ANALYSIS_UPDATE);
+            if (type == "assistant") {
+                record(addon::Presentation_event_kind::ANALYSIS_UPDATE);
+                const auto* parent = event.find("parent_tool_use_id");
+                const auto* message = event.find("message");
+                if (text(event, "session_id") == root_session && (!parent || parent->is_null()) &&
+                    !flag(event, "isSynthetic") && !flag(event, "isCompactSummary") &&
+                    message && text(*message, "role") == "assistant" && text(*message, "model") != "<synthetic>")
+                {
+                    observe(message->find("model"), "claude.assistant.message");
+                }
+            }
             else
             if (type == "user") record(addon::Presentation_event_kind::TOOL_RESPONSE);
             else
@@ -730,6 +763,9 @@ addon::Structured_inspect_result inspect_session(
             state.set("pending_before_input", Json(pending_before_input));
             state.set("result_base64", Json(addon::encode_base64(answer)));
             state.set("root_session_id", Json(root_session));
+            if (observe_model) {
+                addon::encode_structured_model_observation(state, result.model_observation, result.model_failure);
+            }
             result.protocol_state = addon::serialize_json(state);
             if (!addon::exchange_protocol_state_valid(result.protocol_state)) return failed("protocol_state_limit");
         }
@@ -750,7 +786,12 @@ void handle_sessions(addon::Invocation_context& invocation, const std::filesyste
             invocation.fail(addon::Result_status::FAILED, failure.reason_code);
             return;
         }
-        invocation.succeed(addon::encode_structured_inspect_result(inspect_session(inspection->purpose, inspection->inspection)));
+        auto result = inspect_session(inspection->purpose, inspection->inspection,
+            inspection->model_state_version == addon::k_model_state_version && !inspection->model_failure);
+        if (inspection->model_failure) {
+            result.model_failure = inspection->model_failure;
+        }
+        invocation.succeed(addon::encode_structured_inspect_result(result));
         return;
     }
     if (request.operation != "prepare") {

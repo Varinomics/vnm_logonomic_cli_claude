@@ -246,6 +246,11 @@ if(BUILD_TESTING)
     target_link_libraries(claude_execution_context_tests PRIVATE claude_provider)
     claude_target(claude_execution_context_tests)
     add_test(NAME claude_execution_context_tests COMMAND claude_execution_context_tests)
+    add_executable(claude_model_tests tests/claude_model_tests.cpp)
+    target_link_libraries(claude_model_tests PRIVATE claude_provider)
+    claude_target(claude_model_tests)
+    add_test(NAME claude_model_tests COMMAND claude_model_tests)
+    set_tests_properties(claude_model_tests PROPERTIES TIMEOUT 30)
     add_test(NAME claude_quota_tests COMMAND claude_contract_tests --quota)
     set_tests_properties(claude_quota_tests PROPERTIES TIMEOUT 30 LABELS "quota")
     set_tests_properties(claude_launcher_approval_tests PROPERTIES TIMEOUT 30 LABELS "launcher-approval")
@@ -309,6 +314,10 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_context_hook_tests.mjs"
             "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/hooks/wake.js")
         set_tests_properties(claude_context_hook_tests PROPERTIES TIMEOUT 30)
+        add_test(NAME claude_model_hook_tests COMMAND "${CLAUDE_NODE_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_model_hook_tests.mjs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/hooks/wake.js")
+        set_tests_properties(claude_model_hook_tests PROPERTIES TIMEOUT 30)
         add_test(NAME claude_activation_hook_tests COMMAND "${CLAUDE_NODE_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_activation_hook_tests.mjs"
             "${CMAKE_CURRENT_SOURCE_DIR}/package/assets/claude-hooks/hooks/wake.js"

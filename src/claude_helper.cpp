@@ -8,6 +8,7 @@
 #include <logonomic_cli_addon/json.h>
 #include <logonomic_cli_addon/lifecycle_events.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/model_state.h>
 
 #if defined(_WIN32)
 #include <fcntl.h>
@@ -26,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace claude {
 namespace {
@@ -93,7 +95,16 @@ std::optional<addon::Json_value> read_event(bool watch_parent)
     {
         if (const auto* value = event->find(key)) sanitized.set(key, *value);
     }
+    if (name->as_string() == "ModModel") {
+        std::vector<addon::Model_update> updates;
+        std::optional<addon::Contract_failure> model_failure;
+        addon::decode_model_updates(*event, updates, model_failure);
+        addon::encode_model_updates(sanitized, updates, model_failure);
+    }
     if (name->as_string() == "SessionStart" && !event->find("agent_id")) {
+        if (const auto* model = event->find("model")) {
+            sanitized.set("model", *model);
+        }
         // Only the native session boundary supplies this snapshot. Tool input,
         // transcript paths and the original project directory are not its cwd.
         if (const auto* cwd = event->find("cwd")) {

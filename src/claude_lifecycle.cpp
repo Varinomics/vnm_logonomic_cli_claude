@@ -5,6 +5,7 @@
 #include <logonomic_cli_addon/context_state.h>
 #include <logonomic_cli_addon/execution_context.h>
 #include <logonomic_cli_addon/limits.h>
+#include <logonomic_cli_addon/model_state.h>
 #include <logonomic_cli_addon/provider_event_diagnostic.h>
 
 #include <algorithm>
@@ -110,6 +111,33 @@ void classify_start_directory(
     result.execution_updates.push_back(std::move(update));
 }
 
+void classify_start_model(
+    const addon::Classify_event_request& request, addon::Classify_event_result& result,
+    const std::string& provider_session_id)
+{
+    const auto* model = request.event.body.find("model");
+    if (request.model_state_version != addon::k_model_state_version || request.model_failure || !model) {
+        return;
+    }
+    addon::Model_update update;
+    update.provider_session_id = provider_session_id;
+    update.transition_nonce    = request.transition_nonce;
+    update.status              = addon::Model_status::CONFIRMED;
+    update.source              = "claude.SessionStart";
+    if (model->is_string()) {
+        update.model = model->as_string();
+    }
+    // The native start supplies the live model, independently of any launcher
+    // selection. The same transition owns sequence zero and identifies no backend.
+    if (addon::is_valid_model_update(update)) {
+        result.model_updates.push_back(std::move(update));
+    }
+    else {
+        result.model_failure = addon::Contract_failure{
+            "invalid_model_observation", "Claude SessionStart model is malformed"};
+    }
+}
+
 } // namespace
 
 bool canonical_session_id(std::string_view value)
@@ -143,6 +171,26 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
         result.context_failure = addon::Context_failure{{}, *request.context_failure};
     }
     result.execution_failure = request.execution_failure;
+    result.model_failure = request.model_failure;
+    if (name == "ModModel") {
+        if (request.model_state_version == addon::k_model_state_version && !request.model_failure) {
+            addon::decode_model_updates(body, result.model_updates, result.model_failure);
+            for (const auto& update : result.model_updates) {
+                if (update.provider_session_id != text(body, "session_id") ||
+                    update.agent_id != text(body, "agent_id") || update.sequence == 0 ||
+                    update.status != addon::Model_status::CONFIRMED ||
+                    (update.source != "claude.turn.step.usage" &&
+                        (update.source != "claude.PostModelSwitch" || !update.agent_id.empty())))
+                {
+                    result.model_updates.clear();
+                    result.model_failure = addon::Contract_failure{
+                        "invalid_model_observation", "Claude model source or actor does not match its carrier"};
+                    break;
+                }
+            }
+        }
+        return result;
+    }
     const std::array<std::string_view, 13> supported{
         "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "UserPromptSubmit", "Stop",
         "StopFailure", "PermissionRequest", "PreToolUse", "PostToolUse", "PostToolUseFailure", "ModTurnComplete",
@@ -179,6 +227,7 @@ addon::Classify_event_result classify_event(const addon::Classify_event_request&
             observation.resume_record = std::move(record);
         }
         classify_start_directory(request, result, observation.provider_session_id);
+        classify_start_model(request, result, observation.provider_session_id);
     }
     else
     if (name == "SessionEnd") {
