@@ -21,7 +21,8 @@ inside the package, and each carried library needs a notice: Linux falls back
 to the distribution's `/usr/share/doc/<package>/copyright` for a dpkg-owned
 library, otherwise (and always on macOS) set `CLAUDE_RUNTIME_NOTICES_DIRECTORY`
 to a directory holding `<library filename>.txt` for each. Linux also needs
-`objdump`, and macOS assembly needs Python >=3.9.
+`objdump` and the GNU libunistring development files (`libunistring-dev` on
+Ubuntu) for native profile normalization. macOS assembly needs Python >=3.9.
 
 The package target produces an indexed package containing the adapter, attached
 process bridge, authenticated hook helper, capability declarations, and immutable

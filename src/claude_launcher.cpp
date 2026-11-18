@@ -394,11 +394,11 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
                 scanned_entries < k_max_profile_directory_entries_to_scan;
                 entry.increment(profile_error), ++scanned_entries)
             {
-                const auto profile = entry->path();
+                const auto name = path_string(entry->path().filename());
                 std::error_code entry_error;
-                if (entry->is_directory(entry_error) && path_string(profile.filename()).starts_with(".claude") &&
-                    fs::is_regular_file(profile / ".credentials.json", entry_error))
-                {
+                if (!name.starts_with(".claude") || !addon::is_valid_utf8(name) || !entry->is_directory(entry_error)) continue;
+                const auto profile = normalized_profile(entry->path());
+                if (fs::is_regular_file(profile / ".credentials.json", entry_error)) {
                     add_profile(profile);
                     if (profiles.size() == addon::limits::k_max_discovery_candidates) {
                         break;

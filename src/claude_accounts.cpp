@@ -1,5 +1,7 @@
 #include "claude_accounts.h"
 #include "claude_launcher.h"
+#include "claude_filesystem.h"
+#include "claude_native_context.h"
 #include "claude_support.h"
 
 #include <logonomic_cli_addon/launcher_utilities.h>
@@ -20,8 +22,21 @@ namespace fs = std::filesystem;
 fs::path normalized_profile(const fs::path& profile)
 {
     if (profile.empty()) throw std::runtime_error("profile_unavailable");
-    const auto path = fs::absolute(profile).lexically_normal();
+    const auto path = native_context::nfc_config_directory(fs::absolute(profile).lexically_normal());
     return path.has_relative_path() && !path.has_filename() ? path.parent_path() : path;
+}
+
+bool recorded_profile_matches(const fs::path& recorded, const fs::path& selected)
+{
+    if (!recorded.is_absolute()) return false;
+    auto original = recorded.lexically_normal();
+    if (original.has_relative_path() && !original.has_filename()) original = original.parent_path();
+    if (addon::same_native_account_profile(original, selected)) return true;
+    // An old decomposed locator cannot transfer retained history to a separate
+    // composed directory, even though Claude itself selects the composed name.
+    std::error_code error;
+    return addon::same_native_account_profile(normalized_profile(original), selected) &&
+        fs::equivalent(native_io_path(original), native_io_path(selected), error);
 }
 
 namespace {
@@ -67,6 +82,7 @@ fs::path granted_profile(const addon::Account_context& account, const addon::Ses
     if (!account.profile_path) throw std::runtime_error("account_unavailable");
     const auto retained = addon::path_from_utf8(*account.profile_path).lexically_normal();
     const auto profile  = normalized_profile(retained);
+    if (!recorded_profile_matches(retained, profile)) throw std::runtime_error("account_profile_mismatch");
     if (account_key(profile) == account.adapter_account_key) return profile;
 
     // Older keys folded native Windows names together and included trailing
@@ -142,13 +158,13 @@ void handle_accounts(addon::Invocation_context& context)
                 return;
             }
             std::error_code entry_error;
-            if (entry->is_directory(entry_error) && path_string(entry->path().filename()).starts_with(".claude") &&
-                fs::is_regular_file(entry->path() / ".credentials.json", entry_error))
-            {
-                candidates.push_back(normalized_profile(entry->path()));
-            }
+            const auto name = path_string(entry->path().filename());
+            if (!name.starts_with(".claude") || !addon::is_valid_utf8(name) || !entry->is_directory(entry_error)) continue;
+            const auto profile = normalized_profile(entry->path());
+            if (fs::is_regular_file(profile / ".credentials.json", entry_error)) candidates.push_back(profile);
         }
         std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
         for (const auto& candidate : candidates) {
             if (account_key(candidate) == accounts.front().adapter_account_key) continue;
             if (accounts.size() == 64) throw std::runtime_error("account_inventory_capacity");

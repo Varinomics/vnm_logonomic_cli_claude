@@ -7,6 +7,7 @@
 
 namespace claude::native_context {
 
+std::filesystem::path nfc_config_directory(const std::filesystem::path& path);
 bool absent(const std::filesystem::path& path);
 std::optional<logonomic::cli_addon::Json_value> read_object(
     const std::filesystem::path& path, bool required = false);

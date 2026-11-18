@@ -10,6 +10,7 @@
 namespace claude {
 
 std::filesystem::path normalized_profile(const std::filesystem::path& profile);
+bool recorded_profile_matches(const std::filesystem::path& recorded, const std::filesystem::path& selected);
 std::string account_key(const std::filesystem::path& profile);
 // The profile an accounts@2 context names, refused unless its key is that profile's.
 std::filesystem::path profile_for_account(const logonomic::cli_addon::Account_context& account);

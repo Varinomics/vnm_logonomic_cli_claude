@@ -56,10 +56,18 @@ function(claude_target target)
     endif()
 endfunction()
 
-add_library(claude_native_context STATIC src/claude_native_context.cpp)
+add_library(claude_native_context STATIC src/claude_native_context.cpp src/claude_config_directory.cpp)
 claude_target(claude_native_context)
 if(WIN32)
-    target_link_libraries(claude_native_context PRIVATE advapi32)
+    target_link_libraries(claude_native_context PRIVATE advapi32 normaliz)
+elseif(APPLE)
+    find_library(CLAUDE_CORE_FOUNDATION CoreFoundation REQUIRED)
+    target_link_libraries(claude_native_context PRIVATE "${CLAUDE_CORE_FOUNDATION}")
+else()
+    find_path(CLAUDE_UNISTRING_INCLUDE_DIR uninorm.h REQUIRED)
+    find_library(CLAUDE_UNISTRING_LIBRARY unistring REQUIRED)
+    target_include_directories(claude_native_context PRIVATE "${CLAUDE_UNISTRING_INCLUDE_DIR}")
+    target_link_libraries(claude_native_context PRIVATE "${CLAUDE_UNISTRING_LIBRARY}")
 endif()
 
 add_library(claude_quota_windows STATIC src/claude_quota_windows.cpp)
@@ -385,6 +393,11 @@ if(BUILD_TESTING AND LOGONOMIC_CLI_ADDON_RECIPE_TESTS)
         TIMEOUT 1800 RESOURCE_LOCK cli_addon_recipe_rebuild LABELS "cli-addon;delivery;recipe;owning-path")
 endif()
 # Contract and recipe tests must not be confused with real native qualification.
+if(BUILD_TESTING)
+    add_test(NAME claude_account_profiles_nfc_tests COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_account_profiles_tests.py"
+        "${CLAUDE_PACKAGE_DIRECTORY}/adapter/$<TARGET_FILE_NAME:claude_adapter>" nfc)
+endif()
 if(WIN32 AND BUILD_TESTING)
     foreach(mode IN ITEMS sensitive unicode)
         add_test(NAME claude_account_profiles_${mode}_tests COMMAND "${Python3_EXECUTABLE}" -B

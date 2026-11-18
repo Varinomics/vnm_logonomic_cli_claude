@@ -1,6 +1,8 @@
 """Exercise native Windows profile selection through the installed adapter."""
 
 import hashlib
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -83,10 +85,79 @@ def account_contract(adapter, root, selected, sibling):
     assert prepare(selected, {"version": 1, "adapter_account_key": historical_key})["status"] != "success"
 
 
+def normalized_directory_contract(adapter, root):
+    composed = root / ".claude-Caf\u00e9"
+    decomposed = root / ".claude-Cafe\u0301"
+    composed.mkdir()
+    decomposed.mkdir(exist_ok=True)
+    (composed / ".credentials.json").write_text("{}", encoding="utf-8")
+    program = root / ("claude.cmd" if os.name == "nt" else "claude")
+    program.touch()
+    program.chmod(0o755)
+    platform = "windows-x86_64" if os.name == "nt" else ("macos-arm64" if sys.platform == "darwin" else "linux-x86_64")
+    launcher = {"script_body": "claude", "runner_key": "direct", "environment_text": ""}
+    environment = {"platform": platform, "effective_environment": {
+        "PATH": str(root), "CLAUDE_CONFIG_DIR": str(decomposed), "HOME": str(root)}}
+    request = {"launcher": launcher, "launch_environment": environment,
+               "normalization_directory": str(root), "default_home_fallback": str(root)}
+    records = invoke(adapter, "accounts", 2, "discover", request)["payload"]["accounts"]
+    assert len(records) == 1 and records[0]["profile_path"] == str(composed), records
+    account = {"version": 2, "profile_path": str(composed), "adapter_account_key": records[0]["adapter_account_key"]}
+    assert invoke(adapter, "accounts", 2, "resolve", request)["payload"]["adapter_account_key"] == account["adapter_account_key"]
+    discovery = invoke(adapter, "launcher-discovery", 1, "discover", {"platform": platform,
+        "ambient_environment": environment["effective_environment"], "default_home_fallback": str(root)})
+    candidates = discovery["payload"]["candidates"]
+    assert len(candidates) == 1 and candidates[0]["environment_text"] == "CLAUDE_CONFIG_DIR=" + str(composed), candidates
+
+    def prepare(grant):
+        return invoke(adapter, "launch-preparation", 3, "prepare", {"launcher": launcher, "launcher_argv": ["claude"],
+            "working_directory": str(root), "title_instruction": "Set the session title.", "declared_assets": [],
+            "account_context": grant, "launch_environment": environment})
+
+    result = prepare(account)
+    assert result["status"] == "success" and result["payload"]["environment"]["set"]["CLAUDE_CONFIG_DIR"] == str(composed), result
+    original = str(decomposed)
+    old_bytes = (original.lower() if os.name == "nt" else original).encode()
+    old_account = {"version": 2, "profile_path": original, "adapter_account_key": "profile-" + hashlib.sha256(old_bytes).hexdigest()}
+    old = prepare(old_account)
+    if decomposed.samefile(composed):
+        assert old["status"] == "success" and old["payload"]["account_context"] == old_account, old
+    else:
+        assert old["status"] != "success", "a retained source from a distinct directory cannot be reassigned"
+        assert prepare({**account, "profile_path": original})["status"] != "success"
+
+    # The real CLI writes its transcript to the composed profile on NTFS and
+    # ext4. Give the other directory unrelated content for the same session ID.
+    session = "39ece48b-c745-47d4-ad08-88b7b0d31534"
+    def transcript(profile, text):
+        project = profile / "projects" / "fixture"
+        project.mkdir(parents=True)
+        row = {"type": "user", "sessionId": session, "parentUuid": None, "isSidechain": False,
+               "uuid": "9a4acceb-055c-4ee8-ae8d-a62d83bcc2e9", "message": {"role": "user", "content": text}}
+        (project / (session + ".jsonl")).write_text(json.dumps(row) + "\n", encoding="utf-8")
+    transcript(composed, "native profile")
+    if not decomposed.samefile(composed):
+        transcript(decomposed, "other profile")
+    out = root / "export"
+    out.mkdir()
+    exported = invoke(adapter, "conversation-export", 1, "export", {"provider_session_id": session,
+        "working_directory": str(root), "launch_environment": environment, "output_directory": str(out), "format": "text"})
+    assert exported["status"] == "success", exported
+    contents = (out / exported["payload"]["file_name"]).read_text(encoding="utf-8")
+    assert "native profile" in contents and "other profile" not in contents, contents
+
+
 def main():
     executable, mode = Path(sys.argv[1]), sys.argv[2]
     with tempfile.TemporaryDirectory(prefix="claude-native-accounts-") as temporary:
         root = Path(temporary).resolve()
+        if mode == "nfc":
+            adapter = Adapter(executable)
+            try:
+                normalized_directory_contract(adapter, root)
+            finally:
+                adapter.close()
+            return 0
         parent = root / "profiles"
         parent.mkdir()
         if mode == "sensitive":

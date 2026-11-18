@@ -122,7 +122,7 @@ std::optional<addon::Quota_cost> read_recorded_cost(
         {
             throw std::runtime_error("cost_receipt_invalid");
         }
-        if (!selected.is_absolute() || !addon::same_native_account_profile(profile, normalized_profile(selected))) {
+        if (!recorded_profile_matches(selected, profile)) {
             throw std::runtime_error("cost_receipt_profile_mismatch");
         }
         total = total.value_or(0) + amount(record.find("total_cost_usd"));

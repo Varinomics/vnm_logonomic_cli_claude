@@ -386,12 +386,6 @@ conversation_state_t inspect_profile(
     addon::Invocation_context& invocation)
 {
     const auto profile = profile_for_context(launch);
-    const auto profile_text = path_string(profile);
-    // Claude NFC-normalizes its config home. Without a shared Unicode
-    // normalizer, an alternative spelling cannot establish absence.
-    if (std::any_of(profile_text.begin(), profile_text.end(), [](unsigned char ch) { return ch >= 128; })) {
-        return {};
-    }
     if (!resume_context_supported(launch, profile, command)) {
         return {};
     }
