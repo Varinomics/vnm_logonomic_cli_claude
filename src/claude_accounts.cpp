@@ -22,21 +22,18 @@ namespace fs = std::filesystem;
 fs::path normalized_profile(const fs::path& profile)
 {
     if (profile.empty()) throw std::runtime_error("profile_unavailable");
-    const auto path = native_context::nfc_config_directory(fs::absolute(profile).lexically_normal());
-    return path.has_relative_path() && !path.has_filename() ? path.parent_path() : path;
+    auto path = fs::absolute(profile).lexically_normal();
+    if (path.has_relative_path() && !path.has_filename()) path = path.parent_path();
+    const auto nfc = native_context::nfc_config_directory(path);
+    std::error_code error;
+    if (nfc.native() != path.native() && fs::equivalent(native_io_path(path), native_io_path(nfc), error)) return nfc;
+    return path;
 }
 
 bool recorded_profile_matches(const fs::path& recorded, const fs::path& selected)
 {
     if (!recorded.is_absolute()) return false;
-    auto original = recorded.lexically_normal();
-    if (original.has_relative_path() && !original.has_filename()) original = original.parent_path();
-    if (addon::same_native_account_profile(original, selected)) return true;
-    // An old decomposed locator cannot transfer retained history to a separate
-    // composed directory, even though Claude itself selects the composed name.
-    std::error_code error;
-    return addon::same_native_account_profile(normalized_profile(original), selected) &&
-        fs::equivalent(native_io_path(original), native_io_path(selected), error);
+    return addon::same_native_account_profile(normalized_profile(recorded), selected);
 }
 
 namespace {
@@ -51,9 +48,13 @@ fs::path selected_profile(const addon::Launch_environment& launch, std::string_v
         if (home.empty()) home = addon::environment_value(environment, "HOME");
         if (home.empty()) home = std::string(fallback);
         if (home.empty()) throw std::runtime_error("profile_unavailable");
-        return normalized_profile(addon::path_from_utf8(home) / ".claude");
+        return normalized_profile(native_context::nfc_config_directory(addon::path_from_utf8(home) / ".claude"));
     }
-    const auto path = addon::path_from_utf8(profile);
+    // The CLI normalizes the selector first. A relative selector subsequently
+    // resolves below the original working directory, including its spelling.
+    const auto path = native_context::nfc_config_directory(addon::path_from_utf8(profile));
+    if (!path.is_absolute() && !addon::path_from_utf8(normalization_directory).is_absolute())
+        throw std::runtime_error("profile_unavailable");
     return normalized_profile(path.is_absolute() ? path : addon::path_from_utf8(normalization_directory) / path);
 }
 
@@ -82,7 +83,6 @@ fs::path granted_profile(const addon::Account_context& account, const addon::Ses
     if (!account.profile_path) throw std::runtime_error("account_unavailable");
     const auto retained = addon::path_from_utf8(*account.profile_path).lexically_normal();
     const auto profile  = normalized_profile(retained);
-    if (!recorded_profile_matches(retained, profile)) throw std::runtime_error("account_profile_mismatch");
     if (account_key(profile) == account.adapter_account_key) return profile;
 
     // Older keys folded native Windows names together and included trailing
@@ -91,6 +91,12 @@ fs::path granted_profile(const addon::Account_context& account, const addon::Ses
     if (launch && launch->launch_environment) {
         const auto selected = selected_profile(*launch->launch_environment, {}, launch->working_directory);
         if (!addon::same_native_account_profile(profile, selected)) throw std::runtime_error("account_profile_mismatch");
+    }
+    else
+    if (profile.native() != native_context::nfc_config_directory(profile).native()) {
+        // A grant without independent launcher evidence cannot distinguish a
+        // former absolute selector from a relative one resolved under this cwd.
+        throw std::runtime_error("account_profile_mismatch");
     }
     const auto historical = addon::historical_account_profile_identity(retained, retained);
     if (historical && key_for_identity(*historical) == account.adapter_account_key) return profile;
@@ -101,8 +107,12 @@ fs::path granted_profile(const addon::Account_context& account, const addon::Ses
 
 std::string account_key(const fs::path& profile)
 {
-    const auto identity = addon::native_account_profile_identity(normalized_profile(profile));
+    const auto location = normalized_profile(profile);
+    auto identity = addon::native_account_profile_identity(location);
     if (!identity) throw std::runtime_error("profile_normalization_failed");
+    // An old absolute selector used the same pre-NFC key for a different
+    // native location. 0xff cannot begin a UTF-8 path or an SDK path marker.
+    if (location.native() != native_context::nfc_config_directory(location).native()) identity->insert(0, 1, (char)0xff);
     return key_for_identity(*identity);
 }
 
@@ -118,11 +128,25 @@ fs::path profile_for_context(const addon::Session_launch_context& context)
     return selected_profile(*context.launch_environment, {}, context.working_directory);
 }
 
+std::string profile_selector_for_launch(const addon::Session_launch_context& context)
+{
+    const auto profile = profile_for_context(context);
+    if (profile.native() == native_context::nfc_config_directory(profile).native()) return path_string(profile);
+    const auto cwd = addon::path_from_utf8(context.working_directory);
+    if (cwd.is_absolute()) {
+        const auto relative = profile.lexically_relative(cwd.lexically_normal());
+        if (!relative.empty() && recorded_profile_matches(cwd / native_context::nfc_config_directory(relative), profile)) {
+            return path_string(relative);
+        }
+    }
+    throw std::runtime_error("account_profile_unrepresentable");
+}
+
 void apply_account(const addon::Session_launch_context& context, addon::Process_proposal& process)
 {
     process.environment_names = {"PATH", "PATHEXT", "HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
         "XDG_CONFIG_HOME", "XDG_DATA_HOME", "SystemRoot", "WINDIR", "TEMP", "TMP"};
-    process.environment.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(context)));
+    process.environment.emplace_back("CLAUDE_CONFIG_DIR", profile_selector_for_launch(context));
 }
 
 void handle_accounts(addon::Invocation_context& context)
@@ -160,7 +184,7 @@ void handle_accounts(addon::Invocation_context& context)
             std::error_code entry_error;
             const auto name = path_string(entry->path().filename());
             if (!name.starts_with(".claude") || !addon::is_valid_utf8(name) || !entry->is_directory(entry_error)) continue;
-            const auto profile = normalized_profile(entry->path());
+            const auto profile = normalized_profile(parent / native_context::nfc_config_directory(entry->path().filename()));
             if (fs::is_regular_file(profile / ".credentials.json", entry_error)) candidates.push_back(profile);
         }
         std::sort(candidates.begin(), candidates.end());

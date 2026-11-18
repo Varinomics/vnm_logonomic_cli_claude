@@ -1,6 +1,7 @@
 #include "claude_launcher.h"
 #include "claude_support.h"
 #include "claude_accounts.h"
+#include "claude_native_context.h"
 
 #include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/json.h>
@@ -357,7 +358,7 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
     std::set<std::string> canonical_profiles;
     std::optional<std::string> selected_profile_identity;
     auto selected_path = addon::path_from_utf8(selected);
-    if (selected_path.is_absolute()) selected_path = normalized_profile(selected_path);
+    if (selected_path.is_absolute()) selected_path = normalized_profile(native_context::nfc_config_directory(selected_path));
     const auto add_profile = [&](const fs::path& profile) {
         const std::string profile_path = path_string(profile.lexically_normal());
         const std::string environment_text = "CLAUDE_CONFIG_DIR=" + profile_path;
@@ -397,7 +398,7 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
                 const auto name = path_string(entry->path().filename());
                 std::error_code entry_error;
                 if (!name.starts_with(".claude") || !addon::is_valid_utf8(name) || !entry->is_directory(entry_error)) continue;
-                const auto profile = normalized_profile(entry->path());
+                const auto profile = normalized_profile(native_context::nfc_config_directory(entry->path()));
                 if (fs::is_regular_file(profile / ".credentials.json", entry_error)) {
                     add_profile(profile);
                     if (profiles.size() == addon::limits::k_max_discovery_candidates) {

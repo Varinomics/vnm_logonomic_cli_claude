@@ -504,7 +504,7 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
                 launch.account_context = input->account_context;
                 launch.launch_environment = input->launch_environment;
                 launch.working_directory = input->working_directory;
-                result.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(launch)));
+                result.set.emplace_back("CLAUDE_CONFIG_DIR", profile_selector_for_launch(launch));
             }
         }
         if (input->session_wake) prepare_wake(result, input->profile_storage, argv.has_value() && hooks, package_root);
@@ -600,7 +600,7 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
     result.process.executable = addon::Process_executable::launcher_program();
     result.process.argv.assign(argv->begin() + 1, argv->end());
     result.process.stdin_behavior = addon::Stdin_behavior::INHERIT;
-    result.patch.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(launch)));
+    result.patch.set.emplace_back("CLAUDE_CONFIG_DIR", profile_selector_for_launch(launch));
     result.patch.profile_storage = launch.profile_storage;
     result.patch.account_context = launch.account_context;
     if (launch.session_wake) prepare_wake(result.patch, launch.profile_storage, true, package_root);

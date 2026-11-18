@@ -135,6 +135,51 @@ def normalized_directory_contract(adapter, root):
     assert "native profile" in contents and "other profile" not in contents, contents
 
 
+def relative_directory_contract(adapter, root):
+    raw = root / "Cafe\u0301"
+    composed = root / "Caf\u00e9"
+    raw.mkdir()
+    composed.mkdir(exist_ok=True)
+    slot = "profile"
+    (raw / slot).mkdir()
+    if raw.samefile(composed):
+        return
+    (composed / slot).mkdir()
+    launcher = {"script_body": "claude", "runner_key": "direct", "environment_text": ""}
+    platform = "windows-x86_64" if os.name == "nt" else ("macos-arm64" if sys.platform == "darwin" else "linux-x86_64")
+    def environment(selector):
+        return {"platform": platform, "effective_environment": {"CLAUDE_CONFIG_DIR": str(selector)}}
+    def discover(selector):
+        result = adapter.invoke("accounts", 2, "discover", {"launcher": launcher, "normalization_directory": str(raw),
+            "default_home_fallback": str(root), "launch_environment": environment(selector)})
+        assert result["status"] == "success", result
+        record, = result["payload"]["accounts"]
+        return {"version": 2, "adapter_account_key": record["adapter_account_key"], "profile_path": record["profile_path"]}
+
+    relative = discover(slot)
+    absolute = discover(raw / slot)
+    assert relative["profile_path"] == str(raw / slot) and absolute["profile_path"] == str(composed / slot)
+    assert relative["adapter_account_key"] != absolute["adapter_account_key"]
+    def prepare(cwd, selector, grant):
+        return adapter.invoke("launch-preparation", 3, "prepare", {"launcher": launcher, "launcher_argv": ["claude"],
+            "working_directory": str(cwd), "title_instruction": "Set the session title.", "declared_assets": [],
+            "account_context": grant, "launch_environment": environment(selector)})
+
+    result = prepare(raw, slot, relative)
+    assert result["status"] == "success" and result["payload"]["account_context"] == relative, result
+    assert result["payload"]["environment"]["set"]["CLAUDE_CONFIG_DIR"] == slot
+    assert prepare(composed, slot, relative)["status"] != "success", "do not launch a different native directory"
+    result = prepare(raw, raw / slot, absolute)
+    assert result["status"] == "success" and result["payload"]["environment"]["set"]["CLAUDE_CONFIG_DIR"] == str(composed / slot)
+    former = str(raw / slot)
+    old_key = "profile-" + hashlib.sha256((former.lower() if os.name == "nt" else former).encode()).hexdigest()
+    historical = {**relative, "adapter_account_key": old_key}
+    assert relative["adapter_account_key"] != old_key
+    result = prepare(raw, slot, historical)
+    assert result["status"] == "success" and result["payload"]["account_context"] == historical, result
+    assert prepare(raw, raw / slot, historical)["status"] != "success"
+
+
 def main():
     executable, mode = Path(sys.argv[1]), sys.argv[2]
     with tempfile.TemporaryDirectory(prefix="claude-native-accounts-") as temporary:
@@ -143,6 +188,7 @@ def main():
             adapter = Adapter(executable)
             try:
                 normalized_directory_contract(adapter, root)
+                relative_directory_contract(adapter, root)
             finally:
                 adapter.close()
             return 0
