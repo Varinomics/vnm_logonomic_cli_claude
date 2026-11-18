@@ -419,6 +419,37 @@ void content_contract()
     const auto user_row = addon::serialize_json(user);
     write(fixture.transcript(), user_row + "\n");
     fixture.expect_content(Availability::AVAILABLE, Content::NONEMPTY, "a main user message retains work");
+    // Claude Code 2.1.325 persists unlinked request records and links the
+    // assistant response through native context attachments during a normal turn.
+    std::string bookkeeping;
+    for (const auto* type : {"atis-latch", "queue-operation", "api-request-shape", "api-request", "cost-state"}) {
+        auto row = Json::object();
+        row.set("type", Json(type));
+        row.set("sessionId", Json(k_session));
+        bookkeeping += addon::serialize_json(row) + '\n';
+    }
+    write(fixture.transcript(), bookkeeping);
+    fixture.expect_content(Availability::UNKNOWN, Content::UNKNOWN, "bookkeeping alone cannot certify an empty conversation");
+    constexpr auto attachment_id = "44cd96d2-f819-421c-884d-913431db5510";
+    auto attachment = message("attachment", attachment_id, Json(k_user));
+    attachment.erase("message");
+    auto reply = message("assistant", k_assistant, Json(attachment_id));
+    auto last_prompt = claude::object(R"({"type":"last-prompt"})");
+    last_prompt.set("sessionId", Json(k_session));
+    last_prompt.set("leafUuid", Json(k_assistant));
+    for (const auto* kind : {"session_context", "date"}) {
+        auto body = Json::object();
+        body.set("type", Json(kind));
+        attachment.set("attachment", std::move(body));
+        const auto chain = bookkeeping + user_row + '\n' + addon::serialize_json(attachment) + '\n' +
+            addon::serialize_json(reply) + '\n' + addon::serialize_json(last_prompt) + '\n';
+        write(fixture.transcript(), chain);
+        fixture.expect_content(Availability::AVAILABLE, Content::NONEMPTY,
+            "native request records and context attachments preserve a complete visible turn");
+        write(fixture.transcript(), chain + R"({"type":"future-record"})" "\n");
+        fixture.expect_content(Availability::AVAILABLE, Content::UNKNOWN,
+            "unrecognized replay records remain indeterminate even after a visible turn");
+    }
     auto assistant = message("assistant", k_assistant, Json(k_user));
     assistant.find("message")->set("content", Json::array());
     write(fixture.transcript(), user_row + "\n" + addon::serialize_json(assistant) + "\n");

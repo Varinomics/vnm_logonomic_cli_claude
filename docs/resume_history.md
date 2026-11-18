@@ -120,7 +120,10 @@ length does not determine whether earlier work exists.
 A complete transcript containing only recognized `custom-title`, `tag` or
 `permission-mode` metadata, or a complete chain of `system` and `progress`
 records, can be empty even when native availability remains unknown. The
-inspection checks the requested identity and requires each chain parent to
+native print session's queue, request, last-prompt and cost records may also
+surround a completed turn. Its linked date and session-context attachments
+preserve the chain to the final reply. These records alone leave content
+unknown. Inspection checks the requested identity and requires each chain parent to
 have appeared earlier in the transcript. Repeated identities, missing or
 reordered parents, sidechains, team messages, compaction, explicit rewind
 metadata, summary-only logs and unrecognized record kinds remain unknown.

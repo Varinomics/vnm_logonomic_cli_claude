@@ -164,6 +164,28 @@ public:
                 (id && (!id->is_string() || id->as_string() != m_session_id));
             return;
         }
+        // Native print sessions interleave their main chain with unlinked
+        // request, queue and accounting records. None proves content by itself.
+        if (type == "atis-latch" || type == "queue-operation" || type == "api-request-shape" ||
+            type == "api-request" || type == "cost-state" || type == "last-prompt")
+        {
+            m_requires_visible_message = true;
+            m_unknown = text(entry, "sessionId") != m_session_id || entry.find("uuid") || entry.find("parentUuid");
+            if (type == "last-prompt") {
+                m_unknown |= !m_seen.contains(text(entry, "leafUuid")) || flag(entry, "explicit") || flag(entry, "rewound");
+            }
+            return;
+        }
+        if (type == "attachment") {
+            const auto* attachment = entry.find("attachment");
+            const auto kind = attachment ? text(*attachment, "type") : std::string{};
+            if (kind != "session_context" && kind != "date") {
+                m_unknown = true;
+                return;
+            }
+            m_requires_visible_message = true;
+        }
+        else
         if (type != "user" && type != "assistant" && type != "system" && type != "progress") {
             m_unknown = true;
             return;
@@ -196,7 +218,7 @@ public:
         m_unknown |= text(entry, "subtype") == "compact_boundary" || flag(entry, "isCompactSummary") ||
             flag(entry, "isSidechain") || !text(entry, "teamName").empty();
         if (type == "user" || type == "assistant") {
-            m_conversation = true;
+            m_requires_visible_message = true;
             m_nonempty |= !flag(entry, "isSidechain") && !flag(entry, "isMeta") && text(entry, "teamName").empty();
         }
     }
@@ -209,14 +231,14 @@ public:
         if (m_nonempty) {
             return Content::NONEMPTY;
         }
-        return m_conversation ? Content::UNKNOWN : Content::EMPTY;
+        return m_requires_visible_message ? Content::UNKNOWN : Content::EMPTY;
     }
 
 private:
     std::string_view      m_session_id;
     std::set<std::string> m_seen;
     bool                 m_unknown = false;
-    bool                 m_conversation = false;
+    bool                 m_requires_visible_message = false;
     bool                 m_nonempty = false;
 };
 
