@@ -5,10 +5,6 @@
 #include <logonomic_cli_addon/launcher_utilities.h>
 #include <logonomic_cli_addon/sha256.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -17,16 +13,18 @@
 #include <vector>
 
 namespace claude {
-namespace {
 
 namespace addon = logonomic::cli_addon;
 namespace fs = std::filesystem;
 
-fs::path normalize(const fs::path& profile)
+fs::path normalized_profile(const fs::path& profile)
 {
     if (profile.empty()) throw std::runtime_error("profile_unavailable");
-    return fs::absolute(profile).lexically_normal();
+    const auto path = fs::absolute(profile).lexically_normal();
+    return path.has_relative_path() && !path.has_filename() ? path.parent_path() : path;
 }
+
+namespace {
 
 fs::path selected_profile(const addon::Launch_environment& launch, std::string_view fallback, std::string_view normalization_directory)
 {
@@ -38,10 +36,10 @@ fs::path selected_profile(const addon::Launch_environment& launch, std::string_v
         if (home.empty()) home = addon::environment_value(environment, "HOME");
         if (home.empty()) home = std::string(fallback);
         if (home.empty()) throw std::runtime_error("profile_unavailable");
-        return normalize(addon::path_from_utf8(home) / ".claude");
+        return normalized_profile(addon::path_from_utf8(home) / ".claude");
     }
     const auto path = addon::path_from_utf8(profile);
-    return normalize(path.is_absolute() ? path : addon::path_from_utf8(normalization_directory) / path);
+    return normalized_profile(path.is_absolute() ? path : addon::path_from_utf8(normalization_directory) / path);
 }
 
 addon::Account_record account(const fs::path& profile)
@@ -59,38 +57,47 @@ addon::Account_record account(const fs::path& profile)
     return result;
 }
 
+std::string key_for_identity(std::string_view identity)
+{
+    return "profile-" + addon::to_hex(addon::Sha256::digest(identity));
+}
+
+fs::path granted_profile(const addon::Account_context& account, const addon::Session_launch_context* launch)
+{
+    if (!account.profile_path) throw std::runtime_error("account_unavailable");
+    const auto retained = addon::path_from_utf8(*account.profile_path).lexically_normal();
+    const auto profile  = normalized_profile(retained);
+    if (account_key(profile) == account.adapter_account_key) return profile;
+
+    // Older keys folded native Windows names together and included trailing
+    // separators. Keep the granted spelling, and verify any independent
+    // launcher selection before accepting the original key.
+    if (launch && launch->launch_environment) {
+        const auto selected = selected_profile(*launch->launch_environment, {}, launch->working_directory);
+        if (!addon::same_native_account_profile(profile, selected)) throw std::runtime_error("account_profile_mismatch");
+    }
+    const auto historical = addon::historical_account_profile_identity(retained, retained);
+    if (historical && key_for_identity(*historical) == account.adapter_account_key) return profile;
+    throw std::runtime_error("account_profile_mismatch");
+}
+
 } // namespace
 
 std::string account_key(const fs::path& profile)
 {
-    auto normalized = normalize(profile);
-#ifdef _WIN32
-    const auto& source = normalized.native();
-    const int count = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, source.data(),
-        static_cast<int>(source.size()), nullptr, 0, nullptr, nullptr, 0);
-    if (count <= 0) throw std::runtime_error("profile_normalization_failed");
-    std::wstring folded(static_cast<std::size_t>(count), L'\0');
-    if (LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, source.data(), static_cast<int>(source.size()),
-            folded.data(), count, nullptr, nullptr, 0) != count)
-    {
-        throw std::runtime_error("profile_normalization_failed");
-    }
-    normalized = fs::path(folded);
-#endif
-    return "profile-" + addon::to_hex(addon::Sha256::digest(path_string(normalized)));
+    const auto identity = addon::native_account_profile_identity(normalized_profile(profile));
+    if (!identity) throw std::runtime_error("profile_normalization_failed");
+    return key_for_identity(*identity);
 }
 
 fs::path profile_for_account(const addon::Account_context& account)
 {
-    if (!account.profile_path) throw std::runtime_error("account_unavailable");
-    const auto profile = normalize(addon::path_from_utf8(*account.profile_path));
-    if (account_key(profile) != account.adapter_account_key) throw std::runtime_error("account_profile_mismatch");
-    return profile;
+    return granted_profile(account, nullptr);
 }
 
 fs::path profile_for_context(const addon::Session_launch_context& context)
 {
-    if (context.account_context) return profile_for_account(*context.account_context);
+    if (context.account_context) return granted_profile(*context.account_context, &context);
     if (!context.launch_environment) throw std::runtime_error("launch_environment_unavailable");
     return selected_profile(*context.launch_environment, {}, context.working_directory);
 }
@@ -138,12 +145,12 @@ void handle_accounts(addon::Invocation_context& context)
             if (entry->is_directory(entry_error) && path_string(entry->path().filename()).starts_with(".claude") &&
                 fs::is_regular_file(entry->path() / ".credentials.json", entry_error))
             {
-                candidates.push_back(normalize(entry->path()));
+                candidates.push_back(normalized_profile(entry->path()));
             }
         }
         std::sort(candidates.begin(), candidates.end());
         for (const auto& candidate : candidates) {
-            if (account_key(candidate) == account_key(selected)) continue;
+            if (account_key(candidate) == accounts.front().adapter_account_key) continue;
             if (accounts.size() == 64) throw std::runtime_error("account_inventory_capacity");
             accounts.push_back(account(candidate));
         }

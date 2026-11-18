@@ -503,6 +503,7 @@ void handle_preparation(addon::Invocation_context& context, const fs::path& pack
                 addon::Session_launch_context launch;
                 launch.account_context = input->account_context;
                 launch.launch_environment = input->launch_environment;
+                launch.working_directory = input->working_directory;
                 result.set.emplace_back("CLAUDE_CONFIG_DIR", path_string(profile_for_context(launch)));
             }
         }

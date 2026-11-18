@@ -386,6 +386,12 @@ if(BUILD_TESTING AND LOGONOMIC_CLI_ADDON_RECIPE_TESTS)
 endif()
 # Contract and recipe tests must not be confused with real native qualification.
 if(WIN32 AND BUILD_TESTING)
+    foreach(mode IN ITEMS sensitive unicode)
+        add_test(NAME claude_account_profiles_${mode}_tests COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/claude_account_profiles_tests.py"
+            "${CLAUDE_PACKAGE_DIRECTORY}/adapter/$<TARGET_FILE_NAME:claude_adapter>" "${mode}")
+    endforeach()
+    set_tests_properties(claude_account_profiles_sensitive_tests PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(claude_native_path_tests tests/claude_native_path_tests.cpp)
     target_link_libraries(claude_native_path_tests PRIVATE
         claude_provider logonomic_cli_addon_sdk::test_support advapi32)

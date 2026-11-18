@@ -341,21 +341,23 @@ std::vector<logonomic::cli_addon::Launcher_candidate> discover_launchers(
 {
     namespace fs = std::filesystem;
     const bool windows = request.platform_id == "windows-x86_64";
-    const auto program = addon::resolve_program("claude", addon::environment_pairs(request.ambient_environment),
-        {}, Launcher_whitespace::ASCII);
+    const auto environment = addon::environment_pairs(request.ambient_environment);
+    const auto program = addon::resolve_program("claude", environment, {}, Launcher_whitespace::ASCII);
     if (!program) return {};
     const auto runner = addon::preferred_discovery_runner(*program, windows ? "cmd" : "direct");
     std::vector<addon::Launcher_candidate> launchers;
-    auto selected = text(request.ambient_environment, "CLAUDE_CONFIG_DIR");
+    auto selected = addon::environment_value(environment, "CLAUDE_CONFIG_DIR");
     if (selected.empty()) {
-        auto home = text(request.ambient_environment, windows ? "USERPROFILE" : "HOME");
+        auto home = addon::environment_value(environment, windows ? "USERPROFILE" : "HOME");
+        if (home.empty() && windows) home = addon::environment_value(environment, "HOME");
         if (home.empty()) home = request.default_home_fallback;
         if (!home.empty()) selected = path_string(addon::path_from_utf8(home) / ".claude");
     }
     std::vector<fs::path> profiles;
     std::set<std::string> canonical_profiles;
     std::optional<std::string> selected_profile_identity;
-    const auto selected_path = addon::path_from_utf8(selected);
+    auto selected_path = addon::path_from_utf8(selected);
+    if (selected_path.is_absolute()) selected_path = normalized_profile(selected_path);
     const auto add_profile = [&](const fs::path& profile) {
         const std::string profile_path = path_string(profile.lexically_normal());
         const std::string environment_text = "CLAUDE_CONFIG_DIR=" + profile_path;
