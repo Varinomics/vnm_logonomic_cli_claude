@@ -60,6 +60,17 @@ class Adapter:
         assert frame, "adapter closed before its response"
         return json.loads(frame)
 
+    def invoke(self, capability, version, operation, payload):
+        self.serial += 1
+        request_id = f"r{self.serial}"
+        self.send({"type": "invoke", "request_id": request_id, "capability_id": capability,
+                   "version": version, "operation": operation, "deadline_ms": 5000, "payload": payload})
+        while True:
+            result = self.read()
+            if result["type"] == "result":
+                assert result["request_id"] == request_id
+                return result
+
     def prepare(self, profile):
         self.serial += 1
         request_id = "r" + str(self.serial)

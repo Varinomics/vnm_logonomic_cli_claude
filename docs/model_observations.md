@@ -97,6 +97,8 @@ a complete interactive child run, or the Logonomic UI.
 uses a disposable profile, `--bare`, a loopback Messages endpoint, a fixture API
 key, and disabled nonessential traffic. It obtains actual native headless output
 whose init and response models differ, then sends that unmodified stream through
-the compiled production adapter's structured inspector. No live account or paid
-model is used. Its scope is native structured model evidence, independently of
-package staging and full host integration.
+the compiled production adapter's structured inspector. It also reads the
+saved native turn through conversation export, usage scanning and resume
+inspection. Pass `--require-resume-inspection` on a supported native lookup
+to require both available and nonempty results. The scratch profile is removed
+after the run.

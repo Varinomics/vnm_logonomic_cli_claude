@@ -11,18 +11,6 @@ import tempfile
 from claude_helper_tests import Adapter
 
 
-def invoke(adapter, capability, version, operation, payload):
-    adapter.serial += 1
-    request_id = f"r{adapter.serial}"
-    adapter.send({"type": "invoke", "request_id": request_id, "capability_id": capability,
-                 "version": version, "operation": operation, "deadline_ms": 5000, "payload": payload})
-    while True:
-        result = adapter.read()
-        if result["type"] == "result":
-            assert result["request_id"] == request_id
-            return result
-
-
 def account_contract(adapter, root, selected, sibling):
     for profile in (selected, sibling):
         profile.mkdir()
@@ -37,7 +25,7 @@ def account_contract(adapter, root, selected, sibling):
         return {"Path": str(program), "UserProfile": str(root), "Claude_Config_Dir": str(profile)}
 
     def accounts(profile, operation):
-        result = invoke(adapter, "accounts", 2, operation, {
+        result = adapter.invoke("accounts", 2, operation, {
             "launcher": launcher, "launch_environment": {"platform": "windows-x86_64",
                 "effective_environment": environment(profile)},
             "normalization_directory": str(root), "default_home_fallback": str(root)})
@@ -52,7 +40,7 @@ def account_contract(adapter, root, selected, sibling):
     for profile in (selected, sibling):
         assert accounts(profile, "resolve")["adapter_account_key"] == keys[str(profile)]
 
-    result = invoke(adapter, "launcher-discovery", 1, "discover", {
+    result = adapter.invoke("launcher-discovery", 1, "discover", {
         "platform": "windows-x86_64", "ambient_environment": environment(selected),
         "default_home_fallback": str(root)})
     assert result["status"] == "success", result
@@ -62,7 +50,7 @@ def account_contract(adapter, root, selected, sibling):
         "CLAUDE_CONFIG_DIR=" + str(selected)], candidates
 
     def prepare(profile, account):
-        return invoke(adapter, "launch-preparation", 3, "prepare", {
+        return adapter.invoke("launch-preparation", 3, "prepare", {
             "launcher": launcher, "launcher_argv": ["claude"], "working_directory": str(root),
             "title_instruction": "Set the session title.", "declared_assets": [],
             "account_context": account, "launch_environment": {
@@ -100,17 +88,17 @@ def normalized_directory_contract(adapter, root):
         "PATH": str(root), "CLAUDE_CONFIG_DIR": str(decomposed), "HOME": str(root)}}
     request = {"launcher": launcher, "launch_environment": environment,
                "normalization_directory": str(root), "default_home_fallback": str(root)}
-    records = invoke(adapter, "accounts", 2, "discover", request)["payload"]["accounts"]
+    records = adapter.invoke("accounts", 2, "discover", request)["payload"]["accounts"]
     assert len(records) == 1 and records[0]["profile_path"] == str(composed), records
     account = {"version": 2, "profile_path": str(composed), "adapter_account_key": records[0]["adapter_account_key"]}
-    assert invoke(adapter, "accounts", 2, "resolve", request)["payload"]["adapter_account_key"] == account["adapter_account_key"]
-    discovery = invoke(adapter, "launcher-discovery", 1, "discover", {"platform": platform,
+    assert adapter.invoke("accounts", 2, "resolve", request)["payload"]["adapter_account_key"] == account["adapter_account_key"]
+    discovery = adapter.invoke("launcher-discovery", 1, "discover", {"platform": platform,
         "ambient_environment": environment["effective_environment"], "default_home_fallback": str(root)})
     candidates = discovery["payload"]["candidates"]
     assert len(candidates) == 1 and candidates[0]["environment_text"] == "CLAUDE_CONFIG_DIR=" + str(composed), candidates
 
     def prepare(grant):
-        return invoke(adapter, "launch-preparation", 3, "prepare", {"launcher": launcher, "launcher_argv": ["claude"],
+        return adapter.invoke("launch-preparation", 3, "prepare", {"launcher": launcher, "launcher_argv": ["claude"],
             "working_directory": str(root), "title_instruction": "Set the session title.", "declared_assets": [],
             "account_context": grant, "launch_environment": environment})
 
@@ -140,7 +128,7 @@ def normalized_directory_contract(adapter, root):
         transcript(decomposed, "other profile")
     out = root / "export"
     out.mkdir()
-    exported = invoke(adapter, "conversation-export", 1, "export", {"provider_session_id": session,
+    exported = adapter.invoke("conversation-export", 1, "export", {"provider_session_id": session,
         "working_directory": str(root), "launch_environment": environment, "output_directory": str(out), "format": "text"})
     assert exported["status"] == "success", exported
     contents = (out / exported["payload"]["file_name"]).read_text(encoding="utf-8")
