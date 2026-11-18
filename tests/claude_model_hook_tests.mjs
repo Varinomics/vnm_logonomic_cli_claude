@@ -31,7 +31,7 @@ function host_ledger(provider_session_id, transition_nonce) {
     };
 }
 
-async function fixture({ binding = true } = {}) {
+async function fixture({ binding = true, relay } = {}) {
     let handlers;
     const scheduled = [];
     const reports = [];
@@ -71,7 +71,10 @@ async function fixture({ binding = true } = {}) {
         process: { run: async (argv, options) => {
             if (argv[1].endsWith('/logonomic-hook-relay.cjs')) {
                 const report = JSON.parse(options.stdin);
-                if (report.hook_event_name === 'ModModel') reports.push(report);
+                if (report.hook_event_name === 'ModModel') {
+                    reports.push(report);
+                    if (relay) await relay();
+                }
                 return { exitCode: 0, stdout: '', stderr: '' };
             }
             if (argv[2] === 'binding') {
@@ -94,12 +97,15 @@ async function fixture({ binding = true } = {}) {
         handlers = registered;
     };
     const emit = (name, event, next = async () => ({ preserved: true })) => handlers.get(name)($, event, next);
-    const bind = () => scheduled.at(-1)();
+    const bind = () => scheduled.shift()();
+    const flush = async () => {
+        while (scheduled.length) await scheduled.shift()();
+    };
     await load();
     await emit('session.start', { isInteractive: true });
     if (binding) await bind();
     return {
-        reports, emit, bind,
+        reports, emit, bind, flush,
         set_roster: callback => { roster = callback; },
         // The next binding read waits until the returned hold resolves.
         hold_binding: () => {
@@ -148,7 +154,7 @@ function start_step(test, event, result, pending, aborted = false) {
         assert.equal(returned.done, true);
         assert.equal(returned.value, result, 'the native response object passes through untouched');
     })();
-    return { entered: entered.promise, done };
+    return { entered: entered.promise, native_done: done, done: done.then(test.flush) };
 }
 
 async function step(test, event, result, pending, aborted = false) {
@@ -157,6 +163,27 @@ async function step(test, event, result, pending, aborted = false) {
 
 // Oracle: a step's usage.model is the API-reported model of that one response.
 // event.model and aggregate session usage are not serving-model evidence.
+{
+    const held = deferred();
+    const test = await fixture({ relay: () => held.promise });
+    let complete = false;
+    const started = start_step(test, {}, response('served'));
+    const native = started.native_done.then(() => { complete = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(complete, true, 'a held reporting relay cannot delay the native result');
+    assert.equal(test.reports.length, 1, 'the reporting relay is in flight');
+    const slow = deferred();
+    const older = start_step(test, {}, response('older'), slow.promise);
+    await older.entered;
+    await step(test, {}, response('latest'));
+    slow.resolve();
+    await older.done;
+    assert.equal(test.reports.length, 1, 'later results do not start competing relays');
+    held.resolve();
+    await Promise.all([native, started.done]);
+    assert.deepEqual(test.reports.map(report => report.model_state.updates[0].model), ['served', 'latest']);
+}
+
 {
     const test = await fixture();
     await step(test, {}, response('root-served'));
@@ -180,6 +207,7 @@ async function step(test, event, result, pending, aborted = false) {
     assert.equal(await test.emit('classic.PostModelSwitch', {
         session_id: 'A', from_model: 'root-served', to_model: 'resolved-switch', requested_model: 'opus',
     }, async () => preserved), preserved);
+    await test.flush();
     assert.equal(test.reports.at(-1).model_state.updates[0].model, 'resolved-switch');
     assert.equal(test.reports.at(-1).model_state.updates[0].source, 'claude.PostModelSwitch');
 }
@@ -268,6 +296,7 @@ async function step(test, event, result, pending, aborted = false) {
     await test.reload();
     await test.emit('classic.PostModelSwitch', { session_id: 'A', to_model: 'switched-after-reload' },
         async () => ({ preserved: true }));
+    await test.flush();
     child_pending.resolve();
     root_pending.resolve();
     await child.done;

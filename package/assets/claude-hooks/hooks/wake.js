@@ -108,15 +108,14 @@ async function commit_model_sequence($, captured) {
 }
 
 async function report_model($, current, captured, agent_id, model, source) {
-    if (!captured || typeof model !== 'string' || !model || model === '<synthetic>' ||
-        !await matches_activation($, current)) return;
+    if (!await matches_activation($, current)) return;
     if (agent_id) {
         // Native compaction/memory forks have loop IDs absent from the agent
         // roster. Only the real child whose step supplied this model qualifies.
         const agents = await $.agent.list();
         if (!agents.some(agent => agent.id === agent_id) || !await matches_activation($, current)) return;
     }
-    if (!await commit_model_sequence($, captured)) return;
+    if (!await commit_model_sequence($, captured) || current !== activation) return;
     await $.process.run(['node', `${$.plugin.root}/scripts/logonomic-hook-relay.cjs`], {
         stdin: JSON.stringify({
             hook_event_name: 'ModModel', session_id: captured.provider_session_id, agent_id,
@@ -127,6 +126,32 @@ async function report_model($, current, captured, agent_id, model, source) {
             }] },
         }),
         timeoutMs: 13000,
+    });
+}
+
+// The host retains one model per actor. Keep its newest pending observation
+// while a single relay is busy, reserving a slot for the root at child capacity.
+function queue_model($, current, captured, agent_id, model, source) {
+    if (!captured || current !== activation || typeof model !== 'string' || !model || model === '<synthetic>') return;
+    const pending = current.pending_models ??= new Map();
+    const prior = pending.get(agent_id);
+    if (prior && BigInt(captured.sequence) < BigInt(prior.captured.sequence)) return;
+    if (!prior && agent_id && pending.size - Number(pending.has('')) >= 128) return;
+    pending.set(agent_id, { captured, model, source });
+    if (current.sending_models) return;
+    current.sending_models = true;
+    $.clock.after(0, async () => {
+        try {
+            while (current === activation && pending.size) {
+                const [actor, observation] = pending.entries().next().value;
+                pending.delete(actor);
+                try {
+                    await report_model($, current, observation.captured, actor, observation.model, observation.source);
+                }
+                catch { /* A reporting failure drops only this optional observation. */ }
+            }
+        }
+        finally { current.sending_models = false; }
     });
 }
 
@@ -226,7 +251,7 @@ export function register(on) {
         const result = yield* next(event);
         if (!next.signal?.aborted && result.stopReason !== 'compaction') {
             try {
-                await report_model($, current, captured, event.agentId ?? '', result.usage?.model,
+                queue_model($, current, captured, event.agentId ?? '', result.usage?.model,
                     'claude.turn.step.usage');
             }
             catch { /* Optional model evidence cannot change the native response. */ }
@@ -239,7 +264,7 @@ export function register(on) {
         const result = await next(event);
         if (!event.agent_id && !next.signal?.aborted && event.session_id === current.session_id) {
             try {
-                await report_model($, current, captured, '', event.to_model, 'claude.PostModelSwitch');
+                queue_model($, current, captured, '', event.to_model, 'claude.PostModelSwitch');
             }
             catch { /* The native model switch has already succeeded. */ }
         }
