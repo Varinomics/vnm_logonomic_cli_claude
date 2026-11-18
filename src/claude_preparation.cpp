@@ -149,38 +149,56 @@ void require_instruction(const std::string& instruction)
 // Claude's argument list for a launcher: its literal command with the hook
 // plugin, the title instruction and the trailing arguments applied. The scans
 // step over each option's value, so a value that reads like an option, as in
-// --system-prompt --append-system-prompt, stays a value.
+// --system-prompt --append-system-prompt, stays a value. An unconsumed -- ends
+// the options, including one synthesized by a short-option cluster such as
+// -c-. Everything after it remains an operand, including option names.
 std::vector<std::string> claude_command(
     std::vector<std::string> command, const std::string& instruction,
     const std::vector<std::string>& plugins, const std::vector<std::string>& trailing)
 {
     const auto cli_index = *cli_argument_index(command);
-    const auto next_option = [&command](std::size_t index) {
-        return index + 1 + claude_option_value_words(command, index);
-    };
+    const auto next_option = [
+            &command
+        ](
+            std::size_t index
+        )
+        {
+            return index + 1 + claude_option_value_words(command, index);
+        };
+    std::size_t option_end = cli_index + 1;
+    while (option_end < command.size()) {
+        const auto option = claude_option_span(command, option_end);
+        if (option.argument == "--") break;
+        option_end += 1 + option.value_words;
+    }
     for (const auto& plugin : plugins) {
         bool present = false;
-        for (std::size_t index = cli_index + 1; index < command.size(); index = next_option(index)) {
-            if ((command[index] == "--plugin-dir" && index + 1 < command.size() && command[index + 1] == plugin) ||
-                (command[index].starts_with("--plugin-dir=") && command[index].substr(13) == plugin))
+        for (std::size_t index = cli_index + 1; index < option_end; index = next_option(index)) {
+            const auto option = claude_option_span(command, index);
+            if ((option.argument == "--plugin-dir" && index + 1 < command.size() && command[index + 1] == plugin) ||
+                (option.argument.starts_with("--plugin-dir=") && option.argument.substr(13) == plugin))
             {
                 present = true;
                 break;
             }
         }
-        if (!present) command.insert(command.end(), {"--plugin-dir", plugin});
+        if (!present) {
+            command.insert(command.begin() + static_cast<std::ptrdiff_t>(option_end), {"--plugin-dir", plugin});
+            option_end += 2;
+        }
     }
     bool present = false;
-    for (std::size_t index = cli_index + 1; index < command.size(); index = next_option(index)) {
+    for (std::size_t index = cli_index + 1; index < option_end; index = next_option(index)) {
         auto& argument = command[index];
-        if (argument == "--append-system-prompt") {
+        const auto option = claude_option_span(command, index);
+        if (option.argument == "--append-system-prompt") {
             if (index + 1 == command.size()) command.push_back(instruction);
             else
             if (command[index + 1].find(instruction) == std::string::npos) command[index + 1] += ' ' + instruction;
             present = true;
             break;
         }
-        if (argument.starts_with("--append-system-prompt=")) {
+        if (option.argument.starts_with("--append-system-prompt=")) {
             if (argument.find(instruction) == std::string::npos) argument += ' ' + instruction;
             present = true;
             break;

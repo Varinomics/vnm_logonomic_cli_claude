@@ -27,9 +27,9 @@ namespace {
 using Environment = std::vector<std::pair<std::string, std::string>>;
 constexpr std::size_t k_max_profile_directory_entries_to_scan = 256;
 
-// Claude's options that take the next word as their value, whatever that word
-// is, among the options an interactive launch may carry.
-constexpr std::array<std::string_view, 15> k_value_options{
+// Resume admission is narrower than native parsing: accepting a value here
+// must not admit print, session-selection or hidden native launch modes.
+constexpr std::array<std::string_view, 15> k_resume_value_options{
     "--agent", "--agents", "--append-system-prompt", "--autocompact", "--debug-file",
     "--effort", "--model", "-n", "--name", "--permission-mode", "--plugin-dir",
     "--remote-control-session-name-prefix", "--setting-sources", "--settings", "--system-prompt",
@@ -37,6 +37,35 @@ constexpr std::array<std::string_view, 15> k_value_options{
 // An option whose value is optional: it takes the next word only when that
 // word does not start with '-'.
 constexpr std::string_view k_prompt_suggestions = "--prompt-suggestions";
+
+// Claude Code 2.1.327's root Commander declarations, including hidden options.
+// Arity belongs to the native parser, independently of approval and resume policy.
+constexpr std::array<std::string_view, 74> k_native_value_options{
+    "--debug-file", "--output-format", "--json-schema", "--input-format", "--thinking",
+    "--thinking-display", "--max-thinking-tokens", "--max-turns", "--max-budget-usd", "--task-budget",
+    "--permission-prompt-tool", "--permission-prompts", "--system-prompt", "--system-prompt-file",
+    "--append-system-prompt", "--append-system-prompt-file", "--system-prompt-snapshot",
+    "--append-subagent-system-prompt", "--append-subagent-system-prompt-file", "--plan-mode-instructions",
+    "--permission-mode", "--inherit-permission-mode", "--watch-artifact", "--watch-artifact-no-autoreact",
+    "--prefill", "--deep-link-repo", "--deep-link-last-fetch", "--prefill-b64", "--deep-link-cwd-b64",
+    "--resume-session-at", "--resume-drops-turn", "--rewind-files", "--model", "--effort", "--fast-mode",
+    "--agent", "--fallback-model", "--workload", "--settings", "--client-data-url", "--managed-settings",
+    "--project-config-root", "--session-id", "-n", "--name", "--agents", "--setting-sources", "--plugin-dir",
+    "--plugin-dir-no-mcp", "--plugin-url", "--advisor", "--autocompact", "--proactivity",
+    "--messaging-socket-path", "--agent-id", "--agent-name", "--team-name", "--agent-color",
+    "--parent-session-id", "--lead-verify-key", "--teammate-mode", "--agent-type", "--sdk-url",
+    "--runner-declares", "--session-began-as-copy", "--initialize-fields", "--forward-home-settings",
+    "--attach-serve", "--environment", "--pool", "--correlation-id", "--ref", "--on-branch",
+    "--remote-control-session-name-prefix",
+};
+constexpr std::array<std::string_view, 13> k_native_optional_value_options{
+    "-d", "--debug", "--prompt-suggestions", "-r", "--resume", "--from-pr", "-w", "--worktree",
+    "--teleport", "--cloud", "--remote", "--remote-control", "--rc",
+};
+constexpr std::array<std::string_view, 11> k_native_variadic_options{
+    "--allowedTools", "--allowed-tools", "--tools", "--disallowedTools", "--disallowed-tools",
+    "--mcp-config", "--betas", "--add-dir", "--file", "--channels", "--dangerously-load-development-channels",
+};
 
 std::string bounded_display_name(std::string_view value)
 {
@@ -191,16 +220,47 @@ std::optional<std::size_t> cli_argument_index(const std::vector<std::string>& ar
     return std::nullopt;
 }
 
+Claude_option_span claude_option_span(const std::vector<std::string>& argv, std::size_t index)
+{
+    Claude_option_span result{argv[index]};
+    auto& argument = result.argument;
+    // Commander expands a cluster of short switches before consuming the
+    // next word. A value-taking short option consumes any attached suffix.
+    while (argument.size() > 2 && argument[0] == '-' && argument[1] != '-' && argument != "-d2e") {
+        const auto first = std::string_view(argument).substr(0, 2);
+        if (first != "-c" && first != "-p" && first != "-h") return result;
+        argument.erase(1, 1);
+    }
+    if (argument == "--" || index + 1 >= argv.size()) return result;
+    if (std::find(k_native_value_options.begin(), k_native_value_options.end(), argument) !=
+        k_native_value_options.end())
+    {
+        result.value_words = 1;
+        return result;
+    }
+    const auto is_option = [](const std::string& word) { return word.size() > 1 && word.front() == '-'; };
+    if (std::find(k_native_optional_value_options.begin(), k_native_optional_value_options.end(), argument) !=
+        k_native_optional_value_options.end())
+    {
+        result.value_words = is_option(argv[index + 1]) ? 0 : 1;
+        return result;
+    }
+    if (std::find(k_native_variadic_options.begin(), k_native_variadic_options.end(), argument) ==
+        k_native_variadic_options.end())
+    {
+        return result;
+    }
+    // A required variadic option consumes its first word even when it is --.
+    result.value_words = 1;
+    while (index + result.value_words + 1 < argv.size() && !is_option(argv[index + result.value_words + 1])) {
+        ++result.value_words;
+    }
+    return result;
+}
+
 std::size_t claude_option_value_words(const std::vector<std::string>& argv, std::size_t index)
 {
-    if (index + 1 >= argv.size()) {
-        return 0;
-    }
-    const auto& argument = argv[index];
-    if (std::find(k_value_options.begin(), k_value_options.end(), argument) != k_value_options.end()) {
-        return 1;
-    }
-    return argument == k_prompt_suggestions && !argv[index + 1].starts_with('-') ? 1 : 0;
+    return claude_option_span(argv, index).value_words;
 }
 
 bool interactive_resume_arguments(const std::vector<std::string>& argv, std::string* refused_option)
@@ -244,7 +304,10 @@ bool interactive_resume_arguments(const std::vector<std::string>& argv, std::str
             }
             continue;
         }
-        if (claude_option_value_words(argv, index) == 1) {
+        if (std::find(k_resume_value_options.begin(), k_resume_value_options.end(), argument) !=
+                k_resume_value_options.end() &&
+            claude_option_value_words(argv, index) == 1)
+        {
             if (argv[++index].empty()) {
                 return refuse(argument);
             }
@@ -252,8 +315,8 @@ bool interactive_resume_arguments(const std::vector<std::string>& argv, std::str
         }
         const auto equals = argument.find('=');
         if (equals != std::string::npos && equals + 1 < argument.size() &&
-            (std::find(k_value_options.begin(), k_value_options.end(), argument.substr(0, equals)) !=
-                 k_value_options.end() ||
+            (std::find(k_resume_value_options.begin(), k_resume_value_options.end(), argument.substr(0, equals)) !=
+                 k_resume_value_options.end() ||
              argument.substr(0, equals) == "--debug"))
         {
             continue;

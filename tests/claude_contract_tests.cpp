@@ -26,6 +26,7 @@
 #include <logonomic_cli_addon/sidecar.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -94,8 +95,35 @@ void require(bool condition, const char* message)
 // commander's parseOptions: a word longer than one character that starts with
 // '-' is an option; an option declared <value> takes the next word whatever it
 // is, one declared [value] takes it unless it starts with '-', and one declared
-// <values...> takes every word up to the next option; --name=value carries its
-// value. The declarations are Claude Code 2.1's own (claude --help).
+// <values...> takes that required first value, then every word up to the next
+// option; --name=value carries its value. These declarations include the
+// hidden options in the captured Claude Code 2.1.327 native root command.
+constexpr std::array<std::string_view, 74> k_claude_required_options{
+    "--debug-file", "--output-format", "--json-schema", "--input-format", "--thinking", "--thinking-display",
+    "--max-thinking-tokens", "--max-turns", "--max-budget-usd", "--task-budget", "--permission-prompt-tool",
+    "--permission-prompts", "--system-prompt", "--system-prompt-file", "--append-system-prompt",
+    "--append-system-prompt-file", "--system-prompt-snapshot", "--append-subagent-system-prompt",
+    "--append-subagent-system-prompt-file", "--plan-mode-instructions", "--permission-mode",
+    "--inherit-permission-mode", "--watch-artifact", "--watch-artifact-no-autoreact", "--prefill",
+    "--deep-link-repo", "--deep-link-last-fetch", "--prefill-b64", "--deep-link-cwd-b64", "--resume-session-at",
+    "--resume-drops-turn", "--rewind-files", "--model", "--effort", "--fast-mode", "--agent", "--fallback-model",
+    "--workload", "--settings", "--client-data-url", "--managed-settings", "--project-config-root", "--session-id",
+    "-n", "--name", "--agents", "--setting-sources", "--plugin-dir", "--plugin-dir-no-mcp", "--plugin-url",
+    "--advisor", "--autocompact", "--proactivity", "--messaging-socket-path", "--agent-id", "--agent-name",
+    "--team-name", "--agent-color", "--parent-session-id", "--lead-verify-key", "--teammate-mode", "--agent-type",
+    "--sdk-url", "--runner-declares", "--session-began-as-copy", "--initialize-fields", "--forward-home-settings",
+    "--attach-serve", "--environment", "--pool", "--correlation-id", "--ref", "--on-branch",
+    "--remote-control-session-name-prefix",
+};
+constexpr std::array<std::string_view, 13> k_claude_optional_options{
+    "-d", "--debug", "--prompt-suggestions", "-r", "--resume", "--from-pr", "-w", "--worktree", "--teleport",
+    "--cloud", "--remote", "--remote-control", "--rc",
+};
+constexpr std::array<std::string_view, 11> k_claude_variadic_options{
+    "--allowedTools", "--allowed-tools", "--tools", "--disallowedTools", "--disallowed-tools", "--mcp-config",
+    "--betas", "--add-dir", "--file", "--channels", "--dangerously-load-development-channels",
+};
+
 struct Claude_reading
 {
     std::vector<std::pair<std::string, std::vector<std::string>>> options;
@@ -114,22 +142,40 @@ struct Claude_reading
 
 Claude_reading claude_reading(const std::vector<std::string>& argv)
 {
-    const std::vector<std::string_view> required{
-        "--agent", "--agents", "--append-system-prompt", "--autocompact", "--debug-file", "--effort",
-        "--model", "-n", "--name", "--permission-mode", "--plugin-dir",
-        "--remote-control-session-name-prefix", "--setting-sources", "--settings", "--system-prompt",
-    };
-    const std::vector<std::string_view> optional{"-d", "--debug", "--prompt-suggestions", "-r", "--resume"};
     const auto is_option = [](const std::string& word) { return word.size() > 1 && word.front() == '-'; };
-    const auto declared = [](const std::vector<std::string_view>& names, std::string_view name) {
-        return std::find(names.begin(), names.end(), name) != names.end();
-    };
+    const auto declared = [](
+            const auto& names,
+            std::string_view name
+        )
+        {
+            return std::find(names.begin(), names.end(), name) != names.end();
+        };
     Claude_reading reading;
-    for (std::size_t index = 1; index < argv.size(); ++index) {
-        const auto& word = argv[index];
+    auto pending = argv;
+    for (std::size_t index = 1; index < pending.size(); ++index) {
+        const auto word = pending[index];
+        if (word == "--") {
+            reading.operands.insert(reading.operands.end(), pending.begin() + index + 1, pending.end());
+            break;
+        }
         if (!is_option(word)) {
             reading.operands.push_back(word);
             continue;
+        }
+        // Commander's short-switch branch emits that switch and reinserts
+        // '-' + word.slice(2), which can become -- or a managed long option.
+        if (word.size() > 2 && word[1] != '-' && word != "-d2e") {
+            const auto short_name = word.substr(0, 2);
+            if (declared(k_claude_required_options, short_name) || declared(k_claude_optional_options, short_name)) {
+                reading.options.emplace_back(short_name, std::vector<std::string>{word.substr(2)});
+                continue;
+            }
+            if (short_name == "-c" || short_name == "-p" || short_name == "-h") {
+                reading.options.emplace_back(short_name, std::vector<std::string>{});
+                pending[index] = '-' + word.substr(2);
+                --index;
+                continue;
+            }
         }
         const auto equals = word.find('=');
         const auto name   = word.substr(0, equals);
@@ -138,17 +184,17 @@ Claude_reading claude_reading(const std::vector<std::string>& argv)
             values.push_back(word.substr(equals + 1));
         }
         else
-        if (declared(required, name)) {
-            if (index + 1 < argv.size()) values.push_back(argv[++index]);
+        if (declared(k_claude_required_options, name)) {
+            if (index + 1 < pending.size()) values.push_back(pending[++index]);
         }
         else
-        if (declared(optional, name)) {
-            if (index + 1 < argv.size() && !is_option(argv[index + 1])) values.push_back(argv[++index]);
+        if (declared(k_claude_optional_options, name)) {
+            if (index + 1 < pending.size() && !is_option(pending[index + 1])) values.push_back(pending[++index]);
         }
         else
-        if (name == "--add-dir" || name == "--allowedTools" || name == "--mcp-config" ||
-            name == "--disallowedTools" || name == "--tools") {
-            while (index + 1 < argv.size() && !is_option(argv[index + 1])) values.push_back(argv[++index]);
+        if (declared(k_claude_variadic_options, name)) {
+            if (index + 1 < pending.size()) values.push_back(pending[++index]);
+            while (index + 1 < pending.size() && !is_option(pending[index + 1])) values.push_back(pending[++index]);
         }
         reading.options.emplace_back(name, std::move(values));
     }
@@ -776,6 +822,150 @@ Context prepare_launch(
     invocation.m_request.payload = addon::encode_prepare_request(request, 3);
     claude::handle_preparation(invocation, root);
     return invocation;
+}
+
+void launch_option_boundary_contract()
+{
+    const auto root = fs::temp_directory_path() / ("claude-options-" + addon::random_nonce_hex());
+    fs::create_directories(root / "tools");
+    struct Cleanup { fs::path path; ~Cleanup() { std::error_code error; fs::remove_all(path, error); } } cleanup{root};
+    std::ofstream(root / "tools/node").close();
+    std::ofstream(root / "tools/node.exe").close();
+    const std::string instruction = "Set the session title.";
+    const auto plugin = claude::path_string(root / "assets/claude-hooks");
+    const std::string existing_plugin = "OpenRig plugin directory";
+    const std::string settings = R"({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"openrig-activity"}]}]}})";
+    const auto prepare = [
+            &root,
+            &instruction
+        ](
+            const std::vector<std::string>& argv
+        )
+        {
+            const auto invocation = prepare_launch(root, addon::host_platform_id(), "direct", argv, std::nullopt, instruction);
+            addon::Contract_failure failure;
+            const auto patch = addon::decode_launch_patch(invocation.m_payload, &failure, 3);
+            require(invocation.m_finished && invocation.m_status == addon::Result_status::SUCCESS && patch &&
+                addon::validate_launch_patch(*patch, {}, {}, &failure) && patch->argv &&
+                patch->disposition->prepared && patch->disposition->lifecycle_events,
+                "a literal native launch with a prompt terminator keeps native hook preparation");
+            return *patch->argv;
+        };
+
+    // Commander's -- ends option parsing, except when a required option has
+    // already consumed that word as its value. Prompt operands can therefore
+    // spell the very options that preparation needs to add.
+    for (const auto* boundary : {"--", "-c-", "-pc-"}) {
+        for (const std::string& operand : {
+                std::string("--append-system-prompt=User prompt"), "--plugin-dir=" + plugin,
+                std::string("  Original prompt with 'quotes' and a newline\n"), std::string{}})
+        {
+            const std::vector<std::string> original{
+                "claude", "--plugin-dir", existing_plugin, "--settings", settings, boundary, operand};
+            const auto prepared = prepare(original);
+            require(claude_reading(prepared).operands == claude_reading(original).operands,
+                "preparation must preserve every operand after a native option boundary byte for byte");
+            const std::vector<std::string> expected{
+                "claude", "--append-system-prompt", instruction, "--plugin-dir", existing_plugin,
+                "--settings", settings, "--plugin-dir", plugin, boundary, operand};
+            require(prepared == expected,
+                "native hooks precede the boundary without rewriting original short switches, plugins or operands");
+            require(prepare(prepared) == prepared,
+                "repeated native preparation adds neither a duplicate plugin nor a duplicate instruction");
+        }
+        require(prepare({"claude", boundary}) == std::vector<std::string>{
+                "claude", "--append-system-prompt", instruction, "--plugin-dir", plugin, boundary},
+            "a trailing synthetic option boundary still precedes the end of argv");
+    }
+
+    for (const auto* option : {"--system-prompt", "--add-dir"}) {
+        const auto prepared = prepare({"claude", option, "-c-", "--", "User prompt"});
+        const auto reading = claude_reading(prepared);
+        require(reading.values(option) == std::vector<std::string>{"-c-"} &&
+            reading.operands == std::vector<std::string>{"User prompt"},
+            "a required value is not expanded as a short-option cluster");
+    }
+
+    for (const std::string prefix : {"-c", "-pc"}) {
+        for (const bool attached : {false, true}) {
+            std::vector<std::string> original{"claude", prefix + "-append-system-prompt"};
+            if (attached) original.back() += "=User instruction";
+            else original.push_back("User instruction");
+            original.push_back(prefix + "-plugin-dir");
+            if (attached) original.back() += '=' + plugin;
+            else original.push_back(plugin);
+            auto expected = original;
+            expected[attached ? 1 : 2] += ' ' + instruction;
+            const auto prepared = prepare(original);
+            const auto reading = claude_reading(prepared);
+            require(prepared == expected && reading.values("--plugin-dir") == std::vector<std::string>{plugin} &&
+                reading.values("--append-system-prompt") == std::vector<std::string>{"User instruction " + instruction},
+                "native-expanded managed options retain their preceding short switches and original spelling");
+            require(prepare(prepared) == prepared,
+                "native-expanded managed options remain idempotent");
+        }
+    }
+
+    const std::vector<std::string> option_value{
+        "claude", "--system-prompt", "--", "--append-system-prompt", "User instruction",
+        "--plugin-dir", existing_plugin, "--", "--append-system-prompt=User prompt"};
+    const auto prepared = prepare(option_value);
+    const auto reading = claude_reading(prepared);
+    require(reading.operands == claude_reading(option_value).operands &&
+        reading.values("--system-prompt") == std::vector<std::string>{"--"} &&
+        reading.values("--append-system-prompt") == std::vector<std::string>{"User instruction " + instruction} &&
+        reading.values("--plugin-dir") == std::vector<std::string>{existing_plugin, plugin},
+        "a required option's -- value is preserved before the actual operand boundary");
+
+    for (const auto option : k_claude_required_options) {
+        const std::vector<std::string> original{"claude", std::string(option), "--", "--", "User prompt"};
+        const auto prepared = prepare(original);
+        const auto reading = claude_reading(prepared);
+        std::vector<std::string> expected_values{"--"};
+        if (option == "--append-system-prompt") expected_values = {"-- " + instruction};
+        if (option == "--plugin-dir") expected_values.push_back(plugin);
+        const std::vector<std::string> expected_plugins = option == "--plugin-dir"
+            ? std::vector<std::string>{"--", plugin} : std::vector<std::string>{plugin};
+        require(reading.operands == std::vector<std::string>{"User prompt"} &&
+            reading.values(option) == expected_values &&
+            reading.values("--plugin-dir") == expected_plugins,
+            ("a required native option consumes -- as its value: " + std::string(option)).c_str());
+        require(prepare(prepared) == prepared,
+            "required native values preserve idempotent preparation");
+    }
+    // Native parsing must not expand the separately maintained resume policy.
+    for (const auto* option : {"--prefill", "--watch-artifact", "--output-format", "--debug"}) {
+        require(!claude::interactive_resume_arguments({"claude", option, "value"}),
+            "native option arity does not admit additional resume modes");
+    }
+
+    for (const auto option : k_claude_variadic_options) {
+        const std::vector<std::string> original{
+            "claude", std::string(option), "--", "second value", "--append-system-prompt", "User instruction",
+            "--", "User prompt"};
+        const auto prepared = prepare(original);
+        const std::vector<std::string> expected{
+            "claude", std::string(option), "--", "second value", "--append-system-prompt", "User instruction " + instruction,
+            "--plugin-dir", plugin, "--", "User prompt"};
+        require(prepared == expected &&
+            claude_reading(prepared).operands == claude_reading(original).operands &&
+            claude_reading(prepared).values(option) == std::vector<std::string>{"--", "second value"},
+            "a required variadic option consumes its first -- value before the operand boundary");
+    }
+
+    for (const auto option : k_claude_optional_options) {
+        const std::vector<std::string> original{"claude", std::string(option), "--", "--plugin-dir", "User prompt"};
+        const auto reading = claude_reading(prepare(original));
+        require(reading.operands == claude_reading(original).operands && reading.values(option).empty() &&
+            reading.values("--plugin-dir") == std::vector<std::string>{plugin},
+            "an optional value leaves -- as the operand boundary");
+    }
+    for (const auto* cluster : {"-cn", "-pcn"}) {
+        require(prepare({"claude", cluster, "--", "--", "User prompt"}) == std::vector<std::string>{
+                "claude", "--append-system-prompt", instruction, cluster, "--", "--plugin-dir", plugin,
+                "--", "User prompt"},
+            "a required value at the end of a short-option cluster consumes --");
+    }
 }
 
 // The replacement argv of a prepared launch that the host admits as delivering
@@ -3067,6 +3257,7 @@ int main(int argc, char** argv)
         launcher_discovery_candidate_limit();
         launcher_discovery_scan_limit();
         launcher_directory_contract();
+        launch_option_boundary_contract();
         initial_prompt_contract();
         wake_preparation_contract();
         wake_binding_contract();

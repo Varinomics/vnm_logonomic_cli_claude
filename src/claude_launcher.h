@@ -20,9 +20,19 @@ struct Launcher_command
 
 std::optional<Launcher_command> recognize_launcher(std::string_view script, std::string_view runner);
 std::optional<std::size_t> cli_argument_index(const std::vector<std::string>& argv);
-// The words that follow argv[index] as its value when Claude parses argv, for
-// the options an interactive launch may carry: one after an option that takes
-// a value, none after a switch, an option=value word or an unknown option.
+struct Claude_option_span
+{
+    // Commander's remaining token after expanding leading short switches.
+    // This may be a synthetic --. The caller keeps the original argv word.
+    std::string argument;
+    std::size_t value_words = 0;
+};
+
+Claude_option_span claude_option_span(const std::vector<std::string>& argv, std::size_t index);
+// The words that follow argv[index] as its value under Claude's native option
+// grammar, including required, optional and variadic values. Attached values,
+// switches and unknown options consume no following words. This is arity only;
+// admission to an interactive resume is a separate policy.
 std::size_t claude_option_value_words(const std::vector<std::string>& argv, std::size_t index);
 // On refusal, reports the option name without an inline value when requested.
 bool interactive_resume_arguments(const std::vector<std::string>& argv, std::string* refused_option = nullptr);
