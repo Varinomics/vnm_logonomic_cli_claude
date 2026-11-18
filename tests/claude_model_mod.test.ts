@@ -47,6 +47,7 @@ for (const item of [
         } while (!part.done);
         expect(part.value).toEqual(native);
         expect(chunks).toEqual([{ kind: 'text', index: 0, text: 'unchanged' }]);
+        await clock.settle();
         expect(reports.length).toBe(item.expected ? 1 : 0);
         if (item.expected) expect(reports[0]).toEqual({ hook_event_name: 'ModModel',
             session_id: 'native-session', agent_id: item.agentId ?? '', model_state: { version: 1, updates: [{
@@ -79,6 +80,7 @@ test('model evidence: resolved native session switch', async ($, on) => {
     expect(await $.classic.PostModelSwitch({ session_id: 'native-session',
         from_model: 'before', to_model: 'native-resolved', requested_model: 'opus', source: 'command',
     })).toEqual({ additionalContext: ['native-switch-unchanged'] });
+    await clock.settle();
     expect(reports).toEqual([{ hook_event_name: 'ModModel', session_id: 'native-session', agent_id: '',
         model_state: { version: 1, updates: [{ provider_session_id: 'native-session',
             transition_nonce: 'b'.repeat(32), sequence: '1', agent_id: '', state: 'confirmed',
@@ -116,8 +118,10 @@ test('model evidence: successive sources publish through session state', async (
     await clock.settle();
     const stream = $.turn.step({ turnId: 'turn', index: 0, messageCount: 1, model: 'launcher-only' });
     while (!(await stream.next()).done) {}
+    await clock.settle();
     await $.classic.PostModelSwitch({ session_id: 'native-session',
         from_model: 'root-served', to_model: 'native-resolved', requested_model: 'opus', source: 'command' });
+    await clock.settle();
     expect(reports.map(report => [report.model_state.updates[0].model, report.model_state.updates[0].sequence]))
         .toEqual([['root-served', '1'], ['native-resolved', '2']]);
 });
