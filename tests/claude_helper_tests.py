@@ -534,7 +534,8 @@ def main():
         hooks = json.loads((relay.parent.parent / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
         assert len(hooks["PreToolUse"]) == 1 and "matcher" not in hooks["PreToolUse"][0]
         assert hooks["PostToolUse"][0]["matcher"] == "^(AskUserQuestion|ExitPlanMode)$"
-        reply_evidence_contract(helper, adapter, relay, environment, capture)
+        if "--skip-reply" not in sys.argv[5:]:
+            reply_evidence_contract(helper, adapter, relay, environment, capture)
         result, records, _ = run({**prompt, "agent_id": "child-agent"})
         assert result.stdout == "" and all(item["operation"] != "request-title-instruction" for item in records)
         start = {"hook_event_name": "SessionStart", "session_id": "new-session", "source": "startup"}
