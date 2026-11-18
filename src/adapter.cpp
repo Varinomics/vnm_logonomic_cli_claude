@@ -154,6 +154,7 @@ int main()
         {"usage-incremental", 1},
         {addon::k_context_state_capability_id, addon::k_context_state_capability_version},
         {addon::k_model_state_capability_id, addon::k_model_state_version},
+        {addon::k_structured_model_observation_capability_id, addon::k_structured_model_observation_version},
         {addon::k_execution_context_capability_id, addon::k_execution_context_version},
         {addon::k_usage_temporal_capability_id, addon::k_usage_temporal_version},
         {addon::k_attention_kind_capability_id, addon::k_attention_kind_version},

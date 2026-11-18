@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -554,10 +555,8 @@ addon::Structured_inspect_result inspect_session(
         auto parsed = addon::parse_exchange_protocol_state(inspection.protocol_state);
         if (!parsed || !parsed->is_object()) return failed("invalid_structured_output");
         Json state = std::move(*parsed);
-        if (observe_model) {
-            addon::decode_structured_model_observation(state, result.model_observation, result.model_failure);
-        }
-        const auto observe = [&result, observe_model](const Json* model, const char* source) {
+        bool reported_malformed_model = false;
+        const auto observe = [&](const Json* model, const char* source) {
             if (!observe_model || !model) {
                 return;
             }
@@ -566,12 +565,19 @@ addon::Structured_inspect_result inspect_session(
             observation.source = source;
             if (addon::is_valid_structured_model_observation(observation)) {
                 result.model_observation = std::move(observation);
-                result.model_failure.reset();
             }
             else {
-                result.model_observation.reset();
                 result.model_failure = addon::Contract_failure{
                     "invalid_model_observation", "Claude structured model is malformed"};
+            }
+            if (result.model_observation && result.model_failure) {
+                // The wire carries either a fact or a failure. A malformed
+                // sibling cannot withdraw a confirmed model in the same read.
+                if (!reported_malformed_model) {
+                    std::fputs("structured model: invalid_model_observation\n", stderr);
+                    reported_malformed_model = true;
+                }
+                result.model_failure.reset();
             }
         };
         const auto* initialized_value = state.find("initialized");
@@ -712,7 +718,7 @@ addon::Structured_inspect_result inspect_session(
                 record(addon::Presentation_event_kind::ANALYSIS_UPDATE);
                 const auto* parent = event.find("parent_tool_use_id");
                 const auto* message = event.find("message");
-                if (text(event, "session_id") == root_session && (!parent || parent->is_null()) &&
+                if (initialized && text(event, "session_id") == root_session && (!parent || parent->is_null()) &&
                     !flag(event, "isSynthetic") && !flag(event, "isCompactSummary") &&
                     message && text(*message, "role") == "assistant" && text(*message, "model") != "<synthetic>")
                 {
@@ -768,9 +774,6 @@ addon::Structured_inspect_result inspect_session(
             state.set("pending_before_input", Json(pending_before_input));
             state.set("result_base64", Json(addon::encode_base64(answer)));
             state.set("root_session_id", Json(root_session));
-            if (observe_model) {
-                addon::encode_structured_model_observation(state, result.model_observation, result.model_failure);
-            }
             result.protocol_state = addon::serialize_json(state);
             if (!addon::exchange_protocol_state_valid(result.protocol_state)) return failed("protocol_state_limit");
         }

@@ -3,6 +3,7 @@
 #include "claude_support.h"
 
 #include <logonomic_cli_addon/capability_ids.h>
+#include <logonomic_cli_addon/limits.h>
 #include <logonomic_cli_addon/model_state.h>
 
 #include <exception>
@@ -157,13 +158,67 @@ void structured_model()
     require(result.failure_reason == "session_provenance_mismatch" && !result.model_observation,
         "UI administration cannot authorize a different native session's model");
     const std::string malformed = R"({"type":"assistant","session_id":"root","message":{"role":"assistant","model":17}})" "\n";
-    result = inspect(initial_state(), init + malformed + answer, true);
-    require(result.complete && !result.failure_reason && result.result_bytes == "done" && !result.model_observation &&
-        result.model_failure, "Malformed optional native model preserves authenticated completion");
-    auto envelope = addon::encode_structured_inspect_result(result);
-    auto decoded = addon::decode_structured_inspect_result(envelope, true, nullptr);
-    require(decoded && decoded->model_failure && decoded->result_bytes == "done",
-        "Optional model failure survives the actual structured carrier");
+    // The host keeps each valid reply. Grouping the identical native bytes
+    // into one or two inspections must leave it with the same confirmed model.
+    for (const auto& mixed : {assistant + malformed, malformed + assistant}) {
+        result = inspect(initial_state(), init + mixed + answer, true);
+        const auto decoded = addon::decode_structured_inspect_result(
+            addon::encode_structured_inspect_result(result), true, nullptr);
+        require(decoded && decoded->complete && !decoded->failure_reason && decoded->result_bytes == "done" &&
+            decoded->model_observation && decoded->model_observation->model == "native-served",
+            "Malformed sibling cannot erase the last valid assistant model in the same inspection");
+    }
+    first = inspect(initial_state(), init + assistant);
+    result = inspect(first.protocol_state, malformed + answer, true);
+    const auto decoded = addon::decode_structured_inspect_result(
+        addon::encode_structured_inspect_result(result), true, nullptr);
+    require(first.model_observation && first.model_observation->model == "native-served" &&
+        decoded && decoded->complete && !decoded->failure_reason && decoded->result_bytes == "done" &&
+        !decoded->model_observation && decoded->model_failure &&
+        decoded->model_failure->reason_code == "invalid_model_observation",
+        "A subsequent malformed-only inspection reports a capability failure beside its native result");
+}
+
+void review_requires_initialized_root()
+{
+    const auto review = [](std::string state, std::string bytes) {
+        addon::Structured_inspection request;
+        request.protocol_state = std::move(state);
+        request.stdout_bytes = std::move(bytes);
+        return claude::inspect_session(addon::Structured_purpose::READ_ONLY_REVIEW, request, true);
+    };
+    const std::string orphan = R"({"type":"assistant","message":{"role":"assistant","model":"orphan"}})" "\n";
+    const std::string named = R"({"type":"assistant","session_id":"root","message":{"role":"assistant","model":"orphan"}})" "\n";
+    const std::string admin = R"({"type":"system","subtype":"hook_started","session_id":"root"})" "\n";
+    auto result = review(initial_state(), orphan);
+    require(!result.failure_reason && !result.model_observation, "An assistant without an initialized root cannot supply a model");
+    result = review(initial_state(), admin + named);
+    require(!result.failure_reason && !result.model_observation, "A matching administrative session ID does not authenticate an assistant");
+    auto prepared = claude::object(initial_state());
+    prepared.set("expected_tools", Json::array());
+    const std::string init = R"({"type":"system","subtype":"init","session_id":"root","cwd":"/repo","tools":[],"mcp_servers":[]})" "\n";
+    result = review(addon::serialize_json(prepared), init + named);
+    require(!result.failure_reason && result.model_observation && result.model_observation->model == "orphan",
+        "The same assistant can supply its model after read-only initialization authenticates the root");
+}
+
+void model_preserves_continuation_budget()
+{
+    const std::string init = R"({"type":"system","subtype":"init","session_id":"root","model":"native-live"})" "\n";
+    const auto empty = inspect(initial_state(), init, false, false);
+    require(!empty.complete && !empty.protocol_state.empty(), "Base continuation must be valid");
+    const auto budget = addon::limits::k_max_exchange_protocol_state_code_units - empty.protocol_state.size();
+    const std::string whitespace((budget / 4) * 3, ' ');
+    const auto split = whitespace.size() / 2;
+    const auto first = inspect(initial_state(), init + whitespace.substr(0, split));
+    require(!first.failure_reason && first.model_observation, "First read reports the live model");
+    const auto core = inspect(initial_state(), init + whitespace.substr(0, split), false, false);
+    const auto retained = inspect(first.protocol_state, whitespace.substr(split));
+    const auto expected = inspect(core.protocol_state, whitespace.substr(split), false, false);
+    require(!retained.failure_reason && !expected.failure_reason && !retained.model_observation &&
+        retained.protocol_state == expected.protocol_state && retained.protocol_state.size() + 4 >
+        addon::limits::k_max_exchange_protocol_state_code_units,
+        "Optional model sampling leaves the complete native continuation budget available");
 }
 
 } // namespace
@@ -173,6 +228,8 @@ int main()
     try {
         lifecycle_model();
         structured_model();
+        review_requires_initialized_root();
+        model_preserves_continuation_budget();
         return 0;
     }
     catch (const std::exception& failure) {
