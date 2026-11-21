@@ -169,6 +169,8 @@ add_custom_command(
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/package/notices" "${CLAUDE_PACKAGE_DIRECTORY}/notices"
     COMMAND "${CMAKE_COMMAND}" -E copy
+        "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" "${CLAUDE_PACKAGE_DIRECTORY}/notices/LICENSE"
+    COMMAND "${CMAKE_COMMAND}" -E copy
         "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CLAUDE_PACKAGE_DIRECTORY}/logonomic-cli-addon.json"
     COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:claude_adapter>"
         "${CLAUDE_PACKAGE_DIRECTORY}/adapter/claude_adapter${CLAUDE_EXECUTABLE_SUFFIX}"
@@ -178,6 +180,7 @@ add_custom_command(
         "${CLAUDE_PACKAGE_DIRECTORY}/helpers/claude_launch_bridge${CLAUDE_EXECUTABLE_SUFFIX}"
     COMMAND ${claude_index_command}
     DEPENDS claude_adapter claude_helper claude_launch_bridge logonomic_cli_addon_index
+        "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
         "${CMAKE_CURRENT_BINARY_DIR}/generated/logonomic-cli-addon.json" "${CMAKE_CURRENT_BINARY_DIR}/package-inputs.txt"
         ${package_files} ${claude_runtime_inputs} ${claude_index_dependencies}
     VERBATIM)

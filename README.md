@@ -11,6 +11,7 @@ and transcript usage parsing.
 
 The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
 Send provider pull requests to [the claude repository](https://github.com/Varinomics/vnm_logonomic_cli_claude/pulls).
+See the [repository license](LICENSE) for the terms covering Varinomics code.
 
 Set `LOGONOMIC_CLI_ADDON_SDK_SOURCE` to an explicit SDK checkout to test coordinated changes.
 
