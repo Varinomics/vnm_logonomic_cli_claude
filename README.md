@@ -3,13 +3,16 @@
 [![CI](https://github.com/Varinomics/vnm_logonomic_cli_claude/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_logonomic_cli_claude/actions/workflows/ci.yml)
 
 Standalone C++20 Claude Code provider for Logonomic on Windows, Linux and macOS.
-The package depends on the public Logonomic CLI add-on SDK and, outside
+The package depends on the Logonomic CLI add-on SDK and, outside
 Windows, libcurl for its quota helper. It owns launcher
 recognition, account profiles, launch preparation, Claude hooks, interactive
 resume, structured review and implementation sessions, authentication, quota,
 and transcript usage parsing.
 
-The SDK dependency tracks the owned Logonomic `master` branch. Set
+The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
+Send provider pull requests to [the claude repository](https://github.com/Varinomics/vnm_logonomic_cli_claude/pulls).
+
+The SDK dependency tracks `vnm_logonomic_cli_addon` on `master`. Set
 `LOGONOMIC_CLI_ADDON_SDK_SOURCE` to a local `sdk/logonomic_cli_addon_sdk` directory
 to qualify unpublished coordinated SDK changes. Keep build directories outside
 this repository. Windows compilation follows the workspace queued-build and
