@@ -2462,7 +2462,8 @@ void permission_posture_contract()
 }
 
 // Oracle: the owner's read-only purpose and launcher-posture requirement,
-// together with the recorded Claude Code 2.1.282 scripted review stream.
+// together with the event sequence from a scripted Claude Code 2.1.282 review.
+// The fixture substitutes example paths, identifiers and messages.
 void review_contract()
 {
     constexpr auto purpose = addon::Structured_purpose::READ_ONLY_REVIEW;
