@@ -18,6 +18,11 @@ to qualify unpublished coordinated SDK changes. Keep build directories outside
 this repository. Windows compilation follows the workspace queued-build and
 Visual Studio 2026 policy.
 
+The direct-quota tests use temporary profiles. On Windows, if your temporary
+directory inherits Claude settings from an ancestor, set `TEMP` and `TMP` for
+the test process to a writable directory outside that tree. The tests exercise
+the provider's normal ancestor settings lookup.
+
 Outside Windows, configuration requires the libcurl development files. The Linux
 and macOS packages carry libcurl and the rest of their non-system runtime closure
 inside the package, and each carried library needs a notice: Linux falls back
