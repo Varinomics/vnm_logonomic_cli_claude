@@ -85,6 +85,7 @@ target_include_directories(claude_provider PUBLIC src)
 target_link_libraries(claude_provider PUBLIC logonomic_cli_addon_sdk::sdk
     PRIVATE claude_native_context claude_quota_windows)
 add_executable(claude_adapter src/adapter.cpp)
+target_compile_definitions(claude_adapter PRIVATE LOGONOMIC_CLI_ADDON_ADAPTER_VERSION="${PROJECT_VERSION}")
 target_link_libraries(claude_adapter PRIVATE claude_provider)
 claude_target(claude_adapter)
 add_executable(claude_helper src/claude_helper.cpp)

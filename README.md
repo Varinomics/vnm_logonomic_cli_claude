@@ -12,11 +12,7 @@ and transcript usage parsing.
 The [contributor guide](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/CONTRIBUTING.md) covers local package checks.
 Send provider pull requests to [the claude repository](https://github.com/Varinomics/vnm_logonomic_cli_claude/pulls).
 
-The SDK dependency tracks `vnm_logonomic_cli_addon` on `master`. Set
-`LOGONOMIC_CLI_ADDON_SDK_SOURCE` to a local `sdk/logonomic_cli_addon_sdk` directory
-to qualify unpublished coordinated SDK changes. Keep build directories outside
-this repository. Windows compilation follows the workspace queued-build and
-Visual Studio 2026 policy.
+Set `LOGONOMIC_CLI_ADDON_SDK_SOURCE` to an explicit SDK checkout to test coordinated changes.
 
 The direct-quota tests use temporary profiles. On Windows, if your temporary
 directory inherits Claude settings from an ancestor, set `TEMP` and `TMP` for
@@ -88,15 +84,7 @@ unsupported directory evidence is explicit. See
 [conversation history inspection](docs/resume_history.md) for snapshot coverage
 and native resume limits.
 
-The package recipe proves the Windows/Linux x86-64 or macOS ARM64 compiler target
-during configuration. `cmake --install` exports a fresh artifact beneath its install-time
-prefix and preserves executable permissions. An existing per-package destination,
-including a dangling symlink, is refused. POSIX `DESTDIR` staging is supported;
-nonempty `DESTDIR` with a drive-letter prefix is refused. Export is not atomic:
-a failure may leave a partial artifact directory. Choose a fresh destination or
-manually remove only that identified disposable export before retrying; never
-remove an installed generation this way. The application's package ingestion
-owns atomic installation and updates.
+Use `cmake --install` to export the indexed package to a fresh directory. See [SDK package export](https://github.com/Varinomics/vnm_logonomic_cli_addon/blob/master/sdk/logonomic_cli_addon_sdk/docs/package_contract.md#exporting-a-package).
 
 Account selection uses the host-admitted canonical profile path. Scans read
 finalized assistant messages under that profile's `projects` directory, deduplicate

@@ -139,7 +139,7 @@ int main()
     const fs::path package_root = executable_path().parent_path().parent_path();
     addon::Adapter_runtime_options options;
     options.adapter_name = "claude-addon";
-    options.adapter_version = "1.0.0";
+    options.adapter_version = LOGONOMIC_CLI_ADDON_ADAPTER_VERSION;
     options.capabilities = {
         {addon::k_launcher_approval_capability_id, addon::k_launcher_approval_version},
         {"presentation", 1}, {"launcher-discovery", 1}, {"profile-storage", 1}, {"managed-assets", 1},
